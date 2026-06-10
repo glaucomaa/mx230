@@ -51,6 +51,18 @@ pub fn max_rel_err(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Worst-case allclose ratio: max(|g - w| / (atol + rtol * |w|)).
+/// Values <= 1.0 mean every element satisfies |g - w| <= atol + rtol * |w|
+/// (same criterion as numpy.allclose). Unlike pure relative error this does
+/// not blow up on near-zero outputs.
+pub fn allclose_err(got: &[f32], want: &[f32], rtol: f32, atol: f32) -> f32 {
+    assert_eq!(got.len(), want.len());
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| (g - w).abs() / (atol + rtol * w.abs()))
+        .fold(0.0f32, f32::max)
+}
+
 /// Deterministic pseudo-random f32 values in [-1, 1) with no external deps.
 pub fn pseudo_rand(n: usize, mut seed: u64) -> Vec<f32> {
     (0..n)
