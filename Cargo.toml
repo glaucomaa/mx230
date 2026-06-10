@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel-build", "common", "01-gemm", "02-flash-attention"]
+members = ["kernel-build", "common", "01-gemm", "02-flash-attention", "03-llm-engine"]
 
 [workspace.dependencies]
 cudarc = { version = "0.19", features = ["cuda-12090", "cublas"] }
