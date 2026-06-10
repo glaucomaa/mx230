@@ -50,6 +50,49 @@ wheels ship no sm_61 kernels (`cudaErrorNoKernelImageForDevice`) — Pascal is
 simply unsupported, so the hand-written engine is the only way this GPU runs
 an LLM at all (`scripts/hf_baseline.py`).
 
+## llama.cpp baseline
+
+The external baseline is [llama.cpp](https://github.com/ggml-org/llama.cpp)
+built from current upstream sources for the same Pascal target:
+
+```
+cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build-sm61-nofa -G Ninja \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61 -DGGML_CUDA_NO_VMM=ON \
+  -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA=OFF -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/llama.cpp/build-sm61-nofa --target llama-bench llama-cli -j 3
+```
+
+Models:
+
+- [`lamptablet/gpt2-Q8_0-GGUF`](https://huggingface.co/lamptablet/gpt2-Q8_0-GGUF),
+  `gpt2-q8_0.gguf` (GPT-2 base, Q8_0, 167.75 MiB).
+- [`neopolita/qwen2.5-0.5b-gguf`](https://huggingface.co/neopolita/qwen2.5-0.5b-gguf),
+  `qwen2.5-0.5b_q8_0.gguf` (Qwen2.5-0.5B base, Q8_0, 500.79 MiB).
+
+Benchmark command:
+
+```
+/tmp/llama.cpp/build-sm61-nofa/bin/llama-bench \
+  -m 03-llm-engine/models/<model>.gguf \
+  -p 512 -n 128 -r 5 -ngl 999 -fa off -o md
+```
+
+| model | engine | model storage | prefill / prompt processing | greedy decode |
+|-------|--------|---------------|-----------------------------|---------------|
+| GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2740.5 tok/s** (`pp512`) | **142.4 tok/s** (`tg128`) |
+| GPT-2 | ours | int8 weights, ~124 MiB | 998.1 tok/s (`512 / 0.513s`) | 130.0 tok/s |
+| Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **872.5 tok/s** (`pp512`) | 45.4 tok/s (`tg128`) |
+| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 252.0 tok/s (`512 / 2.032s`) | **52.5 tok/s** |
+
+This is the honest split. llama.cpp is much faster on prefill: its prompt path
+is a mature batched graph over GGML kernels, while this engine's batch prefill
+is a first-pass GEMM/attention path. GPT-2 decode also goes to llama.cpp
+(142.4 vs 130.0 tok/s). Qwen decode goes the other way: the custom int8 path
+is 16% faster than llama.cpp on this MX230 because the hot loop is narrower and
+specialized for one architecture/layout instead of the full GGML execution
+model.
+
 ## What the numbers say
 
 Decode is one GEMV per weight matrix per token — pure memory streaming:
