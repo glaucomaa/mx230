@@ -1,12 +1,18 @@
-//! GPT-2 byte-level BPE tokenizer (vocab.json + merges.txt), no external
-//! tokenizer crates. Pre-tokenization reproduces the GPT-2 split regex
+//! Byte-level BPE tokenizer (vocab.json + merges.txt), no external tokenizer
+//! crates; covers both GPT-2 and Qwen2 vocabularies. Pre-tokenization
+//! reproduces each model's split regex with a hand-rolled scanner, since the
+//! `regex` crate lacks lookahead. GPT-2:
 //! ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)
-//! with a hand-rolled scanner, since the `regex` crate lacks lookahead.
+//! Qwen2 differs: case-insensitive contractions, a word may absorb one
+//! leading non-letter, digits split one at a time, newlines separated.
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::model::Arch;
+
 pub struct Tokenizer {
+    arch: Arch,
     vocab: HashMap<String, u32>,
     inv_vocab: HashMap<u32, String>,
     merges: HashMap<(String, String), usize>,
@@ -123,8 +129,95 @@ fn pretokenize(text: &str) -> Vec<String> {
     out
 }
 
+/// Splits text following the Qwen2 regex:
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
+/// | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+fn pretokenize_qwen(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // case-insensitive contractions
+        if c == '\'' && i + 1 < chars.len() {
+            let rest: String = chars[i + 1..chars.len().min(i + 3)]
+                .iter()
+                .collect::<String>()
+                .to_lowercase();
+            let suf = ["s", "t", "re", "ve", "m", "ll", "d"]
+                .iter()
+                .filter(|s| rest.starts_with(*s))
+                .max_by_key(|s| s.len());
+            if let Some(s) = suf {
+                out.push(chars[i..i + 1 + s.len()].iter().collect());
+                i += 1 + s.len();
+                continue;
+            }
+        }
+        // [^\r\n\p{L}\p{N}]?\p{L}+ — a word with one optional leading symbol
+        let prefix_ok = !is_letter(c) && !is_digit(c) && c != '\r' && c != '\n';
+        if is_letter(c) || (prefix_ok && i + 1 < chars.len() && is_letter(chars[i + 1])) {
+            let mut j = if is_letter(c) { i } else { i + 1 };
+            while j < chars.len() && is_letter(chars[j]) {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        // \p{N} — one digit at a time
+        if is_digit(c) {
+            out.push(c.to_string());
+            i += 1;
+            continue;
+        }
+        // ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+        let punct_at = |k: usize| {
+            k < chars.len()
+                && !chars[k].is_whitespace()
+                && !is_letter(chars[k])
+                && !is_digit(chars[k])
+        };
+        if punct_at(i) || (c == ' ' && punct_at(i + 1)) {
+            let mut j = if c == ' ' { i + 1 } else { i };
+            while punct_at(j) {
+                j += 1;
+            }
+            while j < chars.len() && (chars[j] == '\r' || chars[j] == '\n') {
+                j += 1;
+            }
+            out.push(chars[i..j].iter().collect());
+            i = j;
+            continue;
+        }
+        // \s*[\r\n]+ — whitespace run ending in its last newline
+        let mut j = i;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        let last_nl = chars[i..j]
+            .iter()
+            .rposition(|&w| w == '\r' || w == '\n')
+            .map(|p| i + p + 1);
+        if let Some(end) = last_nl {
+            out.push(chars[i..end].iter().collect());
+            i = end;
+            continue;
+        }
+        // '\s+(?!\S)' / '\s+' — same trailing-space rule as GPT-2
+        let end = if j < chars.len() && j - i > 1 {
+            j - 1
+        } else {
+            j
+        };
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
+}
+
 impl Tokenizer {
-    pub fn load(dir: &Path) -> Self {
+    pub fn load(dir: &Path, arch: Arch) -> Self {
         let vocab_json = std::fs::read_to_string(dir.join("vocab.json")).expect("vocab.json");
         let vocab: HashMap<String, u32> = serde_json::from_str(&vocab_json).unwrap();
         let inv_vocab = vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
@@ -144,6 +237,7 @@ impl Tokenizer {
         let byte_to_char = bytes_to_unicode();
         let char_to_byte = (0..256).map(|b| (byte_to_char[b], b as u8)).collect();
         Tokenizer {
+            arch,
             vocab,
             inv_vocab,
             merges,
@@ -180,8 +274,12 @@ impl Tokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        let pre_tokens = match self.arch {
+            Arch::Gpt2 => pretokenize(text),
+            Arch::Qwen2 => pretokenize_qwen(text),
+        };
         let mut ids = Vec::new();
-        for pre in pretokenize(text) {
+        for pre in pre_tokens {
             let mapped: String = pre.bytes().map(|b| self.byte_to_char[b as usize]).collect();
             ids.extend(self.bpe(&mapped));
         }

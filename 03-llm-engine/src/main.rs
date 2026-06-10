@@ -1,5 +1,6 @@
-//! Stage 3: GPT-2 124M inference engine in plain CUDA.
+//! Stage 3: GPT-2 124M / Qwen2.5-0.5B inference engine in plain CUDA.
 //!
+//! Every subcommand takes `--model gpt2|qwen` (default gpt2):
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
 //!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8] [--kv8]
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
@@ -21,14 +22,55 @@ fn models_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models")
 }
 
-fn load_model() -> model::Model {
-    let path = models_dir().join("gpt2.bin");
+/// Model directory, weight file and arch selected by `--model gpt2|qwen`.
+struct ModelChoice {
+    dir: PathBuf,
+    bin: PathBuf,
+    arch: model::Arch,
+}
+
+fn model_choice(args: &[String]) -> ModelChoice {
+    match opt_value(args, "--model").unwrap_or("gpt2") {
+        "gpt2" => {
+            let dir = models_dir();
+            ModelChoice {
+                bin: dir.join("gpt2.bin"),
+                dir,
+                arch: model::Arch::Gpt2,
+            }
+        }
+        "qwen" => {
+            let dir = models_dir().join("qwen");
+            ModelChoice {
+                bin: dir.join("qwen2.5-0.5b.bin"),
+                dir,
+                arch: model::Arch::Qwen2,
+            }
+        }
+        m => panic!("unknown --model {m} (expected gpt2 or qwen)"),
+    }
+}
+
+fn load_model(choice: &ModelChoice) -> model::Model {
     assert!(
-        path.exists(),
+        choice.bin.exists(),
         "{} not found — run `export` first",
-        path.display()
+        choice.bin.display()
     );
-    model::Model::load(&path).unwrap()
+    model::Model::load(&choice.bin).unwrap()
+}
+
+/// Weight-storage modes that fit in 2 GB VRAM for this model.
+/// Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — more than the whole card.
+fn modes_for(arch: model::Arch) -> &'static [gpu::WeightMode] {
+    match arch {
+        model::Arch::Gpt2 => &[
+            gpu::WeightMode::Fp32,
+            gpu::WeightMode::Fp16,
+            gpu::WeightMode::Int8,
+        ],
+        model::Arch::Qwen2 => &[gpu::WeightMode::Fp16, gpu::WeightMode::Int8],
+    }
 }
 
 fn flag(args: &[String], name: &str) -> bool {
@@ -81,12 +123,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("export") => {
-            let dir = models_dir();
-            export::download(&dir);
-            println!("converting safetensors -> gpt2.bin ...");
-            let model = export::convert(&dir);
-            model.save(&dir.join("gpt2.bin")).unwrap();
-            println!("wrote {}", dir.join("gpt2.bin").display());
+            let choice = model_choice(&args);
+            let model = match choice.arch {
+                model::Arch::Gpt2 => {
+                    export::download(&choice.dir);
+                    println!("converting safetensors -> {} ...", choice.bin.display());
+                    export::convert(&choice.dir)
+                }
+                model::Arch::Qwen2 => {
+                    export::download_qwen(&choice.dir);
+                    println!("converting safetensors -> {} ...", choice.bin.display());
+                    export::convert_qwen(&choice.dir)
+                }
+            };
+            model.save(&choice.bin).unwrap();
+            println!("wrote {}", choice.bin.display());
         }
         Some("ppl-data") => {
             export::download_wikitext2(&models_dir());
@@ -99,9 +150,10 @@ fn main() {
             let n_new = opt_n(&args, 64);
             let mode = gpu::WeightMode::parse(&args);
             let kv8 = flag(&args, "--kv8");
+            let choice = model_choice(&args);
 
-            let tok = tokenizer::Tokenizer::load(&models_dir());
-            let model = load_model();
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
             let ctx = CudaContext::new(0).unwrap();
             let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
 
@@ -128,8 +180,9 @@ fn main() {
             );
         }
         Some("verify") => {
-            let tok = tokenizer::Tokenizer::load(&models_dir());
-            let model = load_model();
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
             let prompt = "Alan Turing was a British mathematician";
             let ids = tok.encode(prompt);
             println!("prompt: {prompt:?} -> {ids:?}");
@@ -138,13 +191,11 @@ fn main() {
             let want = cpu::forward(&model, &ids);
 
             let ctx = CudaContext::new(0).unwrap();
-            for (mode, kv8) in [
-                (gpu::WeightMode::Fp32, false),
-                (gpu::WeightMode::Fp16, false),
-                (gpu::WeightMode::Int8, false),
-                (gpu::WeightMode::Fp32, true),
-                (gpu::WeightMode::Int8, true),
-            ] {
+            let mut combos: Vec<(gpu::WeightMode, bool)> =
+                modes_for(choice.arch).iter().map(|&m| (m, false)).collect();
+            combos.push((modes_for(choice.arch)[0], true));
+            combos.push((gpu::WeightMode::Int8, true));
+            for (mode, kv8) in combos {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 let mut got = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
@@ -170,7 +221,8 @@ fn main() {
             // after n steps checks the whole path
             for kv8 in [false, true] {
                 let n_steps = 16;
-                let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32, kv8);
+                let graph_mode = modes_for(choice.arch)[0];
+                let mut engine = gpu::Engine::new(&ctx, &model, graph_mode, kv8);
                 let mut logits = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     logits = engine.forward(t, pos);
@@ -183,8 +235,10 @@ fn main() {
                     pos += 1;
                 }
                 let host_tok = gpu::argmax(&logits);
+                // both engines don't fit in VRAM at once for the larger model
+                drop(engine);
 
-                let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32, kv8);
+                let mut engine = gpu::Engine::new(&ctx, &model, graph_mode, kv8);
                 for (pos, &t) in ids.iter().enumerate() {
                     engine.forward(t, pos);
                 }
@@ -199,8 +253,9 @@ fn main() {
             }
         }
         Some("bench") => {
-            let tok = tokenizer::Tokenizer::load(&models_dir());
-            let model = load_model();
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
             let n_new = opt_n(&args, 64);
             let graphs = flag(&args, "--graphs");
             let kv8 = flag(&args, "--kv8");
@@ -209,11 +264,7 @@ fn main() {
 
             println!("| mode | weights | kv | graph | tokens/sec |");
             println!("|------|---------|----|-------|------------|");
-            for mode in [
-                gpu::WeightMode::Fp32,
-                gpu::WeightMode::Fp16,
-                gpu::WeightMode::Int8,
-            ] {
+            for &mode in modes_for(choice.arch) {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 // warmup + prefill
                 let mut logits = Vec::new();
@@ -238,7 +289,7 @@ fn main() {
                 let dt = t0.elapsed().as_secs_f64();
                 println!(
                     "| {mode} | ~{:.0} MB | {} | {} | {:.1} |",
-                    mode.weight_mb(),
+                    gpu::weight_mb(&model.config, mode),
                     if kv8 { "int8" } else { "fp32" },
                     if graphs { "yes" } else { "no" },
                     n_new as f64 / dt
@@ -258,8 +309,9 @@ fn main() {
             );
             let text = std::fs::read_to_string(&data_path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", data_path.display()));
-            let tok = tokenizer::Tokenizer::load(&models_dir());
-            let model = load_model();
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
             let mut ids = tok.encode(&text);
             ids.truncate(max_tokens.min(ids.len()));
             assert!(ids.len() > 1, "need at least two tokens for perplexity");
@@ -269,16 +321,12 @@ fn main() {
             println!("| mode | weights | kv | tokens | perplexity |");
             println!("|------|---------|----|--------|------------|");
             for kv8 in [false, true] {
-                for mode in [
-                    gpu::WeightMode::Fp32,
-                    gpu::WeightMode::Fp16,
-                    gpu::WeightMode::Int8,
-                ] {
+                for &mode in modes_for(choice.arch) {
                     let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                     let (ppl, n) = perplexity(&mut engine, &ids);
                     println!(
                         "| {mode} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
-                        mode.weight_mb(),
+                        gpu::weight_mb(&model.config, mode),
                         if kv8 { "int8" } else { "fp32" },
                     );
                 }

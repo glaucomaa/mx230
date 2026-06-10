@@ -1,62 +1,111 @@
 //! Model file format and host-side weight storage.
 //!
 //! `model.bin` layout (little-endian):
-//!   magic "MXGP" (u32) | version (u32) | n_layer | n_head | n_embd | n_ctx | n_vocab (u32 each)
-//! followed by fp32 tensors in a fixed order (see `TENSOR_ORDER` below).
-//! Linear weights are stored as [n_in, n_out] row-major (y = x @ W + b),
-//! matching HF GPT-2's Conv1D convention, so export is a straight copy.
+//!   magic "MXGP" (u32) | version (u32) | arch (u32) | n_layer | n_head |
+//!   n_kv_head | head_dim | n_embd | n_inter | n_ctx | n_vocab (u32 each) |
+//!   rope_theta (f32) | norm_eps (f32)
+//! followed by fp32 tensors in a fixed per-arch order (see save/load).
+//! Linear weights are stored as [n_in, n_out] row-major (y = x @ W + b);
+//! HF GPT-2 Conv1D already has that layout, HF Linear (Qwen2) is transposed
+//! at export time.
 
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"MXGP");
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Gpt2,
+    Qwen2,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    pub arch: Arch,
     pub n_layer: usize,
     pub n_head: usize,
+    pub n_kv_head: usize, // < n_head means grouped-query attention
+    pub head_dim: usize,
     pub n_embd: usize,
+    pub n_inter: usize, // MLP hidden width
     pub n_ctx: usize,
     pub n_vocab: usize,
+    pub rope_theta: f32, // 0.0 for learned positional embeddings (GPT-2)
+    pub norm_eps: f32,
 }
 
 impl Config {
     pub fn gpt2_small() -> Self {
         Config {
+            arch: Arch::Gpt2,
             n_layer: 12,
             n_head: 12,
+            n_kv_head: 12,
+            head_dim: 64,
             n_embd: 768,
+            n_inter: 3072,
             n_ctx: 1024,
             n_vocab: 50257,
+            rope_theta: 0.0,
+            norm_eps: 1e-5,
         }
     }
-    pub fn head_dim(&self) -> usize {
-        self.n_embd / self.n_head
+
+    /// Qwen2.5-0.5B; n_ctx capped at 1024 (the KV cache window we allocate),
+    /// the model itself supports far longer contexts.
+    pub fn qwen25_05b() -> Self {
+        Config {
+            arch: Arch::Qwen2,
+            n_layer: 24,
+            n_head: 14,
+            n_kv_head: 2,
+            head_dim: 64,
+            n_embd: 896,
+            n_inter: 4864,
+            n_ctx: 1024,
+            n_vocab: 151936,
+            rope_theta: 1e6,
+            norm_eps: 1e-6,
+        }
+    }
+
+    pub fn q_dim(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+    pub fn kv_dim(&self) -> usize {
+        self.n_kv_head * self.head_dim
+    }
+    pub fn qkv_dim(&self) -> usize {
+        self.q_dim() + 2 * self.kv_dim()
     }
 }
 
 /// Per-layer weights, all fp32, linear weights as [n_in, n_out].
+/// GPT-2 uses every field; Qwen2 leaves the norm biases and MLP biases empty
+/// (`fc_w`/`fc2_w` are reused as SwiGLU gate/down, `up_w` is Qwen2-only).
 pub struct Layer {
     pub ln1_g: Vec<f32>,
     pub ln1_b: Vec<f32>,
-    pub qkv_w: Vec<f32>, // [embd, 3*embd]
+    pub qkv_w: Vec<f32>, // [embd, q_dim + 2*kv_dim]
     pub qkv_b: Vec<f32>,
-    pub proj_w: Vec<f32>, // [embd, embd]
-    pub proj_b: Vec<f32>,
+    pub proj_w: Vec<f32>, // [q_dim, embd]
+    pub proj_b: Vec<f32>, // zeros for Qwen2 (o_proj has no bias)
     pub ln2_g: Vec<f32>,
     pub ln2_b: Vec<f32>,
-    pub fc_w: Vec<f32>, // [embd, 4*embd]
+    pub fc_w: Vec<f32>, // GPT-2 fc [embd, inter] | Qwen2 gate [embd, inter]
     pub fc_b: Vec<f32>,
-    pub fc2_w: Vec<f32>, // [4*embd, embd]
+    pub up_w: Vec<f32>,  // Qwen2 only: [embd, inter]
+    pub fc2_w: Vec<f32>, // GPT-2 fc2 [inter, embd] | Qwen2 down [inter, embd]
     pub fc2_b: Vec<f32>,
 }
 
 pub struct Model {
     pub config: Config,
     pub wte: Vec<f32>, // [vocab, embd]; also the (tied) lm_head
-    pub wpe: Vec<f32>, // [ctx, embd]
+    pub wpe: Vec<f32>, // [ctx, embd] for GPT-2, empty for Qwen2 (RoPE)
     pub layers: Vec<Layer>,
     pub lnf_g: Vec<f32>,
     pub lnf_b: Vec<f32>,
@@ -78,6 +127,9 @@ impl<'a> Reader<'a> {
         self.pos += 4;
         v
     }
+    fn f32(&mut self) -> f32 {
+        f32::from_bits(self.u32())
+    }
     fn tensor(&mut self, len: usize) -> Vec<f32> {
         let bytes = &self.buf[self.pos..self.pos + len * 4];
         self.pos += len * 4;
@@ -95,26 +147,45 @@ impl Model {
         for v in [
             MAGIC,
             VERSION,
+            match c.arch {
+                Arch::Gpt2 => 0,
+                Arch::Qwen2 => 1,
+            },
             c.n_layer as u32,
             c.n_head as u32,
+            c.n_kv_head as u32,
+            c.head_dim as u32,
             c.n_embd as u32,
+            c.n_inter as u32,
             c.n_ctx as u32,
             c.n_vocab as u32,
+            c.rope_theta.to_bits(),
+            c.norm_eps.to_bits(),
         ] {
             out.write_all(&v.to_le_bytes())?;
         }
         write_tensor(&mut out, &self.wte)?;
-        write_tensor(&mut out, &self.wpe)?;
+        if c.arch == Arch::Gpt2 {
+            write_tensor(&mut out, &self.wpe)?;
+        }
         for l in &self.layers {
-            for t in [
-                &l.ln1_g, &l.ln1_b, &l.qkv_w, &l.qkv_b, &l.proj_w, &l.proj_b, &l.ln2_g, &l.ln2_b,
-                &l.fc_w, &l.fc_b, &l.fc2_w, &l.fc2_b,
-            ] {
+            let tensors: Vec<&Vec<f32>> = match c.arch {
+                Arch::Gpt2 => vec![
+                    &l.ln1_g, &l.ln1_b, &l.qkv_w, &l.qkv_b, &l.proj_w, &l.proj_b, &l.ln2_g,
+                    &l.ln2_b, &l.fc_w, &l.fc_b, &l.fc2_w, &l.fc2_b,
+                ],
+                Arch::Qwen2 => vec![
+                    &l.ln1_g, &l.qkv_w, &l.qkv_b, &l.proj_w, &l.ln2_g, &l.fc_w, &l.up_w, &l.fc2_w,
+                ],
+            };
+            for t in tensors {
                 write_tensor(&mut out, t)?;
             }
         }
         write_tensor(&mut out, &self.lnf_g)?;
-        write_tensor(&mut out, &self.lnf_b)?;
+        if c.arch == Arch::Gpt2 {
+            write_tensor(&mut out, &self.lnf_b)?;
+        }
         Ok(())
     }
 
@@ -122,35 +193,75 @@ impl Model {
         let buf = fs::read(path)?;
         let mut r = Reader { buf: &buf, pos: 0 };
         assert_eq!(r.u32(), MAGIC, "not a model.bin file");
-        assert_eq!(r.u32(), VERSION, "unsupported model.bin version");
+        assert_eq!(
+            r.u32(),
+            VERSION,
+            "unsupported model.bin version — re-run `export`"
+        );
+        let arch = match r.u32() {
+            0 => Arch::Gpt2,
+            1 => Arch::Qwen2,
+            a => panic!("unknown arch tag {a}"),
+        };
         let config = Config {
+            arch,
             n_layer: r.u32() as usize,
             n_head: r.u32() as usize,
+            n_kv_head: r.u32() as usize,
+            head_dim: r.u32() as usize,
             n_embd: r.u32() as usize,
+            n_inter: r.u32() as usize,
             n_ctx: r.u32() as usize,
             n_vocab: r.u32() as usize,
+            rope_theta: r.f32(),
+            norm_eps: r.f32(),
         };
-        let e = config.n_embd;
+        let (e, inter) = (config.n_embd, config.n_inter);
+        let (qd, qkvd) = (config.q_dim(), config.qkv_dim());
         let wte = r.tensor(config.n_vocab * e);
-        let wpe = r.tensor(config.n_ctx * e);
+        let wpe = match arch {
+            Arch::Gpt2 => r.tensor(config.n_ctx * e),
+            Arch::Qwen2 => Vec::new(),
+        };
         let layers = (0..config.n_layer)
-            .map(|_| Layer {
-                ln1_g: r.tensor(e),
-                ln1_b: r.tensor(e),
-                qkv_w: r.tensor(e * 3 * e),
-                qkv_b: r.tensor(3 * e),
-                proj_w: r.tensor(e * e),
-                proj_b: r.tensor(e),
-                ln2_g: r.tensor(e),
-                ln2_b: r.tensor(e),
-                fc_w: r.tensor(e * 4 * e),
-                fc_b: r.tensor(4 * e),
-                fc2_w: r.tensor(4 * e * e),
-                fc2_b: r.tensor(e),
+            .map(|_| match arch {
+                Arch::Gpt2 => Layer {
+                    ln1_g: r.tensor(e),
+                    ln1_b: r.tensor(e),
+                    qkv_w: r.tensor(e * qkvd),
+                    qkv_b: r.tensor(qkvd),
+                    proj_w: r.tensor(qd * e),
+                    proj_b: r.tensor(e),
+                    ln2_g: r.tensor(e),
+                    ln2_b: r.tensor(e),
+                    fc_w: r.tensor(e * inter),
+                    fc_b: r.tensor(inter),
+                    up_w: Vec::new(),
+                    fc2_w: r.tensor(inter * e),
+                    fc2_b: r.tensor(e),
+                },
+                Arch::Qwen2 => Layer {
+                    ln1_g: r.tensor(e),
+                    ln1_b: Vec::new(),
+                    qkv_w: r.tensor(e * qkvd),
+                    qkv_b: r.tensor(qkvd),
+                    proj_w: r.tensor(qd * e),
+                    proj_b: vec![0.0; e],
+                    ln2_g: r.tensor(e),
+                    ln2_b: Vec::new(),
+                    fc_w: r.tensor(e * inter),
+                    fc_b: Vec::new(),
+                    up_w: r.tensor(e * inter),
+                    fc2_w: r.tensor(inter * e),
+                    fc2_b: Vec::new(),
+                },
             })
             .collect();
         let lnf_g = r.tensor(e);
-        let lnf_b = r.tensor(e);
+        let lnf_b = match arch {
+            Arch::Gpt2 => r.tensor(e),
+            Arch::Qwen2 => Vec::new(),
+        };
         assert_eq!(r.pos, buf.len(), "trailing bytes in model.bin");
         Ok(Model {
             config,

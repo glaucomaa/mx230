@@ -10,10 +10,11 @@ use serde_json::Value;
 use crate::model::{Config, Layer, Model};
 
 const HF_BASE: &str = "https://huggingface.co/openai-community/gpt2/resolve/main";
+const HF_QWEN_BASE: &str = "https://huggingface.co/Qwen/Qwen2.5-0.5B/resolve/main";
 const FILES: &[&str] = &["model.safetensors", "vocab.json", "merges.txt"];
 const WIKITEXT2_ROWS: &str = "https://datasets-server.huggingface.co/rows?dataset=Salesforce/wikitext&config=wikitext-2-raw-v1&split=test";
 
-pub fn download(dir: &Path) {
+fn fetch(base: &str, dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     for f in FILES {
         let dst = dir.join(f);
@@ -25,11 +26,19 @@ pub fn download(dir: &Path) {
         let status = Command::new("curl")
             .args(["-L", "--fail", "--progress-bar", "-o"])
             .arg(&dst)
-            .arg(format!("{HF_BASE}/{f}"))
+            .arg(format!("{base}/{f}"))
             .status()
             .expect("failed to run curl");
         assert!(status.success(), "download of {f} failed");
     }
+}
+
+pub fn download(dir: &Path) {
+    fetch(HF_BASE, dir);
+}
+
+pub fn download_qwen(dir: &Path) {
+    fetch(HF_QWEN_BASE, dir);
 }
 
 pub fn download_wikitext2(dir: &Path) {
@@ -94,15 +103,33 @@ fn tensor(st: &SafeTensors, name: &str) -> Vec<f32> {
         .tensor(name)
         .or_else(|_| st.tensor(&format!("transformer.{name}")))
         .unwrap_or_else(|_| panic!("tensor {name} not found"));
-    assert_eq!(
-        view.dtype(),
-        safetensors::Dtype::F32,
-        "{name}: expected f32"
-    );
-    view.data()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+    match view.dtype() {
+        safetensors::Dtype::F32 => view
+            .data()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+        safetensors::Dtype::BF16 => view
+            .data()
+            .chunks_exact(2)
+            .map(|c| {
+                let hi = u16::from_le_bytes(c.try_into().unwrap());
+                f32::from_bits((hi as u32) << 16)
+            })
+            .collect(),
+        d => panic!("{name}: unsupported dtype {d:?}"),
+    }
+}
+
+/// HF Linear stores [n_out, n_in]; our GEMV wants [n_in, n_out].
+fn transpose(w: &[f32], n_out: usize, n_in: usize) -> Vec<f32> {
+    let mut t = vec![0.0f32; w.len()];
+    for o in 0..n_out {
+        for i in 0..n_in {
+            t[i * n_out + o] = w[o * n_in + i];
+        }
+    }
+    t
 }
 
 pub fn convert(dir: &Path) -> Model {
@@ -122,6 +149,7 @@ pub fn convert(dir: &Path) -> Model {
             ln2_b: tensor(&st, &format!("h.{l}.ln_2.bias")),
             fc_w: tensor(&st, &format!("h.{l}.mlp.c_fc.weight")),
             fc_b: tensor(&st, &format!("h.{l}.mlp.c_fc.bias")),
+            up_w: Vec::new(),
             fc2_w: tensor(&st, &format!("h.{l}.mlp.c_proj.weight")),
             fc2_b: tensor(&st, &format!("h.{l}.mlp.c_proj.bias")),
         })
@@ -134,5 +162,67 @@ pub fn convert(dir: &Path) -> Model {
         layers,
         lnf_g: tensor(&st, "ln_f.weight"),
         lnf_b: tensor(&st, "ln_f.bias"),
+    }
+}
+
+pub fn convert_qwen(dir: &Path) -> Model {
+    let buf = std::fs::read(dir.join("model.safetensors")).expect("run qwen download first");
+    let st = SafeTensors::deserialize(&buf).unwrap();
+    let config = Config::qwen25_05b();
+    let (e, inter) = (config.n_embd, config.n_inter);
+    let (qd, kvd, qkvd) = (config.q_dim(), config.kv_dim(), config.qkv_dim());
+
+    let layers = (0..config.n_layer)
+        .map(|l| {
+            let p = format!("model.layers.{l}");
+            // q/k/v are separate Linears; concatenate into one [e, q+k+v] GEMV
+            let q = transpose(&tensor(&st, &format!("{p}.self_attn.q_proj.weight")), qd, e);
+            let k = transpose(
+                &tensor(&st, &format!("{p}.self_attn.k_proj.weight")),
+                kvd,
+                e,
+            );
+            let v = transpose(
+                &tensor(&st, &format!("{p}.self_attn.v_proj.weight")),
+                kvd,
+                e,
+            );
+            let mut qkv_w = vec![0.0f32; e * qkvd];
+            for i in 0..e {
+                qkv_w[i * qkvd..i * qkvd + qd].copy_from_slice(&q[i * qd..(i + 1) * qd]);
+                qkv_w[i * qkvd + qd..i * qkvd + qd + kvd]
+                    .copy_from_slice(&k[i * kvd..(i + 1) * kvd]);
+                qkv_w[i * qkvd + qd + kvd..(i + 1) * qkvd]
+                    .copy_from_slice(&v[i * kvd..(i + 1) * kvd]);
+            }
+            let mut qkv_b = tensor(&st, &format!("{p}.self_attn.q_proj.bias"));
+            qkv_b.extend(tensor(&st, &format!("{p}.self_attn.k_proj.bias")));
+            qkv_b.extend(tensor(&st, &format!("{p}.self_attn.v_proj.bias")));
+
+            Layer {
+                ln1_g: tensor(&st, &format!("{p}.input_layernorm.weight")),
+                ln1_b: Vec::new(),
+                qkv_w,
+                qkv_b,
+                proj_w: transpose(&tensor(&st, &format!("{p}.self_attn.o_proj.weight")), e, qd),
+                proj_b: vec![0.0; e],
+                ln2_g: tensor(&st, &format!("{p}.post_attention_layernorm.weight")),
+                ln2_b: Vec::new(),
+                fc_w: transpose(&tensor(&st, &format!("{p}.mlp.gate_proj.weight")), inter, e),
+                fc_b: Vec::new(),
+                up_w: transpose(&tensor(&st, &format!("{p}.mlp.up_proj.weight")), inter, e),
+                fc2_w: transpose(&tensor(&st, &format!("{p}.mlp.down_proj.weight")), e, inter),
+                fc2_b: Vec::new(),
+            }
+        })
+        .collect();
+
+    Model {
+        config,
+        wte: tensor(&st, "model.embed_tokens.weight"), // tied lm_head
+        wpe: Vec::new(),                               // RoPE, no learned positions
+        layers,
+        lnf_g: tensor(&st, "model.norm.weight"),
+        lnf_b: Vec::new(),
     }
 }

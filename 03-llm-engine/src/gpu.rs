@@ -10,7 +10,7 @@ use cudarc::driver::{
 };
 use half::f16;
 
-use crate::model::{Config, Model};
+use crate::model::{Arch, Config, Model};
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
 
@@ -43,13 +43,29 @@ impl WeightMode {
         }
     }
 
-    pub fn weight_mb(self) -> f64 {
+    fn bytes_per_param(self) -> f64 {
         match self {
-            WeightMode::Fp32 => 498.0,
-            WeightMode::Fp16 => 249.0,
-            WeightMode::Int8 => 124.0,
+            WeightMode::Fp32 => 4.0,
+            WeightMode::Fp16 => 2.0,
+            WeightMode::Int8 => 1.0,
         }
     }
+}
+
+/// Approximate weight footprint on device for a given storage mode.
+pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
+    let (e, inter) = (c.n_embd, c.n_inter);
+    let mlp = match c.arch {
+        Arch::Gpt2 => 2 * e * inter,
+        Arch::Qwen2 => 3 * e * inter,
+    };
+    let per_layer = e * c.qkv_dim() + c.q_dim() * e + mlp;
+    let wpe = match c.arch {
+        Arch::Gpt2 => c.n_ctx * e,
+        Arch::Qwen2 => 0,
+    };
+    let params = c.n_vocab * e + wpe + c.n_layer * per_layer;
+    params as f64 * mode.bytes_per_param() / 1e6
 }
 
 impl fmt::Display for WeightMode {
@@ -105,17 +121,18 @@ fn to_half(w: &[f32]) -> Vec<f16> {
 
 struct LayerG {
     ln1_g: CudaSlice<f32>,
-    ln1_b: CudaSlice<f32>,
+    ln1_b: Option<CudaSlice<f32>>, // None for RMSNorm (Qwen2)
     qkv_w: Weights,
     qkv_b: CudaSlice<f32>,
     proj_w: Weights,
     proj_b: CudaSlice<f32>,
     ln2_g: CudaSlice<f32>,
-    ln2_b: CudaSlice<f32>,
-    fc_w: Weights,
-    fc_b: CudaSlice<f32>,
-    fc2_w: Weights,
-    fc2_b: CudaSlice<f32>,
+    ln2_b: Option<CudaSlice<f32>>,
+    fc_w: Weights, // GPT-2 fc | Qwen2 SwiGLU gate
+    fc_b: Option<CudaSlice<f32>>,
+    up_w: Option<Weights>, // Qwen2 SwiGLU up
+    fc2_w: Weights,        // GPT-2 fc2 | Qwen2 SwiGLU down
+    fc2_b: Option<CudaSlice<f32>>,
 }
 
 struct Kernels {
@@ -126,6 +143,10 @@ struct Kernels {
     embed_half_dyn: CudaFunction,
     embed_int8_dyn: CudaFunction,
     layernorm: CudaFunction,
+    rmsnorm: CudaFunction,
+    rope: CudaFunction,
+    rope_dyn: CudaFunction,
+    silu_mul: CudaFunction,
     gemv: CudaFunction,
     gemv_half: CudaFunction,
     gemv_int8: CudaFunction,
@@ -149,24 +170,36 @@ fn cfg1d(n: usize) -> LaunchConfig {
     }
 }
 
-fn layernorm(
+/// LayerNorm (bias present) or RMSNorm (bias None), one block.
+#[allow(clippy::too_many_arguments)]
+fn norm(
     stream: &Arc<CudaStream>,
-    f: &CudaFunction,
+    k: &Kernels,
     out: &mut CudaSlice<f32>,
     x: &CudaSlice<f32>,
     g: &CudaSlice<f32>,
-    b: &CudaSlice<f32>,
+    b: Option<&CudaSlice<f32>>,
     n: usize,
+    eps: f32,
 ) {
     let n_i = n as i32;
-    let mut lb = stream.launch_builder(f);
-    lb.arg(out).arg(x).arg(g).arg(b).arg(&n_i);
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { lb.launch(cfg) }.unwrap();
+    match b {
+        Some(b) => {
+            let mut lb = stream.launch_builder(&k.layernorm);
+            lb.arg(out).arg(x).arg(g).arg(b).arg(&n_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+        None => {
+            let mut lb = stream.launch_builder(&k.rmsnorm);
+            lb.arg(out).arg(x).arg(g).arg(&n_i).arg(&eps);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,7 +259,7 @@ pub struct Engine {
     wpe: CudaSlice<f32>,
     layers: Vec<LayerG>,
     lnf_g: CudaSlice<f32>,
-    lnf_b: CudaSlice<f32>,
+    lnf_b: Option<CudaSlice<f32>>,
     kv: KvCache,
     // scratch buffers
     x: CudaSlice<f32>,
@@ -234,6 +267,7 @@ pub struct Engine {
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     h: CudaSlice<f32>,
+    h2: CudaSlice<f32>,        // SwiGLU up-branch scratch (Qwen2)
     zero_bias: CudaSlice<f32>, // for the bias-free lm_head GEMV
     logits: CudaSlice<f32>,
     graph_tok: CudaSlice<i32>,
@@ -260,6 +294,10 @@ impl Engine {
             embed_half_dyn: f("embed_half_dyn"),
             embed_int8_dyn: f("embed_int8_dyn"),
             layernorm: f("layernorm"),
+            rmsnorm: f("rmsnorm"),
+            rope: f("rope"),
+            rope_dyn: f("rope_dyn"),
+            silu_mul: f("silu_mul"),
             gemv: f("gemv"),
             gemv_half: f("gemv_half"),
             gemv_int8: f("gemv_int8"),
@@ -298,22 +336,35 @@ impl Engine {
             }
         }
 
+        let opt = |t: &[f32]| -> Option<CudaSlice<f32>> {
+            if t.is_empty() {
+                None
+            } else {
+                Some(up(t))
+            }
+        };
+        let (qd, qkvd, inter) = (c.q_dim(), c.qkv_dim(), c.n_inter);
         let layers = model
             .layers
             .iter()
             .map(|l| LayerG {
                 ln1_g: up(&l.ln1_g),
-                ln1_b: up(&l.ln1_b),
-                qkv_w: upw(&l.qkv_w, e, 3 * e),
+                ln1_b: opt(&l.ln1_b),
+                qkv_w: upw(&l.qkv_w, e, qkvd),
                 qkv_b: up(&l.qkv_b),
-                proj_w: upw(&l.proj_w, e, e),
+                proj_w: upw(&l.proj_w, qd, e),
                 proj_b: up(&l.proj_b),
                 ln2_g: up(&l.ln2_g),
-                ln2_b: up(&l.ln2_b),
-                fc_w: upw(&l.fc_w, e, 4 * e),
-                fc_b: up(&l.fc_b),
-                fc2_w: upw(&l.fc2_w, 4 * e, e),
-                fc2_b: up(&l.fc2_b),
+                ln2_b: opt(&l.ln2_b),
+                fc_w: upw(&l.fc_w, e, inter),
+                fc_b: opt(&l.fc_b),
+                up_w: if l.up_w.is_empty() {
+                    None
+                } else {
+                    Some(upw(&l.up_w, e, inter))
+                },
+                fc2_w: upw(&l.fc2_w, inter, e),
+                fc2_b: opt(&l.fc2_b),
             })
             .collect();
 
@@ -321,40 +372,47 @@ impl Engine {
             config: c,
             k,
             wte_t: upw(&wte_t, e, v),
-            wpe: up(&model.wpe),
+            // RoPE models have no learned positions; a zero table keeps the
+            // embed kernels uniform across archs
+            wpe: if model.wpe.is_empty() {
+                stream.alloc_zeros(c.n_ctx * e).unwrap()
+            } else {
+                up(&model.wpe)
+            },
             layers,
             lnf_g: up(&model.lnf_g),
-            lnf_b: up(&model.lnf_b),
+            lnf_b: opt(&model.lnf_b),
             kv: if kv8 {
                 KvCache::Q8 {
                     k: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
                         .collect(),
                     v: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
                         .collect(),
                     ks: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_head).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
                         .collect(),
                     vs: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_head).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
                         .collect(),
                 }
             } else {
                 KvCache::F32 {
                     k: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
                         .collect(),
                     v: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
                         .collect(),
                 }
             },
             x: stream.alloc_zeros(e).unwrap(),
             xb: stream.alloc_zeros(e).unwrap(),
-            qkv: stream.alloc_zeros(3 * e).unwrap(),
-            attn: stream.alloc_zeros(e).unwrap(),
-            h: stream.alloc_zeros(4 * e).unwrap(),
+            qkv: stream.alloc_zeros(qkvd).unwrap(),
+            attn: stream.alloc_zeros(qd).unwrap(),
+            h: stream.alloc_zeros(inter).unwrap(),
+            h2: stream.alloc_zeros(inter).unwrap(),
             zero_bias: stream.alloc_zeros(v).unwrap(),
             logits: stream.alloc_zeros(v).unwrap(),
             graph_tok: stream.alloc_zeros(1).unwrap(),
@@ -448,18 +506,22 @@ impl Engine {
 
     fn forward_body(&mut self, pos: usize) {
         let c = self.config;
-        let (e, nh, hd) = (c.n_embd, c.n_head, c.head_dim());
+        let e = c.n_embd;
+        let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let eps = c.norm_eps;
         for l in 0..c.n_layer {
             let layer = &self.layers[l];
 
-            layernorm(
+            norm(
                 &self.stream,
-                &self.k.layernorm,
+                &self.k,
                 &mut self.xb,
                 &self.x,
                 &layer.ln1_g,
-                &layer.ln1_b,
+                layer.ln1_b.as_ref(),
                 e,
+                eps,
             );
             gemv(
                 &self.stream,
@@ -469,10 +531,21 @@ impl Engine {
                 &layer.qkv_w,
                 &layer.qkv_b,
                 e,
-                3 * e,
+                qkvd,
             );
 
-            let (t_i, nh_i, hd_i) = (pos as i32, nh as i32, hd as i32);
+            let (t_i, nh_i, nkv_i, hd_i) = (pos as i32, nh as i32, nkv as i32, hd as i32);
+            if c.arch == Arch::Qwen2 {
+                let mut lb = self.stream.launch_builder(&self.k.rope);
+                lb.arg(&mut self.qkv)
+                    .arg(&t_i)
+                    .arg(&nh_i)
+                    .arg(&nkv_i)
+                    .arg(&hd_i)
+                    .arg(&c.rope_theta);
+                unsafe { lb.launch(cfg1d((nh + nkv) * hd / 2)) }.unwrap();
+            }
+
             let attn_cfg = LaunchConfig {
                 grid_dim: (nh as u32, 1, 1),
                 block_dim: (128, 1, 1),
@@ -482,14 +555,14 @@ impl Engine {
                 KvCache::F32 { k, v } => {
                     self.stream
                         .memcpy_dtod(
-                            &self.qkv.slice(e..2 * e),
-                            &mut k[l].slice_mut(pos * e..(pos + 1) * e),
+                            &self.qkv.slice(qd..qd + kvd),
+                            &mut k[l].slice_mut(pos * kvd..(pos + 1) * kvd),
                         )
                         .unwrap();
                     self.stream
                         .memcpy_dtod(
-                            &self.qkv.slice(2 * e..3 * e),
-                            &mut v[l].slice_mut(pos * e..(pos + 1) * e),
+                            &self.qkv.slice(qd + kvd..qkvd),
+                            &mut v[l].slice_mut(pos * kvd..(pos + 1) * kvd),
                         )
                         .unwrap();
 
@@ -500,12 +573,14 @@ impl Engine {
                         .arg(&v[l])
                         .arg(&t_i)
                         .arg(&nh_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
                 KvCache::Q8 { k, v, ks, vs } => {
+                    let qd_i = qd as i32;
                     let q_cfg = LaunchConfig {
-                        grid_dim: (nh as u32, 1, 1),
+                        grid_dim: (nkv as u32, 1, 1),
                         block_dim: (hd as u32, 1, 1),
                         shared_mem_bytes: 0,
                     };
@@ -516,7 +591,8 @@ impl Engine {
                         .arg(&mut vs[l])
                         .arg(&self.qkv)
                         .arg(&t_i)
-                        .arg(&nh_i)
+                        .arg(&qd_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(q_cfg) }.unwrap();
 
@@ -529,6 +605,7 @@ impl Engine {
                         .arg(&vs[l])
                         .arg(&t_i)
                         .arg(&nh_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
@@ -541,19 +618,20 @@ impl Engine {
                 &self.attn,
                 &layer.proj_w,
                 &layer.proj_b,
-                e,
+                qd,
                 e,
             );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
 
-            layernorm(
+            norm(
                 &self.stream,
-                &self.k.layernorm,
+                &self.k,
                 &mut self.xb,
                 &self.x,
                 &layer.ln2_g,
-                &layer.ln2_b,
+                layer.ln2_b.as_ref(),
                 e,
+                eps,
             );
             gemv(
                 &self.stream,
@@ -561,35 +639,55 @@ impl Engine {
                 &mut self.h,
                 &self.xb,
                 &layer.fc_w,
-                &layer.fc_b,
+                layer.fc_b.as_ref().unwrap_or(&self.zero_bias),
                 e,
-                4 * e,
+                inter,
             );
-            let n_i = (4 * e) as i32;
-            let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
-            lb.arg(&mut self.h).arg(&n_i);
-            unsafe { lb.launch(cfg1d(4 * e)) }.unwrap();
+            let n_i = inter as i32;
+            match &layer.up_w {
+                None => {
+                    let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
+                    lb.arg(&mut self.h).arg(&n_i);
+                    unsafe { lb.launch(cfg1d(inter)) }.unwrap();
+                }
+                Some(up_w) => {
+                    gemv(
+                        &self.stream,
+                        &self.k,
+                        &mut self.h2,
+                        &self.xb,
+                        up_w,
+                        &self.zero_bias,
+                        e,
+                        inter,
+                    );
+                    let mut lb = self.stream.launch_builder(&self.k.silu_mul);
+                    lb.arg(&mut self.h).arg(&self.h2).arg(&n_i);
+                    unsafe { lb.launch(cfg1d(inter)) }.unwrap();
+                }
+            }
             gemv(
                 &self.stream,
                 &self.k,
                 &mut self.xb,
                 &self.h,
                 &layer.fc2_w,
-                &layer.fc2_b,
-                4 * e,
+                layer.fc2_b.as_ref().unwrap_or(&self.zero_bias),
+                inter,
                 e,
             );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
         }
 
-        layernorm(
+        norm(
             &self.stream,
-            &self.k.layernorm,
+            &self.k,
             &mut self.xb,
             &self.x,
             &self.lnf_g,
-            &self.lnf_b,
+            self.lnf_b.as_ref(),
             e,
+            eps,
         );
         gemv(
             &self.stream,
@@ -605,18 +703,22 @@ impl Engine {
 
     fn forward_body_dyn(&mut self) {
         let c = self.config;
-        let (e, nh, hd) = (c.n_embd, c.n_head, c.head_dim());
+        let e = c.n_embd;
+        let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let eps = c.norm_eps;
         for l in 0..c.n_layer {
             let layer = &self.layers[l];
 
-            layernorm(
+            norm(
                 &self.stream,
-                &self.k.layernorm,
+                &self.k,
                 &mut self.xb,
                 &self.x,
                 &layer.ln1_g,
-                &layer.ln1_b,
+                layer.ln1_b.as_ref(),
                 e,
+                eps,
             );
             gemv(
                 &self.stream,
@@ -626,10 +728,21 @@ impl Engine {
                 &layer.qkv_w,
                 &layer.qkv_b,
                 e,
-                3 * e,
+                qkvd,
             );
 
-            let (nh_i, hd_i) = (nh as i32, hd as i32);
+            let (nh_i, nkv_i, hd_i) = (nh as i32, nkv as i32, hd as i32);
+            if c.arch == Arch::Qwen2 {
+                let mut lb = self.stream.launch_builder(&self.k.rope_dyn);
+                lb.arg(&mut self.qkv)
+                    .arg(&self.graph_pos)
+                    .arg(&nh_i)
+                    .arg(&nkv_i)
+                    .arg(&hd_i)
+                    .arg(&c.rope_theta);
+                unsafe { lb.launch(cfg1d((nh + nkv) * hd / 2)) }.unwrap();
+            }
+
             let attn_cfg = LaunchConfig {
                 grid_dim: (nh as u32, 1, 1),
                 block_dim: (128, 1, 1),
@@ -637,14 +750,15 @@ impl Engine {
             };
             match &mut self.kv {
                 KvCache::F32 { k, v } => {
-                    let e_i = e as i32;
+                    let (qd_i, kvd_i) = (qd as i32, kvd as i32);
                     let mut lb = self.stream.launch_builder(&self.k.copy_kv_dyn);
                     lb.arg(&mut k[l])
                         .arg(&mut v[l])
                         .arg(&self.qkv)
                         .arg(&self.graph_pos)
-                        .arg(&e_i);
-                    unsafe { lb.launch(cfg1d(e)) }.unwrap();
+                        .arg(&qd_i)
+                        .arg(&kvd_i);
+                    unsafe { lb.launch(cfg1d(kvd)) }.unwrap();
 
                     let mut lb = self.stream.launch_builder(&self.k.attn_decode_dyn);
                     lb.arg(&mut self.attn)
@@ -653,12 +767,14 @@ impl Engine {
                         .arg(&v[l])
                         .arg(&self.graph_pos)
                         .arg(&nh_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
                 KvCache::Q8 { k, v, ks, vs } => {
+                    let qd_i = qd as i32;
                     let q_cfg = LaunchConfig {
-                        grid_dim: (nh as u32, 1, 1),
+                        grid_dim: (nkv as u32, 1, 1),
                         block_dim: (hd as u32, 1, 1),
                         shared_mem_bytes: 0,
                     };
@@ -669,7 +785,8 @@ impl Engine {
                         .arg(&mut vs[l])
                         .arg(&self.qkv)
                         .arg(&self.graph_pos)
-                        .arg(&nh_i)
+                        .arg(&qd_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(q_cfg) }.unwrap();
 
@@ -682,6 +799,7 @@ impl Engine {
                         .arg(&vs[l])
                         .arg(&self.graph_pos)
                         .arg(&nh_i)
+                        .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
@@ -694,19 +812,20 @@ impl Engine {
                 &self.attn,
                 &layer.proj_w,
                 &layer.proj_b,
-                e,
+                qd,
                 e,
             );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
 
-            layernorm(
+            norm(
                 &self.stream,
-                &self.k.layernorm,
+                &self.k,
                 &mut self.xb,
                 &self.x,
                 &layer.ln2_g,
-                &layer.ln2_b,
+                layer.ln2_b.as_ref(),
                 e,
+                eps,
             );
             gemv(
                 &self.stream,
@@ -714,35 +833,55 @@ impl Engine {
                 &mut self.h,
                 &self.xb,
                 &layer.fc_w,
-                &layer.fc_b,
+                layer.fc_b.as_ref().unwrap_or(&self.zero_bias),
                 e,
-                4 * e,
+                inter,
             );
-            let n_i = (4 * e) as i32;
-            let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
-            lb.arg(&mut self.h).arg(&n_i);
-            unsafe { lb.launch(cfg1d(4 * e)) }.unwrap();
+            let n_i = inter as i32;
+            match &layer.up_w {
+                None => {
+                    let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
+                    lb.arg(&mut self.h).arg(&n_i);
+                    unsafe { lb.launch(cfg1d(inter)) }.unwrap();
+                }
+                Some(up_w) => {
+                    gemv(
+                        &self.stream,
+                        &self.k,
+                        &mut self.h2,
+                        &self.xb,
+                        up_w,
+                        &self.zero_bias,
+                        e,
+                        inter,
+                    );
+                    let mut lb = self.stream.launch_builder(&self.k.silu_mul);
+                    lb.arg(&mut self.h).arg(&self.h2).arg(&n_i);
+                    unsafe { lb.launch(cfg1d(inter)) }.unwrap();
+                }
+            }
             gemv(
                 &self.stream,
                 &self.k,
                 &mut self.xb,
                 &self.h,
                 &layer.fc2_w,
-                &layer.fc2_b,
-                4 * e,
+                layer.fc2_b.as_ref().unwrap_or(&self.zero_bias),
+                inter,
                 e,
             );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
         }
 
-        layernorm(
+        norm(
             &self.stream,
-            &self.k.layernorm,
+            &self.k,
             &mut self.xb,
             &self.x,
             &self.lnf_g,
-            &self.lnf_b,
+            self.lnf_b.as_ref(),
             e,
+            eps,
         );
         gemv(
             &self.stream,

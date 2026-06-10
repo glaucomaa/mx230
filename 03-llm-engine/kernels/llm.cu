@@ -142,6 +142,11 @@ extern "C" __global__ void gemv_half(float *y, const float *x, const __half *w,
 }
 
 // int8 weights with one fp32 scale per output column (absmax quantization).
+// For wide outputs (a multiple of 4) each thread produces 4 outputs from
+// char4 loads — without this the kernel is instruction-bound on byte loads
+// and loses to fp16 despite moving half the bytes. Narrow outputs keep one
+// output per thread: dropping the thread count 4x there starves the SMs of
+// latency-hiding warps and costs more than the wider loads gain.
 extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char *w,
                                      const float *scales, const float *b,
                                      int n_in, int n_out) {
@@ -149,6 +154,28 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
     for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[i] = x[i];
     __syncthreads();
 
+    if (n_out % 4 == 0 && n_out >= 4096) {
+        const char4 *w4 = (const char4 *)w;
+        int n4 = n_out / 4;
+        for (int o4 = blockIdx.x * blockDim.x + threadIdx.x; o4 < n4;
+             o4 += gridDim.x * blockDim.x) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int i = 0; i < n_in; ++i) {
+                char4 c = w4[(size_t)i * n4 + o4];
+                float xi = xs[i];
+                a0 += xi * (float)c.x;
+                a1 += xi * (float)c.y;
+                a2 += xi * (float)c.z;
+                a3 += xi * (float)c.w;
+            }
+            int o = 4 * o4;
+            y[o + 0] = a0 * scales[o + 0] + (b ? b[o + 0] : 0.0f);
+            y[o + 1] = a1 * scales[o + 1] + (b ? b[o + 1] : 0.0f);
+            y[o + 2] = a2 * scales[o + 2] + (b ? b[o + 2] : 0.0f);
+            y[o + 3] = a3 * scales[o + 3] + (b ? b[o + 3] : 0.0f);
+        }
+        return;
+    }
     for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n_out;
          o += gridDim.x * blockDim.x) {
         float acc = 0.0f;
@@ -160,26 +187,84 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
 }
 
 extern "C" __global__ void copy_kv_dyn(float *kcache, float *vcache, const float *qkv,
-                                       const int *pos_ptr, int n_embd) {
+                                       const int *pos_ptr, int q_dim, int kv_dim) {
     int pos = *pos_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n_embd) {
-        kcache[(size_t)pos * n_embd + i] = qkv[n_embd + i];
-        vcache[(size_t)pos * n_embd + i] = qkv[2 * n_embd + i];
+    if (i < kv_dim) {
+        kcache[(size_t)pos * kv_dim + i] = qkv[q_dim + i];
+        vcache[(size_t)pos * kv_dim + i] = qkv[q_dim + kv_dim + i];
+    }
+}
+
+// RMSNorm: out = x / sqrt(mean(x^2) + eps) * g. One block.
+extern "C" __global__ void rmsnorm(float *out, const float *x, const float *g,
+                                   int n, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    float s = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) s += x[i] * x[i];
+    red[tid] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / n + eps);
+    __syncthreads();
+    for (int i = tid; i < n; i += blockDim.x) {
+        out[i] = x[i] * inv * g[i];
+    }
+}
+
+// Rotary position embedding over the Q and K sections of the qkv buffer
+// (HF rotate_half convention: pairs are (d, d + head_dim/2)). K heads follow
+// Q heads directly in memory, so one flat index covers both.
+__device__ void rope_impl(float *qkv, int pos, int n_head, int n_kv_head,
+                          int head_dim, float theta) {
+    int half = head_dim / 2;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (n_head + n_kv_head) * half) return;
+    int h = i / half;
+    int d = i % half;
+    float *base = qkv + h * head_dim;
+    float freq = __powf(theta, -2.0f * d / head_dim);
+    float c, s;
+    __sincosf(pos * freq, &s, &c);
+    float x1 = base[d], x2 = base[d + half];
+    base[d] = x1 * c - x2 * s;
+    base[d + half] = x1 * s + x2 * c;
+}
+
+extern "C" __global__ void rope(float *qkv, int pos, int n_head, int n_kv_head,
+                                int head_dim, float theta) {
+    rope_impl(qkv, pos, n_head, n_kv_head, head_dim, theta);
+}
+
+extern "C" __global__ void rope_dyn(float *qkv, const int *pos_ptr, int n_head,
+                                    int n_kv_head, int head_dim, float theta) {
+    rope_impl(qkv, *pos_ptr, n_head, n_kv_head, head_dim, theta);
+}
+
+// SwiGLU combine: x = silu(x) * y.
+extern "C" __global__ void silu_mul(float *x, const float *y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v / (1.0f + __expf(-v)) * y[i];
     }
 }
 
 // Quantizes the new K/V rows into int8 caches, one fp32 absmax scale per
-// (position, head). One block per head, one thread per head dim.
+// (position, kv head). One block per kv head, one thread per head dim.
 __device__ void quantize_kv_impl(signed char *kq, signed char *vq,
                                  float *ks, float *vs, const float *qkv,
-                                 int pos, int n_head, int head_dim) {
+                                 int pos, int q_dim, int n_kv_head, int head_dim) {
     __shared__ float red[128];
     int h = blockIdx.x;
     int d = threadIdx.x;
-    int e = n_head * head_dim;
-    const float *k = qkv + e + h * head_dim;
-    const float *v = qkv + 2 * e + h * head_dim;
+    int kv_dim = n_kv_head * head_dim;
+    const float *k = qkv + q_dim + h * head_dim;
+    const float *v = qkv + q_dim + kv_dim + h * head_dim;
 
     red[d] = fabsf(k[d]);
     __syncthreads();
@@ -198,44 +283,47 @@ __device__ void quantize_kv_impl(signed char *kq, signed char *vq,
     }
     float vscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
 
-    size_t row = (size_t)pos * e + h * head_dim;
+    size_t row = (size_t)pos * kv_dim + h * head_dim;
     kq[row + d] = (signed char)lrintf(k[d] / kscale);
     vq[row + d] = (signed char)lrintf(v[d] / vscale);
     if (d == 0) {
-        ks[pos * n_head + h] = kscale;
-        vs[pos * n_head + h] = vscale;
+        ks[pos * n_kv_head + h] = kscale;
+        vs[pos * n_kv_head + h] = vscale;
     }
 }
 
 extern "C" __global__ void quantize_kv(signed char *kq, signed char *vq,
                                        float *ks, float *vs, const float *qkv,
-                                       int pos, int n_head, int head_dim) {
-    quantize_kv_impl(kq, vq, ks, vs, qkv, pos, n_head, head_dim);
+                                       int pos, int q_dim, int n_kv_head, int head_dim) {
+    quantize_kv_impl(kq, vq, ks, vs, qkv, pos, q_dim, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void quantize_kv_dyn(signed char *kq, signed char *vq,
                                            float *ks, float *vs, const float *qkv,
-                                           const int *pos_ptr, int n_head, int head_dim) {
-    quantize_kv_impl(kq, vq, ks, vs, qkv, *pos_ptr, n_head, head_dim);
+                                           const int *pos_ptr, int q_dim, int n_kv_head,
+                                           int head_dim) {
+    quantize_kv_impl(kq, vq, ks, vs, qkv, *pos_ptr, q_dim, n_kv_head, head_dim);
 }
 
-// Causal attention for one new token over the KV cache (one block per head).
-// Cache layout per layer: [t][n_embd] where each row is heads*head_dim.
+// Causal attention for one new token over the KV cache (one block per query
+// head). Cache layout per layer: [t][n_kv_head * head_dim]; with grouped-query
+// attention (n_kv_head < n_head) several query heads share one kv head.
 // Scores for up to n_ctx cached positions live in shared memory.
 __device__ void attn_decode_impl(float *out, const float *qkv,
                                  const float *kcache, const float *vcache,
-                                 int t_cur, int n_head, int head_dim) {
+                                 int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
     __shared__ float red[128];
     int h = blockIdx.x;
     int tid = threadIdx.x;
-    int e = n_head * head_dim;
+    int kvd = n_kv_head * head_dim;
+    int kvh = h / (n_head / n_kv_head);
     const float *q = qkv + h * head_dim;
     float scale = rsqrtf((float)head_dim);
 
     float m = -CUDART_INF_F;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
-        const float *k = kcache + (size_t)t * e + h * head_dim;
+        const float *k = kcache + (size_t)t * kvd + kvh * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) dot += q[d] * k[d];
         s[t] = dot * scale;
@@ -267,7 +355,7 @@ __device__ void attn_decode_impl(float *out, const float *qkv,
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t <= t_cur; ++t) {
-            acc += s[t] * vcache[(size_t)t * e + h * head_dim + d];
+            acc += s[t] * vcache[(size_t)t * kvd + kvh * head_dim + d];
         }
         out[h * head_dim + d] = acc * inv;
     }
@@ -275,14 +363,15 @@ __device__ void attn_decode_impl(float *out, const float *qkv,
 
 extern "C" __global__ void attn_decode(float *out, const float *qkv,
                                        const float *kcache, const float *vcache,
-                                       int t_cur, int n_head, int head_dim) {
-    attn_decode_impl(out, qkv, kcache, vcache, t_cur, n_head, head_dim);
+                                       int t_cur, int n_head, int n_kv_head, int head_dim) {
+    attn_decode_impl(out, qkv, kcache, vcache, t_cur, n_head, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void attn_decode_dyn(float *out, const float *qkv,
                                            const float *kcache, const float *vcache,
-                                           const int *pos_ptr, int n_head, int head_dim) {
-    attn_decode_impl(out, qkv, kcache, vcache, *pos_ptr, n_head, head_dim);
+                                           const int *pos_ptr, int n_head, int n_kv_head,
+                                           int head_dim) {
+    attn_decode_impl(out, qkv, kcache, vcache, *pos_ptr, n_head, n_kv_head, head_dim);
 }
 
 // Same attention over an int8 KV cache: scores and the V accumulation
@@ -291,12 +380,13 @@ extern "C" __global__ void attn_decode_dyn(float *out, const float *qkv,
 __device__ void attn_decode_q8_impl(float *out, const float *qkv,
                                     const signed char *kq, const signed char *vq,
                                     const float *ks, const float *vs,
-                                    int t_cur, int n_head, int head_dim) {
+                                    int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
     __shared__ float red[128];
     int h = blockIdx.x;
     int tid = threadIdx.x;
-    int e = n_head * head_dim;
+    int kvd = n_kv_head * head_dim;
+    int kvh = h / (n_head / n_kv_head);
     const float *q = qkv + h * head_dim;
     float scale = rsqrtf((float)head_dim);
 
@@ -304,14 +394,14 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
     for (int t = tid; t <= t_cur; t += blockDim.x) {
         // head rows are head_dim-byte aligned, so char4 loads are safe and
         // cut the byte-load instruction count 4x
-        const char4 *k4 = (const char4 *)(kq + (size_t)t * e + h * head_dim);
+        const char4 *k4 = (const char4 *)(kq + (size_t)t * kvd + kvh * head_dim);
         float dot = 0.0f;
         for (int d = 0; d < head_dim / 4; ++d) {
             char4 c = k4[d];
             dot += q[4 * d] * (float)c.x + q[4 * d + 1] * (float)c.y +
                    q[4 * d + 2] * (float)c.z + q[4 * d + 3] * (float)c.w;
         }
-        s[t] = dot * ks[t * n_head + h] * scale;
+        s[t] = dot * ks[t * n_kv_head + kvh] * scale;
         m = fmaxf(m, s[t]);
     }
     red[tid] = m;
@@ -340,8 +430,8 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t <= t_cur; ++t) {
-            acc += s[t] * vs[t * n_head + h] *
-                   (float)vq[(size_t)t * e + h * head_dim + d];
+            acc += s[t] * vs[t * n_kv_head + kvh] *
+                   (float)vq[(size_t)t * kvd + kvh * head_dim + d];
         }
         out[h * head_dim + d] = acc * inv;
     }
@@ -350,15 +440,17 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
 extern "C" __global__ void attn_decode_q8(float *out, const float *qkv,
                                           const signed char *kq, const signed char *vq,
                                           const float *ks, const float *vs,
-                                          int t_cur, int n_head, int head_dim) {
-    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, t_cur, n_head, head_dim);
+                                          int t_cur, int n_head, int n_kv_head,
+                                          int head_dim) {
+    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, t_cur, n_head, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void attn_decode_q8_dyn(float *out, const float *qkv,
                                               const signed char *kq, const signed char *vq,
                                               const float *ks, const float *vs,
-                                              const int *pos_ptr, int n_head, int head_dim) {
-    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, *pos_ptr, n_head, head_dim);
+                                              const int *pos_ptr, int n_head, int n_kv_head,
+                                              int head_dim) {
+    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, *pos_ptr, n_head, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void add_inplace(float *x, const float *y, int n) {
