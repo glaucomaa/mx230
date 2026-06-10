@@ -58,6 +58,22 @@ impl fmt::Display for WeightMode {
     }
 }
 
+/// Per-layer KV cache, either fp32 or int8 with one absmax scale per
+/// (position, head). Quantization happens on write (quantize_kv kernel),
+/// dequantization inside the attention kernel.
+enum KvCache {
+    F32 {
+        k: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_embd]
+        v: Vec<CudaSlice<f32>>,
+    },
+    Q8 {
+        k: Vec<CudaSlice<i8>>,
+        v: Vec<CudaSlice<i8>>,
+        ks: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_head]
+        vs: Vec<CudaSlice<f32>>,
+    },
+}
+
 pub enum Weights {
     F32(CudaSlice<f32>),
     F16(CudaSlice<f16>),
@@ -114,8 +130,12 @@ struct Kernels {
     gemv_half: CudaFunction,
     gemv_int8: CudaFunction,
     copy_kv_dyn: CudaFunction,
+    quantize_kv: CudaFunction,
+    quantize_kv_dyn: CudaFunction,
     attn_decode: CudaFunction,
     attn_decode_dyn: CudaFunction,
+    attn_decode_q8: CudaFunction,
+    attn_decode_q8_dyn: CudaFunction,
     add_inplace: CudaFunction,
     gelu_inplace: CudaFunction,
     argmax_advance: CudaFunction,
@@ -207,8 +227,7 @@ pub struct Engine {
     layers: Vec<LayerG>,
     lnf_g: CudaSlice<f32>,
     lnf_b: CudaSlice<f32>,
-    kcache: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_embd]
-    vcache: Vec<CudaSlice<f32>>,
+    kv: KvCache,
     // scratch buffers
     x: CudaSlice<f32>,
     xb: CudaSlice<f32>,
@@ -223,7 +242,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode) -> Self {
+    pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode, kv8: bool) -> Self {
         let c = model.config;
         let (e, v) = (c.n_embd, c.n_vocab);
         // This engine schedules all work on one stream. Disabling cudarc's
@@ -245,8 +264,12 @@ impl Engine {
             gemv_half: f("gemv_half"),
             gemv_int8: f("gemv_int8"),
             copy_kv_dyn: f("copy_kv_dyn"),
+            quantize_kv: f("quantize_kv"),
+            quantize_kv_dyn: f("quantize_kv_dyn"),
             attn_decode: f("attn_decode"),
             attn_decode_dyn: f("attn_decode_dyn"),
+            attn_decode_q8: f("attn_decode_q8"),
+            attn_decode_q8_dyn: f("attn_decode_q8_dyn"),
             add_inplace: f("add_inplace"),
             gelu_inplace: f("gelu_inplace"),
             argmax_advance: f("argmax_advance"),
@@ -302,12 +325,31 @@ impl Engine {
             layers,
             lnf_g: up(&model.lnf_g),
             lnf_b: up(&model.lnf_b),
-            kcache: (0..c.n_layer)
-                .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
-                .collect(),
-            vcache: (0..c.n_layer)
-                .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
-                .collect(),
+            kv: if kv8 {
+                KvCache::Q8 {
+                    k: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .collect(),
+                    v: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .collect(),
+                    ks: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_head).unwrap())
+                        .collect(),
+                    vs: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_head).unwrap())
+                        .collect(),
+                }
+            } else {
+                KvCache::F32 {
+                    k: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .collect(),
+                    v: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                        .collect(),
+                }
+            },
             x: stream.alloc_zeros(e).unwrap(),
             xb: stream.alloc_zeros(e).unwrap(),
             qkv: stream.alloc_zeros(3 * e).unwrap(),
@@ -430,34 +472,67 @@ impl Engine {
                 3 * e,
             );
 
-            self.stream
-                .memcpy_dtod(
-                    &self.qkv.slice(e..2 * e),
-                    &mut self.kcache[l].slice_mut(pos * e..(pos + 1) * e),
-                )
-                .unwrap();
-            self.stream
-                .memcpy_dtod(
-                    &self.qkv.slice(2 * e..3 * e),
-                    &mut self.vcache[l].slice_mut(pos * e..(pos + 1) * e),
-                )
-                .unwrap();
-
             let (t_i, nh_i, hd_i) = (pos as i32, nh as i32, hd as i32);
-            let mut lb = self.stream.launch_builder(&self.k.attn_decode);
-            lb.arg(&mut self.attn)
-                .arg(&self.qkv)
-                .arg(&self.kcache[l])
-                .arg(&self.vcache[l])
-                .arg(&t_i)
-                .arg(&nh_i)
-                .arg(&hd_i);
-            let cfg = LaunchConfig {
+            let attn_cfg = LaunchConfig {
                 grid_dim: (nh as u32, 1, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { lb.launch(cfg) }.unwrap();
+            match &mut self.kv {
+                KvCache::F32 { k, v } => {
+                    self.stream
+                        .memcpy_dtod(
+                            &self.qkv.slice(e..2 * e),
+                            &mut k[l].slice_mut(pos * e..(pos + 1) * e),
+                        )
+                        .unwrap();
+                    self.stream
+                        .memcpy_dtod(
+                            &self.qkv.slice(2 * e..3 * e),
+                            &mut v[l].slice_mut(pos * e..(pos + 1) * e),
+                        )
+                        .unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode);
+                    lb.arg(&mut self.attn)
+                        .arg(&self.qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&t_i)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+                KvCache::Q8 { k, v, ks, vs } => {
+                    let q_cfg = LaunchConfig {
+                        grid_dim: (nh as u32, 1, 1),
+                        block_dim: (hd as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&mut ks[l])
+                        .arg(&mut vs[l])
+                        .arg(&self.qkv)
+                        .arg(&t_i)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(q_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_q8);
+                    lb.arg(&mut self.attn)
+                        .arg(&self.qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&ks[l])
+                        .arg(&vs[l])
+                        .arg(&t_i)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+            }
 
             gemv(
                 &self.stream,
@@ -554,30 +629,63 @@ impl Engine {
                 3 * e,
             );
 
-            let e_i = e as i32;
-            let mut lb = self.stream.launch_builder(&self.k.copy_kv_dyn);
-            lb.arg(&mut self.kcache[l])
-                .arg(&mut self.vcache[l])
-                .arg(&self.qkv)
-                .arg(&self.graph_pos)
-                .arg(&e_i);
-            unsafe { lb.launch(cfg1d(e)) }.unwrap();
-
             let (nh_i, hd_i) = (nh as i32, hd as i32);
-            let mut lb = self.stream.launch_builder(&self.k.attn_decode_dyn);
-            lb.arg(&mut self.attn)
-                .arg(&self.qkv)
-                .arg(&self.kcache[l])
-                .arg(&self.vcache[l])
-                .arg(&self.graph_pos)
-                .arg(&nh_i)
-                .arg(&hd_i);
-            let cfg = LaunchConfig {
+            let attn_cfg = LaunchConfig {
                 grid_dim: (nh as u32, 1, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { lb.launch(cfg) }.unwrap();
+            match &mut self.kv {
+                KvCache::F32 { k, v } => {
+                    let e_i = e as i32;
+                    let mut lb = self.stream.launch_builder(&self.k.copy_kv_dyn);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&self.qkv)
+                        .arg(&self.graph_pos)
+                        .arg(&e_i);
+                    unsafe { lb.launch(cfg1d(e)) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_dyn);
+                    lb.arg(&mut self.attn)
+                        .arg(&self.qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&self.graph_pos)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+                KvCache::Q8 { k, v, ks, vs } => {
+                    let q_cfg = LaunchConfig {
+                        grid_dim: (nh as u32, 1, 1),
+                        block_dim: (hd as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv_dyn);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&mut ks[l])
+                        .arg(&mut vs[l])
+                        .arg(&self.qkv)
+                        .arg(&self.graph_pos)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(q_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_q8_dyn);
+                    lb.arg(&mut self.attn)
+                        .arg(&self.qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&ks[l])
+                        .arg(&vs[l])
+                        .arg(&self.graph_pos)
+                        .arg(&nh_i)
+                        .arg(&hd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+            }
 
             gemv(
                 &self.stream,

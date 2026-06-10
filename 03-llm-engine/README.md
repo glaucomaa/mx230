@@ -1,14 +1,15 @@
 # Stage 3 — GPT-2 inference engine in plain CUDA
 
 GPT-2 124M running on hand-written CUDA kernels with a Rust host: custom
-weight format, byte-level BPE tokenizer (no tokenizer crates), KV cache,
-fp16 storage and int8 weight quantization. One command pipeline:
+weight format, byte-level BPE tokenizer (no tokenizer crates), KV cache
+(fp32 or int8), fp16 storage and int8 weight quantization. One command
+pipeline:
 
 ```
 cargo run -rp llm-engine -- export                    # download + convert weights
 cargo run -rp llm-engine -- verify                    # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8]
-cargo run -rp llm-engine -- bench -n 128 [--graphs]
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8] [--kv8]
+cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8]
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048
 ```
@@ -50,6 +51,24 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   step itself: small GEMVs that can't fully use the bus, attention and KV
   cache traffic still in fp32, and serial reductions (layernorm, softmax)
   that scale with depth, not bytes.
+- **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
+  absmax scale per (position, head) and dequantized inside the attention
+  kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
+  of decode that grows with context — drops 4x. KV traffic only matters at
+  long context (at position 900 it is 66 MB/token fp32, more than half the
+  int8 weights), so that is where the gain shows:
+
+  | mode | kv | tok/s @128 ctx | tok/s @900 ctx |
+  |------|------|------|------|
+  | fp32 | fp32 | 78.0 | 68.3 |
+  | fp32 | int8 | 79.1 | 74.4 |
+  | int8 | fp32 | 121.9 | 100.3 |
+  | int8 | int8 | 124.5 | **113.5** |
+
+  One implementation detail mattered: a naive byte-at-a-time dequant loop
+  made kv8 *slower* than fp32 (92 tok/s at 900 ctx) — the score kernel got
+  instruction-bound on byte loads. Vectorizing K loads as `char4` cut the
+  load count 4x and flipped the result.
 
 Quality is measured separately with:
 
@@ -61,11 +80,18 @@ cargo run -rp llm-engine -- ppl -n 2048
 The harness reports fp32/fp16/int8 perplexity on the same token slice, giving a
 quality-vs-traffic table instead of only argmax agreement.
 
-| mode | weights | WikiText-2 raw test tokens | perplexity |
-|------|---------|----------------------------|------------|
-| fp32 | ~498 MB | 2047                       | 25.388     |
-| fp16 | ~249 MB | 2047                       | 25.396     |
-| int8 | ~124 MB | 2047                       | 25.601     |
+| mode | kv | WikiText-2 raw test tokens | perplexity |
+|------|------|----------------------------|------------|
+| fp32 | fp32 | 2047                       | 25.388     |
+| fp16 | fp32 | 2047                       | 25.396     |
+| int8 | fp32 | 2047                       | 25.601     |
+| fp32 | int8 | 2047                       | 25.378     |
+| fp16 | int8 | 2047                       | 25.367     |
+| int8 | int8 | 2047                       | 25.596     |
+
+The int8 KV cache is free in quality terms: per-(position, head) absmax
+scales track the activation range closely enough that perplexity moves only
+in the noise.
 
 ## Pieces
 
@@ -77,16 +103,18 @@ quality-vs-traffic table instead of only argmax agreement.
 - `src/cpu.rs` — slow, obvious reference forward; ground truth for the GPU.
 - `kernels/llm.cu` — embed, layernorm (block reduction), GEMV (fp32 / fp16
   storage / int8 with per-output-channel absmax scales), fused causal KV-cache
-  attention (one block per head, online scores in shared memory), GELU,
-  residual add, GPU argmax for graph replay.
+  attention (one block per head, online scores in shared memory; fp32 and
+  int8-cache variants with `char4` dequant), quantize-on-write KV kernels,
+  GELU, residual add, GPU argmax for graph replay.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or
-  quantized at load; per-layer KV cache; standard host-greedy decode and a
-  CUDA-graph benchmark path.
+  quantized at load; per-layer KV cache (fp32 or int8 + scales); standard
+  host-greedy decode and a CUDA-graph benchmark path.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
-fp16 and int8 report allclose error and are checked for argmax agreement;
-the graph decode path must reproduce the host loop's greedy continuation
-token-for-token (checked 16 steps deep).
+fp16, int8 and both int8-KV variants report allclose error and are checked
+for argmax agreement; the graph decode path (with fp32 and int8 KV) must
+reproduce the host loop's greedy continuation token-for-token (checked 16
+steps deep).
 Sample output (greedy, so it loops — that's GPT-2 124M, not a bug):
 
 > Alan Turing was a brilliant mathematician, and he was a great friend of

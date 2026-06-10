@@ -1,9 +1,9 @@
 //! Stage 3: GPT-2 124M inference engine in plain CUDA.
 //!
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
-//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8]
+//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8] [--kv8]
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
-//!   cargo run -rp llm-engine -- bench [-n 64] [--graphs]
+//!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- ppl --data path [-n tokens]
 
 mod cpu;
@@ -98,11 +98,12 @@ fn main() {
                 .expect("usage: generate \"prompt\"");
             let n_new = opt_n(&args, 64);
             let mode = gpu::WeightMode::parse(&args);
+            let kv8 = flag(&args, "--kv8");
 
             let tok = tokenizer::Tokenizer::load(&models_dir());
             let model = load_model();
             let ctx = CudaContext::new(0).unwrap();
-            let mut engine = gpu::Engine::new(&ctx, &model, mode);
+            let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
 
             let ids = tok.encode(prompt);
             print!("{prompt}");
@@ -119,7 +120,11 @@ fn main() {
                 n_new,
                 dt,
                 (ids.len() + n_new) as f64 / dt,
-                mode
+                if kv8 {
+                    format!("{mode} + kv8")
+                } else {
+                    mode.to_string()
+                }
             );
         }
         Some("verify") => {
@@ -133,77 +138,83 @@ fn main() {
             let want = cpu::forward(&model, &ids);
 
             let ctx = CudaContext::new(0).unwrap();
-            for mode in [
-                gpu::WeightMode::Fp32,
-                gpu::WeightMode::Fp16,
-                gpu::WeightMode::Int8,
+            for (mode, kv8) in [
+                (gpu::WeightMode::Fp32, false),
+                (gpu::WeightMode::Fp16, false),
+                (gpu::WeightMode::Int8, false),
+                (gpu::WeightMode::Fp32, true),
+                (gpu::WeightMode::Int8, true),
             ] {
-                let mut engine = gpu::Engine::new(&ctx, &model, mode);
+                let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 let mut got = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     got = engine.forward(t, pos);
                 }
                 let err = common::allclose_err(&got, &want, 1e-2, 5e-2);
                 let (cw, gw) = (gpu::argmax(&want), gpu::argmax(&got));
+                let kv = if kv8 { "/kv8" } else { "" };
                 println!(
-                    "GPU {mode}: allclose_err = {err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?})",
+                    "GPU {mode}{kv}: allclose_err = {err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?})",
                     tok.decode(&[cw]),
                     tok.decode(&[gw]),
                 );
-                if mode == gpu::WeightMode::Fp32 {
+                if mode == gpu::WeightMode::Fp32 && !kv8 {
                     assert!(err < 1.0, "fp32 logits mismatch: {err}");
                 }
-                assert_eq!(cw, gw, "{mode} argmax mismatch");
+                assert_eq!(cw, gw, "{mode}{kv} argmax mismatch");
                 println!("  OK");
             }
 
             // graph decode must produce the same greedy continuation as the
             // host loop; any divergence propagates, so comparing the token
             // after n steps checks the whole path
-            let n_steps = 16;
-            let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32);
-            let mut logits = Vec::new();
-            for (pos, &t) in ids.iter().enumerate() {
-                logits = engine.forward(t, pos);
-            }
-            let first = gpu::argmax(&logits);
-            let mut pos = ids.len();
-            for _ in 0..n_steps {
-                let next = gpu::argmax(&logits);
-                logits = engine.forward(next, pos);
-                pos += 1;
-            }
-            let host_tok = gpu::argmax(&logits);
+            for kv8 in [false, true] {
+                let n_steps = 16;
+                let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32, kv8);
+                let mut logits = Vec::new();
+                for (pos, &t) in ids.iter().enumerate() {
+                    logits = engine.forward(t, pos);
+                }
+                let first = gpu::argmax(&logits);
+                let mut pos = ids.len();
+                for _ in 0..n_steps {
+                    let next = gpu::argmax(&logits);
+                    logits = engine.forward(next, pos);
+                    pos += 1;
+                }
+                let host_tok = gpu::argmax(&logits);
 
-            let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32);
-            for (pos, &t) in ids.iter().enumerate() {
-                engine.forward(t, pos);
+                let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32, kv8);
+                for (pos, &t) in ids.iter().enumerate() {
+                    engine.forward(t, pos);
+                }
+                let graph_tok = engine.graph_decode(first, ids.len(), n_steps);
+                assert_eq!(
+                    graph_tok, host_tok,
+                    "graph decode (kv8={kv8}) diverged from host decode after {n_steps} steps"
+                );
+                println!(
+                    "graph decode kv8={kv8}: token after {n_steps} steps matches host loop ({host_tok})  OK"
+                );
             }
-            let graph_tok = engine.graph_decode(first, ids.len(), n_steps);
-            assert_eq!(
-                graph_tok, host_tok,
-                "graph decode diverged from host decode after {n_steps} steps"
-            );
-            println!(
-                "graph decode: token after {n_steps} steps matches host loop ({host_tok})  OK"
-            );
         }
         Some("bench") => {
             let tok = tokenizer::Tokenizer::load(&models_dir());
             let model = load_model();
             let n_new = opt_n(&args, 64);
             let graphs = flag(&args, "--graphs");
+            let kv8 = flag(&args, "--kv8");
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
-            println!("| mode | weights | graph | tokens/sec |");
-            println!("|------|---------|-------|------------|");
+            println!("| mode | weights | kv | graph | tokens/sec |");
+            println!("|------|---------|----|-------|------------|");
             for mode in [
                 gpu::WeightMode::Fp32,
                 gpu::WeightMode::Fp16,
                 gpu::WeightMode::Int8,
             ] {
-                let mut engine = gpu::Engine::new(&ctx, &model, mode);
+                let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 // warmup + prefill
                 let mut logits = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
@@ -226,8 +237,9 @@ fn main() {
                 }
                 let dt = t0.elapsed().as_secs_f64();
                 println!(
-                    "| {mode} | ~{:.0} MB | {} | {:.1} |",
+                    "| {mode} | ~{:.0} MB | {} | {} | {:.1} |",
                     mode.weight_mb(),
+                    if kv8 { "int8" } else { "fp32" },
                     if graphs { "yes" } else { "no" },
                     n_new as f64 / dt
                 );
@@ -254,16 +266,22 @@ fn main() {
             let ctx = CudaContext::new(0).unwrap();
 
             println!("dataset: {} ({} tokens)", data_path.display(), ids.len());
-            println!("| mode | weights | tokens | perplexity |");
-            println!("|------|---------|--------|------------|");
-            for mode in [
-                gpu::WeightMode::Fp32,
-                gpu::WeightMode::Fp16,
-                gpu::WeightMode::Int8,
-            ] {
-                let mut engine = gpu::Engine::new(&ctx, &model, mode);
-                let (ppl, n) = perplexity(&mut engine, &ids);
-                println!("| {mode} | ~{:.0} MB | {n} | {ppl:.3} |", mode.weight_mb());
+            println!("| mode | weights | kv | tokens | perplexity |");
+            println!("|------|---------|----|--------|------------|");
+            for kv8 in [false, true] {
+                for mode in [
+                    gpu::WeightMode::Fp32,
+                    gpu::WeightMode::Fp16,
+                    gpu::WeightMode::Int8,
+                ] {
+                    let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                    let (ppl, n) = perplexity(&mut engine, &ids);
+                    println!(
+                        "| {mode} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
+                        mode.weight_mb(),
+                        if kv8 { "int8" } else { "fp32" },
+                    );
+                }
             }
         }
         _ => {
