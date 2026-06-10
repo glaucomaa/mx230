@@ -1,23 +1,44 @@
-//! Byte-level BPE tokenizer (vocab.json + merges.txt), no external tokenizer
-//! crates; covers both GPT-2 and Qwen2 vocabularies. Pre-tokenization
+//! Tokenizers, no external tokenizer crates.
+//!
+//! GPT-2/Qwen2: byte-level BPE (vocab.json + merges.txt). Pre-tokenization
 //! reproduces each model's split regex with a hand-rolled scanner, since the
 //! `regex` crate lacks lookahead. GPT-2:
 //! ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)
 //! Qwen2 differs: case-insensitive contractions, a word may absorb one
 //! leading non-letter, digits split one at a time, newlines separated.
+//!
+//! TinyLlama: SentencePiece BPE (vocab + merges parsed out of tokenizer.json).
+//! No split regex at all — spaces become the U+2581 marker, a marker is
+//! prepended, merges apply greedily by rank, and characters that never merged
+//! into a vocab entry fall back to <0xXX> byte tokens. BOS (id 1) is
+//! prepended on encode, the way the model was trained.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::model::Arch;
 
-pub struct Tokenizer {
+const SP_SPACE: char = '\u{2581}'; // '▁'
+
+pub enum Tokenizer {
+    Bpe(Box<ByteBpe>),
+    Sp(SpBpe),
+}
+
+pub struct ByteBpe {
     arch: Arch,
     vocab: HashMap<String, u32>,
     inv_vocab: HashMap<u32, String>,
     merges: HashMap<(String, String), usize>,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
+}
+
+pub struct SpBpe {
+    vocab: HashMap<String, u32>,
+    inv_vocab: HashMap<u32, String>,
+    merges: HashMap<(String, String), usize>,
+    bos: u32,
 }
 
 /// GPT-2's reversible byte <-> unicode mapping: printable bytes map to
@@ -218,6 +239,29 @@ fn pretokenize_qwen(text: &str) -> Vec<String> {
 
 impl Tokenizer {
     pub fn load(dir: &Path, arch: Arch) -> Self {
+        match arch {
+            Arch::Llama => Tokenizer::Sp(SpBpe::load(dir)),
+            _ => Tokenizer::Bpe(Box::new(ByteBpe::load(dir, arch))),
+        }
+    }
+
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        match self {
+            Tokenizer::Bpe(t) => t.encode(text),
+            Tokenizer::Sp(t) => t.encode(text),
+        }
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> String {
+        match self {
+            Tokenizer::Bpe(t) => t.decode(ids),
+            Tokenizer::Sp(t) => t.decode(ids),
+        }
+    }
+}
+
+impl ByteBpe {
+    fn load(dir: &Path, arch: Arch) -> Self {
         let vocab_json = std::fs::read_to_string(dir.join("vocab.json")).expect("vocab.json");
         let vocab: HashMap<String, u32> = serde_json::from_str(&vocab_json).unwrap();
         let inv_vocab = vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
@@ -236,7 +280,7 @@ impl Tokenizer {
 
         let byte_to_char = bytes_to_unicode();
         let char_to_byte = (0..256).map(|b| (byte_to_char[b], b as u8)).collect();
-        Tokenizer {
+        ByteBpe {
             arch,
             vocab,
             inv_vocab,
@@ -273,10 +317,10 @@ impl Tokenizer {
             .collect()
     }
 
-    pub fn encode(&self, text: &str) -> Vec<u32> {
+    fn encode(&self, text: &str) -> Vec<u32> {
         let pre_tokens = match self.arch {
             Arch::Gpt2 => pretokenize(text),
-            Arch::Qwen2 => pretokenize_qwen(text),
+            _ => pretokenize_qwen(text),
         };
         let mut ids = Vec::new();
         for pre in pre_tokens {
@@ -286,7 +330,7 @@ impl Tokenizer {
         ids
     }
 
-    pub fn decode(&self, ids: &[u32]) -> String {
+    fn decode(&self, ids: &[u32]) -> String {
         let chars: String = ids
             .iter()
             .map(|id| self.inv_vocab.get(id).map(String::as_str).unwrap_or(""))
@@ -295,6 +339,131 @@ impl Tokenizer {
             .chars()
             .filter_map(|c| self.char_to_byte.get(&c).copied())
             .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl SpBpe {
+    fn load(dir: &Path) -> Self {
+        let json = std::fs::read_to_string(dir.join("tokenizer.json")).expect("tokenizer.json");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let model = &v["model"];
+        let vocab: HashMap<String, u32> = model["vocab"]
+            .as_object()
+            .expect("model.vocab")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_u64().unwrap() as u32))
+            .collect();
+        let inv_vocab = vocab.iter().map(|(k, v)| (*v, k.clone())).collect();
+        // merges come as "a b" strings in older files, ["a","b"] pairs in newer
+        let merges = model["merges"]
+            .as_array()
+            .expect("model.merges")
+            .iter()
+            .enumerate()
+            .map(|(rank, m)| {
+                let (a, b) = match m {
+                    serde_json::Value::String(s) => {
+                        let (a, b) = s.split_once(' ').unwrap();
+                        (a.to_string(), b.to_string())
+                    }
+                    serde_json::Value::Array(p) => (
+                        p[0].as_str().unwrap().to_string(),
+                        p[1].as_str().unwrap().to_string(),
+                    ),
+                    _ => panic!("unexpected merge entry"),
+                };
+                ((a, b), rank)
+            })
+            .collect();
+        SpBpe {
+            vocab,
+            inv_vocab,
+            merges,
+            bos: 1,
+        }
+    }
+
+    /// Greedy lowest-rank-first BPE over one piece, GPT-2-style.
+    fn bpe(&self, parts: &mut Vec<String>) {
+        while parts.len() > 1 {
+            let best = parts
+                .windows(2)
+                .enumerate()
+                .filter_map(|(i, w)| {
+                    self.merges
+                        .get(&(w[0].clone(), w[1].clone()))
+                        .map(|r| (*r, i))
+                })
+                .min();
+            let Some((_, i)) = best else { break };
+            let merged = format!("{}{}", parts[i], parts[i + 1]);
+            parts.splice(i..i + 2, [merged]);
+        }
+    }
+
+    fn encode(&self, text: &str) -> Vec<u32> {
+        // SentencePiece normalization: prepend a space, then space -> '▁'
+        let marked: String = format!(" {text}")
+            .chars()
+            .map(|c| if c == ' ' { SP_SPACE } else { c })
+            .collect();
+
+        // No vocab entry carries '▁' anywhere but at its start, so a merge
+        // can never cross a (non-marker, marker) boundary — splitting there
+        // makes per-piece BPE equal to global BPE and keeps pieces word-sized.
+        let chars: Vec<char> = marked.chars().collect();
+        let mut ids = vec![self.bos];
+        let mut start = 0;
+        for i in 0..=chars.len() {
+            let boundary =
+                i == chars.len() || (i > 0 && chars[i] == SP_SPACE && chars[i - 1] != SP_SPACE);
+            if !boundary || i == start {
+                continue;
+            }
+            let mut parts: Vec<String> = chars[start..i].iter().map(|c| c.to_string()).collect();
+            self.bpe(&mut parts);
+            for p in &parts {
+                match self.vocab.get(p) {
+                    Some(&id) => ids.push(id),
+                    // unmerged character missing from the vocab: byte fallback
+                    None => {
+                        for b in p.as_bytes() {
+                            let tok = format!("<0x{b:02X}>");
+                            ids.push(*self.vocab.get(&tok).unwrap_or_else(|| {
+                                panic!("no byte-fallback token {tok} in vocab")
+                            }));
+                        }
+                    }
+                }
+            }
+            start = i;
+        }
+        ids
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let mut bytes = Vec::new();
+        for id in ids {
+            let Some(tok) = self.inv_vocab.get(id) else {
+                continue;
+            };
+            // <0xXX> byte-fallback tokens, and skip <s>/</s>/<unk>
+            if tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>') {
+                bytes.push(u8::from_str_radix(&tok[3..5], 16).unwrap());
+            } else if tok.starts_with('<') && tok.ends_with('>') {
+                continue;
+            } else {
+                for c in tok.chars() {
+                    if c == SP_SPACE {
+                        bytes.push(b' ');
+                    } else {
+                        let mut buf = [0u8; 4];
+                        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+        }
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }

@@ -1,8 +1,9 @@
-//! Stage 3: GPT-2 124M / Qwen2.5-0.5B inference engine in plain CUDA.
+//! Stage 3: GPT-2 124M / Qwen2.5-0.5B / TinyLlama-1.1B inference engine in
+//! plain CUDA.
 //!
-//! Every subcommand takes `--model gpt2|qwen` (default gpt2):
+//! Every subcommand takes `--model gpt2|qwen|tinyllama` (default gpt2):
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
-//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8] [--kv8] [--spec]
+//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8|--int4] [--kv8] [--spec]
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
@@ -48,7 +49,15 @@ fn model_choice(args: &[String]) -> ModelChoice {
                 arch: model::Arch::Qwen2,
             }
         }
-        m => panic!("unknown --model {m} (expected gpt2 or qwen)"),
+        "tinyllama" => {
+            let dir = models_dir().join("tinyllama");
+            ModelChoice {
+                bin: dir.join("tinyllama-1.1b.bin"),
+                dir,
+                arch: model::Arch::Llama,
+            }
+        }
+        m => panic!("unknown --model {m} (expected gpt2, qwen or tinyllama)"),
     }
 }
 
@@ -62,15 +71,23 @@ fn load_model(choice: &ModelChoice) -> model::Model {
 }
 
 /// Weight-storage modes that fit in 2 GB VRAM for this model.
-/// Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — more than the whole card.
+/// Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — more than the whole card;
+/// TinyLlama-1.1B even in fp16 is 2.2 GB, so only int4 (~620 MB) and
+/// int8 (~1.1 GB, just barely) run at all.
 fn modes_for(arch: model::Arch) -> &'static [gpu::WeightMode] {
     match arch {
         model::Arch::Gpt2 => &[
             gpu::WeightMode::Fp32,
             gpu::WeightMode::Fp16,
             gpu::WeightMode::Int8,
+            gpu::WeightMode::Int4,
         ],
-        model::Arch::Qwen2 => &[gpu::WeightMode::Fp16, gpu::WeightMode::Int8],
+        model::Arch::Qwen2 => &[
+            gpu::WeightMode::Fp16,
+            gpu::WeightMode::Int8,
+            gpu::WeightMode::Int4,
+        ],
+        model::Arch::Llama => &[gpu::WeightMode::Int4, gpu::WeightMode::Int8],
     }
 }
 
@@ -145,9 +162,23 @@ fn main() {
                     println!("converting safetensors -> {} ...", choice.bin.display());
                     export::convert_qwen(&choice.dir)
                 }
+                model::Arch::Llama => {
+                    export::download_tinyllama(&choice.dir);
+                    println!("converting safetensors -> {} ...", choice.bin.display());
+                    export::convert_tinyllama(&choice.dir)
+                }
             };
             model.save(&choice.bin).unwrap();
             println!("wrote {}", choice.bin.display());
+        }
+        Some("encode") => {
+            // debug helper: print token ids for a string (compare against HF)
+            let text = args.get(1).expect("usage: encode \"text\"");
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let ids = tok.encode(text);
+            println!("{ids:?}");
+            println!("decoded: {:?}", tok.decode(&ids));
         }
         Some("ppl-data") => {
             export::download_wikitext2(&models_dir());
@@ -237,7 +268,17 @@ fn main() {
                     assert!(err < 1.0, "fp32 logits mismatch: {err}");
                     assert!(batch_err < 1.0, "fp32 batch prefill mismatch: {batch_err}");
                 }
-                assert_eq!(cw, gw, "{mode}{kv} argmax mismatch");
+                // int4 may legitimately change the argmax (on GPT-2 the
+                // quantization damage is real — see the perplexity table),
+                // so the CPU comparison is informational there; internal
+                // consistency between decode and batch prefill always holds
+                if mode == gpu::WeightMode::Int4 {
+                    if cw != gw {
+                        println!("  note: int4 argmax differs from fp32 CPU (quantization)");
+                    }
+                } else {
+                    assert_eq!(cw, gw, "{mode}{kv} argmax mismatch");
+                }
                 assert_eq!(gw, bw, "{mode}{kv} batch prefill argmax mismatch");
                 println!("  OK");
             }

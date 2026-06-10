@@ -1,21 +1,23 @@
 # Stage 3 — LLM inference engine in plain CUDA
 
-GPT-2 124M and Qwen2.5-0.5B running on hand-written CUDA kernels with a Rust
-host: custom weight format, byte-level BPE tokenizer (no tokenizer crates,
-both pre-tokenization regexes hand-rolled), KV cache (fp32 or int8), fp16
-storage and int8 weight quantization. The same kernel set serves both
-architectures — LayerNorm/RMSNorm, learned positions/RoPE, GELU/SwiGLU,
-full attention/GQA are per-arch dispatches. One command pipeline
-(`--model gpt2|qwen`, default gpt2):
+GPT-2 124M, Qwen2.5-0.5B and TinyLlama-1.1B running on hand-written CUDA
+kernels with a Rust host: custom weight format, two tokenizers written from
+scratch (byte-level BPE with both pre-tokenization regexes hand-rolled, and
+SentencePiece BPE with byte fallback), KV cache (fp32 or int8), fp16 storage,
+int8 and packed int4 weight quantization. The same kernel set serves all
+three architectures — LayerNorm/RMSNorm, learned positions/RoPE, GELU/SwiGLU,
+full attention/GQA, tied/untied lm_head are per-arch dispatches. One command
+pipeline (`--model gpt2|qwen|tinyllama`, default gpt2):
 
 ```
 cargo run -rp llm-engine -- export [--model qwen]     # download + convert weights
 cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8] [--kv8] [--spec]
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4] [--kv8] [--spec]
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
+cargo run -rp llm-engine -- encode "text" [--model qwen]  # tokenizer debug
 ```
 
 ## Results (greedy decode, 128 tokens, MX230 / 40 GB/s bus)
@@ -30,6 +32,7 @@ GPT-2 124M:
 | **ours, fp16 + graph**  | 249 MB  | **115.6**  |
 | **ours, int8**          | 124 MB  | **130.0**  |
 | **ours, int8 + graph**  | 124 MB  | **131.9**  |
+| **ours, int4**          | 70 MB   | **211.3** (quality collapses — see ppl) |
 | HF transformers (torch CPU) | 497 MB | 45.1   |
 
 Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
@@ -38,12 +41,23 @@ Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
 |-------------------------|---------|------------|
 | **ours, fp16 storage**  | 988 MB  | **30.2**   |
 | **ours, int8**          | 494 MB  | **52.6**   |
+| **ours, int4**          | 278 MB  | **59.6**   |
+
+TinyLlama-1.1B (22 layers, GQA 32q/4kv, SwiGLU, RoPE, untied lm_head):
+
+| engine                  | weights | tokens/sec |
+|-------------------------|---------|------------|
+| **ours, int8**          | 1100 MB | **28.9**   |
+| **ours, int4**          | 619 MB  | **31.3**   |
+| **ours, int4 + spec**   | 619 MB  | **41.5**   |
 
 Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — it does not fit in 2 GB VRAM,
 so fp16/int8 storage is not an optimization here but the only way the model
-runs at all. And PyTorch still can't touch this GPU (no sm_61 kernels), so
-a 2024 model generating 52 tok/s on a 2019 laptop card is the engine's
-closing argument.
+runs at all. TinyLlama-1.1B pushes that one step further: even fp16 is
+2.2 GB, so the model exists on this card only as int8 (1.1 GB, barely) or
+int4 (619 MB, comfortably). And PyTorch still can't touch this GPU (no
+sm_61 kernels), so a 1.1B-parameter model generating coherent text at
+31 tok/s on a 2019 laptop card is the engine's closing argument.
 
 PyTorch GPU is not in the table for a reason worth stating: current torch
 wheels ship no sm_61 kernels (`cudaErrorNoKernelImageForDevice`) — Pascal is
@@ -165,6 +179,19 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   wall is the serial fraction of the decode step: narrow GEMVs, fp32
   attention traffic, and one-block reductions (layernorm, softmax) that
   scale with depth, not bytes.
+- **int4 weights pack two per byte** (Q4_0-style: one fp16 scale per 32
+  weights of an output column, nibbles store q+8). Memory-wise it is the
+  only way TinyLlama-1.1B fits comfortably; speed-wise it beats int8 on
+  every model (GPT-2 130 → 211, Qwen 52 → 59.6, TinyLlama 28.9 → 31.3
+  tok/s) — bytes win again. But the margins shrink with model width:
+  TinyLlama int4 moves only ~20 GB/s of a 40 GB/s bus, while its int8 run
+  saturates at ~32 GB/s. The int4 GEMV pays extra instructions per weight
+  (nibble unpack, per-group scale loads), and the narrow qkv/proj matrices
+  (n_out < 4096) sit on the scalar path — the same instruction wall int8
+  hit before `char4`, one level deeper. Unlike int8, the group scale can't
+  be folded into the final accumulator (it changes every 32 rows), so the
+  GEMM path dequantizes during the shared-tile fill — which is also why
+  int4 prefill (6.5s/512) trails int8 (4.8s/512).
 - **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
   absmax scale per (position, head) and dequantized inside the attention
   kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
@@ -193,7 +220,7 @@ cargo run -rp llm-engine -- ppl-data
 cargo run -rp llm-engine -- ppl -n 2048
 ```
 
-The harness reports fp32/fp16/int8 perplexity on the same token slice, giving a
+The harness reports per-mode perplexity on the same token slice, giving a
 quality-vs-traffic table instead of only argmax agreement.
 
 | model | mode | kv | WikiText-2 raw test tokens | perplexity |
@@ -201,46 +228,71 @@ quality-vs-traffic table instead of only argmax agreement.
 | GPT-2 | fp32 | fp32 | 2047                  | 25.388     |
 | GPT-2 | fp16 | fp32 | 2047                  | 25.396     |
 | GPT-2 | int8 | fp32 | 2047                  | 25.601     |
+| GPT-2 | int4 | fp32 | 2047                  | **261.3**  |
 | GPT-2 | fp32 | int8 | 2047                  | 25.378     |
 | GPT-2 | fp16 | int8 | 2047                  | 25.367     |
 | GPT-2 | int8 | int8 | 2047                  | 25.596     |
 | Qwen  | fp16 | fp32 | 2047                  | 12.463     |
 | Qwen  | int8 | fp32 | 2047                  | 12.464     |
+| Qwen  | int4 | fp32 | 2047                  | 14.262     |
 | Qwen  | fp16 | int8 | 2047                  | 12.941     |
 | Qwen  | int8 | int8 | 2047                  | 12.944     |
+| TinyLlama | int8 | fp32 | 2047              | 7.357      |
+| TinyLlama | int4 | fp32 | 2047              | 7.692      |
+| TinyLlama | int8 | int8 | 2047              | 7.356      |
+| TinyLlama | int4 | int8 | 2047              | 7.695      |
 
-Three quality stories in one table. Int8 *weights* are free on both models
-(on Qwen literally so: 12.464 vs 12.463). The int8 *KV cache* is free on
-GPT-2 (12 KV heads, errors average out across heads) but costs Qwen +0.48
-perplexity: with GQA there are only 2 KV heads, so each quantized K/V row is
-reused by 7 query heads and its error has nowhere to hide. And Qwen2.5-0.5B
-at 12.5 perplexity is twice as good as GPT-2 124M — seven years of model
-progress measured on the same harness.
+Several quality stories in one table. Int8 *weights* are free on every model
+(on Qwen literally so: 12.464 vs 12.463). The int8 *KV cache* depends on GQA
+width: free on GPT-2 (12 KV heads, errors average out) and on TinyLlama
+(4 KV heads), but costs Qwen +0.48 — with only 2 KV heads each quantized
+K/V row is reused by 7 query heads and its error has nowhere to hide.
+
+Int4 *weights* are a clean function of model scale. TinyLlama-1.1B barely
+notices (+0.34), Qwen-0.5B pays a real but workable +1.8, and GPT-2 124M
+collapses outright (25.6 → 261; greedy output degenerates into "the only,
+the only, the only..."), exactly the small-old-model quantization
+sensitivity the literature warns about — group-32 absmax has no answer to
+GPT-2's weight outliers. The decode speed ladder runs the same direction as
+the damage: int4 is most profitable exactly where it is least affordable.
+
+And the model ladder itself: GPT-2 124M at 25.4, Qwen2.5-0.5B at 12.5,
+TinyLlama-1.1B at 7.4 — seven years of model progress measured on the same
+harness, the biggest model only runnable here because of the quantization
+it tolerates best.
 
 ## Pieces
 
-- `src/export.rs` — pulls `openai-community/gpt2` / `Qwen/Qwen2.5-0.5B`
-  safetensors (curl) and repacks into a flat fp32 `model.bin` (header +
-  tensors in fixed order; bf16 widened, HF Linear transposed to [in, out],
-  q/k/v concatenated into one GEMV).
-- `src/tokenizer.rs` — byte-level BPE from `vocab.json`/`merges.txt` with
-  hand-rolled scanners for both the GPT-2 and Qwen2 pre-tokenization regexes
-  (the `regex` crate lacks the lookahead they need).
-- `src/cpu.rs` — slow, obvious reference forwards for both archs; ground
+- `src/export.rs` — pulls `openai-community/gpt2` / `Qwen/Qwen2.5-0.5B` /
+  `TinyLlama-1.1B` safetensors (curl) and repacks into a flat fp32
+  `model.bin` (header + tensors in fixed order; bf16 widened, HF Linear
+  transposed to [in, out], q/k/v concatenated into one GEMV, untied lm_head
+  stored as an extra tensor). The 4.4 GB TinyLlama checkpoint and model.bin
+  are mmap'd, not read — otherwise conversion would double-buffer ~9 GB.
+- `src/tokenizer.rs` — two from-scratch tokenizers: byte-level BPE from
+  `vocab.json`/`merges.txt` with hand-rolled scanners for both the GPT-2
+  and Qwen2 pre-tokenization regexes (the `regex` crate lacks the lookahead
+  they need), and SentencePiece BPE for TinyLlama parsed out of
+  `tokenizer.json` (U+2581 space marker, `<0xXX>` byte fallback, BOS) —
+  both verified token-for-token against HF tokenizers.
+- `src/cpu.rs` — slow, obvious reference forwards for all archs; ground
   truth for the GPU.
 - `kernels/llm.cu` — embed, layernorm/rmsnorm (block reduction), RoPE, GEMV
   (fp32 / fp16 storage / int8 with per-output-channel absmax scales and
-  char4 loads on wide outputs), fused causal KV-cache attention with GQA
-  (one block per query head, online scores in shared memory; fp32 and
-  int8-cache variants), batched prefill GEMM in three M-tiers (64/16-row
-  tiles + multi-row GEMV, vectorized tile loads) and flash-style attention,
-  quantize-on-write KV kernels, GELU, SwiGLU combine, residual add, GPU
-  argmax for graph replay and per-row argmax for draft verification.
+  char4 loads on wide outputs / int4 with two weights per byte and
+  per-group fp16 scales, uchar4 loads covering 4 columns x 2 rows), fused
+  causal KV-cache attention with GQA (one block per query head, online
+  scores in shared memory; fp32 and int8-cache variants), batched prefill
+  GEMM in three M-tiers (64/16-row tiles + multi-row GEMV, vectorized tile
+  loads; int4 variants dequantize during the tile fill), flash-style
+  attention, quantize-on-write KV kernels, GELU, SwiGLU combine, residual
+  add, GPU argmax for graph replay and per-row argmax for draft
+  verification.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or
-  quantized at load; per-layer KV cache (fp32 or int8 + scales); standard
-  host-greedy decode, batch prefill, prompt-lookup speculative decode
-  (device-side verify, only token ids cross the bus) and a CUDA-graph
-  benchmark path.
+  quantized to int8/int4 at load; tied or untied lm_head; per-layer KV
+  cache (fp32 or int8 + scales); standard host-greedy decode, batch
+  prefill, prompt-lookup speculative decode (device-side verify, only
+  token ids cross the bus) and a CUDA-graph benchmark path.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked
@@ -258,3 +310,9 @@ Qwen2.5-0.5B on the same kernels:
 > Alan Turing was born in 1912 in England. He was the son of a
 > mathematician. He was educated at the University of Cambridge, where he
 > studied mathematics
+
+TinyLlama-1.1B, int4, on the same kernels:
+
+> Alan Turing was a mathematician and computer scientist who worked on the
+> development of the first computer. He was also a pioneer in the field of
+> artificial intelligence and was a leading figure in the development of the

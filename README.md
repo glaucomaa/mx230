@@ -8,13 +8,16 @@ up in the numbers:
   (48x, up to **82% of cuBLAS**)
 - **`02-flash-attention/`** — Flash Attention forward from scratch: **12–19x**
   over naive, zero extra memory, runs where naive OOMs (N=32k needs 4.3 GB)
-- **`03-llm-engine/`** — GPT-2 124M and Qwen2.5-0.5B inference in plain
-  CUDA: own weight format, BPE tokenizer, KV cache (fp32 or int8,
-  quantize-on-write), fp16 storage, int8 (char4-vectorized GEMV), GQA, RoPE,
-  SwiGLU, CUDA Graph decode benchmark, WikiText-2 perplexity harness —
-  GPT-2: **78 tok/s fp32 (bus saturated), 114 tok/s fp16, 130 tok/s int8**
-  vs 45 tok/s PyTorch CPU; Qwen2.5: **52.6 tok/s int8** (fp32 wouldn't even
-  fit in VRAM, and PyTorch GPU has no sm_61 kernels at all)
+- **`03-llm-engine/`** — GPT-2 124M, Qwen2.5-0.5B and TinyLlama-1.1B
+  inference in plain CUDA: own weight format, two from-scratch tokenizers
+  (byte-level BPE and SentencePiece BPE), KV cache (fp32 or int8,
+  quantize-on-write), fp16 storage, int8 (char4-vectorized GEMV), packed
+  int4 (2 weights/byte, group scales), GQA, RoPE, SwiGLU, CUDA Graph decode
+  benchmark, WikiText-2 perplexity harness — GPT-2: **78 tok/s fp32 (bus
+  saturated), 114 tok/s fp16, 130 tok/s int8, 211 tok/s int4** vs 45 tok/s
+  PyTorch CPU; Qwen2.5: **52.6 tok/s int8**; TinyLlama-1.1B: **31.3 tok/s
+  int4** on a card its fp16 weights alone wouldn't fit into (and PyTorch
+  GPU has no sm_61 kernels at all)
 
 Kernels: CUDA C → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks: Rust.
 Each stage's README has tables and the how/why.

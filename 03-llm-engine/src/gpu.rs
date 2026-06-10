@@ -21,20 +21,25 @@ pub enum WeightMode {
     Fp32,
     Fp16,
     Int8,
+    Int4,
 }
 
 impl WeightMode {
     pub fn parse(args: &[String]) -> Self {
-        let fp16 = args.iter().any(|a| a == "--fp16");
-        let int8 = args.iter().any(|a| a == "--int8");
-        assert!(!(fp16 && int8), "choose only one of --fp16 or --int8");
-        if int8 {
-            WeightMode::Int8
-        } else if fp16 {
-            WeightMode::Fp16
-        } else {
-            WeightMode::Fp32
-        }
+        let picked: Vec<WeightMode> = [
+            ("--fp16", WeightMode::Fp16),
+            ("--int8", WeightMode::Int8),
+            ("--int4", WeightMode::Int4),
+        ]
+        .iter()
+        .filter(|(f, _)| args.iter().any(|a| a == f))
+        .map(|&(_, m)| m)
+        .collect();
+        assert!(
+            picked.len() <= 1,
+            "choose only one of --fp16, --int8, --int4"
+        );
+        picked.first().copied().unwrap_or(WeightMode::Fp32)
     }
 
     pub fn label(self) -> &'static str {
@@ -42,6 +47,7 @@ impl WeightMode {
             WeightMode::Fp32 => "fp32",
             WeightMode::Fp16 => "fp16",
             WeightMode::Int8 => "int8",
+            WeightMode::Int4 => "int4",
         }
     }
 
@@ -50,23 +56,31 @@ impl WeightMode {
             WeightMode::Fp32 => 4.0,
             WeightMode::Fp16 => 2.0,
             WeightMode::Int8 => 1.0,
+            // packed nibble + one fp16 scale per 32-weight group
+            WeightMode::Int4 => 0.5 + 2.0 / Q4_GROUP as f64,
         }
     }
 }
+
+const Q4_GROUP: usize = 32;
 
 /// Approximate weight footprint on device for a given storage mode.
 pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
     let (e, inter) = (c.n_embd, c.n_inter);
     let mlp = match c.arch {
         Arch::Gpt2 => 2 * e * inter,
-        Arch::Qwen2 => 3 * e * inter,
+        Arch::Qwen2 | Arch::Llama => 3 * e * inter,
     };
     let per_layer = e * c.qkv_dim() + c.q_dim() * e + mlp;
     let wpe = match c.arch {
         Arch::Gpt2 => c.n_ctx * e,
-        Arch::Qwen2 => 0,
+        _ => 0,
     };
-    let params = c.n_vocab * e + wpe + c.n_layer * per_layer;
+    let heads = match c.arch {
+        Arch::Llama => 2, // untied lm_head
+        _ => 1,
+    };
+    let params = heads * c.n_vocab * e + wpe + c.n_layer * per_layer;
     params as f64 * mode.bytes_per_param() / 1e6
 }
 
@@ -99,6 +113,49 @@ pub enum Weights {
         q: CudaSlice<i8>,
         scales: CudaSlice<f32>,
     },
+    Int4 {
+        q: CudaSlice<u8>,       // [(n_in/2), n_out], two rows per byte
+        scales: CudaSlice<f16>, // [(n_in/32), n_out]
+    },
+}
+
+/// Q4_0-style group quantization of a [n_in, n_out] matrix: per (32-row
+/// group, column), scale = signed absmax / -8, nibbles store q+8 in [0, 15],
+/// rows i and i+1 pack into one byte (low/high nibble).
+fn quantize_q4(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
+    assert!(
+        n_in.is_multiple_of(Q4_GROUP),
+        "int4 needs n_in divisible by {Q4_GROUP}"
+    );
+    let n_groups = n_in / Q4_GROUP;
+    let mut scales = vec![f16::ZERO; n_groups * n_out];
+    let mut q = vec![0u8; n_in / 2 * n_out];
+    for o in 0..n_out {
+        for g in 0..n_groups {
+            let mut m = 0.0f32; // value with the largest magnitude, sign kept
+            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
+                let v = w[i * n_out + o];
+                if v.abs() > m.abs() {
+                    m = v;
+                }
+            }
+            let d = m / -8.0;
+            // fp16 rounding must match what the kernel dequantizes with
+            let dh = f16::from_f32(d);
+            scales[g * n_out + o] = dh;
+            let id = if dh.to_f32() != 0.0 {
+                1.0 / dh.to_f32()
+            } else {
+                0.0
+            };
+            for i in (g * Q4_GROUP..(g + 1) * Q4_GROUP).step_by(2) {
+                let lo = ((w[i * n_out + o] * id).round() + 8.0).clamp(0.0, 15.0) as u8;
+                let hi = ((w[(i + 1) * n_out + o] * id).round() + 8.0).clamp(0.0, 15.0) as u8;
+                q[i / 2 * n_out + o] = lo | (hi << 4);
+            }
+        }
+    }
+    (q, scales)
 }
 
 /// Per-output-channel absmax quantization of a [n_in, n_out] matrix.
@@ -144,9 +201,12 @@ struct Kernels {
     embed_dyn: CudaFunction,
     embed_half_dyn: CudaFunction,
     embed_int8_dyn: CudaFunction,
+    embed_int4: CudaFunction,
+    embed_int4_dyn: CudaFunction,
     embed_batch: CudaFunction,
     embed_half_batch: CudaFunction,
     embed_int8_batch: CudaFunction,
+    embed_int4_batch: CudaFunction,
     layernorm: CudaFunction,
     rmsnorm: CudaFunction,
     rope: CudaFunction,
@@ -156,15 +216,19 @@ struct Kernels {
     gemv: CudaFunction,
     gemv_half: CudaFunction,
     gemv_int8: CudaFunction,
+    gemv_int4: CudaFunction,
     gemm_f32: CudaFunction,
     gemm_half: CudaFunction,
     gemm_int8: CudaFunction,
+    gemm_int4: CudaFunction,
     gemm_f32_skinny: CudaFunction,
     gemm_half_skinny: CudaFunction,
     gemm_int8_skinny: CudaFunction,
+    gemm_int4_skinny: CudaFunction,
     gemm_rows_f32: CudaFunction,
     gemm_rows_half: CudaFunction,
     gemm_rows_int8: CudaFunction,
+    gemm_rows_int4: CudaFunction,
     copy_kv_dyn: CudaFunction,
     copy_kv_batch: CudaFunction,
     quantize_kv: CudaFunction,
@@ -266,6 +330,11 @@ fn gemv(
             lb.arg(y).arg(x).arg(q).arg(scales).arg(b).arg(&ni).arg(&no);
             unsafe { lb.launch(cfg) }.unwrap();
         }
+        Weights::Int4 { q, scales } => {
+            let mut lb = stream.launch_builder(&k.gemv_int4);
+            lb.arg(y).arg(x).arg(q).arg(scales).arg(b).arg(&ni).arg(&no);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
     }
 }
 
@@ -354,6 +423,23 @@ fn gemm(
                 .arg(&k_i);
             unsafe { lb.launch(cfg) }.unwrap();
         }
+        Weights::Int4 { q, scales } => {
+            let f = match tier {
+                0 => &k.gemm_rows_int4,
+                1 => &k.gemm_int4_skinny,
+                _ => &k.gemm_int4,
+            };
+            let mut lb = stream.launch_builder(f);
+            lb.arg(c)
+                .arg(a)
+                .arg(q)
+                .arg(scales)
+                .arg(bias)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
     }
 }
 
@@ -407,6 +493,7 @@ pub struct Engine {
     stream: Arc<CudaStream>,
     k: Kernels,
     wte_t: Weights, // [n_embd, n_vocab], transposed token embeddings (tied lm_head)
+    lm_head_t: Option<Weights>, // untied lm_head (Llama), same layout as wte_t
     wpe: CudaSlice<f32>,
     layers: Vec<LayerG>,
     lnf_g: CudaSlice<f32>,
@@ -453,9 +540,12 @@ impl Engine {
             embed_dyn: f("embed_dyn"),
             embed_half_dyn: f("embed_half_dyn"),
             embed_int8_dyn: f("embed_int8_dyn"),
+            embed_int4: f("embed_int4"),
+            embed_int4_dyn: f("embed_int4_dyn"),
             embed_batch: f("embed_batch"),
             embed_half_batch: f("embed_half_batch"),
             embed_int8_batch: f("embed_int8_batch"),
+            embed_int4_batch: f("embed_int4_batch"),
             layernorm: f("layernorm"),
             rmsnorm: f("rmsnorm"),
             rope: f("rope"),
@@ -465,15 +555,19 @@ impl Engine {
             gemv: f("gemv"),
             gemv_half: f("gemv_half"),
             gemv_int8: f("gemv_int8"),
+            gemv_int4: f("gemv_int4"),
             gemm_f32: f("gemm_f32"),
             gemm_half: f("gemm_half"),
             gemm_int8: f("gemm_int8"),
+            gemm_int4: f("gemm_int4"),
             gemm_f32_skinny: f("gemm_f32_skinny"),
             gemm_half_skinny: f("gemm_half_skinny"),
             gemm_int8_skinny: f("gemm_int8_skinny"),
+            gemm_int4_skinny: f("gemm_int4_skinny"),
             gemm_rows_f32: f("gemm_rows_f32"),
             gemm_rows_half: f("gemm_rows_half"),
             gemm_rows_int8: f("gemm_rows_int8"),
+            gemm_rows_int4: f("gemm_rows_int4"),
             copy_kv_dyn: f("copy_kv_dyn"),
             copy_kv_batch: f("copy_kv_batch"),
             quantize_kv: f("quantize_kv"),
@@ -506,16 +600,27 @@ impl Engine {
                         scales: up(&s),
                     }
                 }
+                WeightMode::Int4 => {
+                    let (q, s) = quantize_q4(t, n_in, n_out);
+                    Weights::Int4 {
+                        q: stream.clone_htod(&q).unwrap(),
+                        scales: stream.clone_htod(&s).unwrap(),
+                    }
+                }
             }
         };
 
-        // transpose wte [v, e] -> wte_t [e, v] so the lm_head GEMV is coalesced
-        let mut wte_t = vec![0.0f32; e * v];
-        for tok in 0..v {
-            for i in 0..e {
-                wte_t[i * v + tok] = model.wte[tok * e + i];
+        // transpose [v, e] -> [e, v] so the lm_head GEMV is coalesced
+        let transpose_ve = |w: &[f32]| {
+            let mut t = vec![0.0f32; e * v];
+            for tok in 0..v {
+                for i in 0..e {
+                    t[i * v + tok] = w[tok * e + i];
+                }
             }
-        }
+            t
+        };
+        let wte_t = transpose_ve(&model.wte);
 
         let opt = |t: &[f32]| -> Option<CudaSlice<f32>> {
             if t.is_empty() {
@@ -553,6 +658,11 @@ impl Engine {
             config: c,
             k,
             wte_t: upw(&wte_t, e, v),
+            lm_head_t: if model.lm_head.is_empty() {
+                None
+            } else {
+                Some(upw(&transpose_ve(&model.lm_head), e, v))
+            },
             // RoPE models have no learned positions; a zero table keeps the
             // embed kernels uniform across archs
             wpe: if model.wpe.is_empty() {
@@ -650,6 +760,18 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
+            Weights::Int4 { q, scales } => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_int4);
+                lb.arg(&mut self.x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&tok)
+                    .arg(&pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
         }
     }
 
@@ -681,6 +803,18 @@ impl Engine {
             }
             Weights::Int8 { q, scales } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int8_dyn);
+                lb.arg(&mut self.x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&self.graph_tok)
+                    .arg(&self.graph_pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
+            Weights::Int4 { q, scales } => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_int4_dyn);
                 lb.arg(&mut self.x)
                     .arg(q)
                     .arg(scales)
@@ -725,7 +859,7 @@ impl Engine {
             );
 
             let (t_i, nh_i, nkv_i, hd_i) = (pos as i32, nh as i32, nkv as i32, hd as i32);
-            if c.arch == Arch::Qwen2 {
+            if c.arch != Arch::Gpt2 {
                 let mut lb = self.stream.launch_builder(&self.k.rope);
                 lb.arg(&mut self.qkv)
                     .arg(&t_i)
@@ -884,7 +1018,7 @@ impl Engine {
             &self.k,
             &mut self.logits,
             &self.xb,
-            &self.wte_t,
+            self.lm_head_t.as_ref().unwrap_or(&self.wte_t),
             &self.zero_bias,
             e,
             c.n_vocab,
@@ -922,7 +1056,7 @@ impl Engine {
             );
 
             let (nh_i, nkv_i, hd_i) = (nh as i32, nkv as i32, hd as i32);
-            if c.arch == Arch::Qwen2 {
+            if c.arch != Arch::Gpt2 {
                 let mut lb = self.stream.launch_builder(&self.k.rope_dyn);
                 lb.arg(&mut self.qkv)
                     .arg(&self.graph_pos)
@@ -1078,7 +1212,7 @@ impl Engine {
             &self.k,
             &mut self.logits,
             &self.xb,
-            &self.wte_t,
+            self.lm_head_t.as_ref().unwrap_or(&self.wte_t),
             &self.zero_bias,
             e,
             c.n_vocab,
@@ -1139,6 +1273,19 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
             }
+            Weights::Int4 { q, scales } => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_int4_batch);
+                lb.arg(&mut self.batch_x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&self.batch_tok)
+                    .arg(&pos_i)
+                    .arg(&n_i)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
+            }
         }
     }
 
@@ -1186,7 +1333,7 @@ impl Engine {
                 e,
             );
 
-            if c.arch == Arch::Qwen2 {
+            if c.arch != Arch::Gpt2 {
                 let (pos_i, n_i, nh_i, nkv_i, hd_i, stride_i) = (
                     pos0 as i32,
                     n as i32,
@@ -1408,7 +1555,7 @@ impl Engine {
             &self.k,
             &mut self.logits,
             &self.xb,
-            &self.wte_t,
+            self.lm_head_t.as_ref().unwrap_or(&self.wte_t),
             &self.zero_bias,
             e,
             c.n_vocab,
@@ -1433,7 +1580,7 @@ impl Engine {
             &self.k,
             &mut self.batch_logits,
             &self.batch_xb,
-            &self.wte_t,
+            self.lm_head_t.as_ref().unwrap_or(&self.wte_t),
             &self.zero_bias,
             n,
             c.n_vocab,

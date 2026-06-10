@@ -11,12 +11,16 @@ use crate::model::{Config, Layer, Model};
 
 const HF_BASE: &str = "https://huggingface.co/openai-community/gpt2/resolve/main";
 const HF_QWEN_BASE: &str = "https://huggingface.co/Qwen/Qwen2.5-0.5B/resolve/main";
+const HF_TINYLLAMA_BASE: &str =
+    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T/resolve/main";
 const FILES: &[&str] = &["model.safetensors", "vocab.json", "merges.txt"];
+// SentencePiece-family checkpoint: vocab+merges live inside tokenizer.json
+const FILES_SP: &[&str] = &["model.safetensors", "tokenizer.json"];
 const WIKITEXT2_ROWS: &str = "https://datasets-server.huggingface.co/rows?dataset=Salesforce/wikitext&config=wikitext-2-raw-v1&split=test";
 
-fn fetch(base: &str, dir: &Path) {
+fn fetch(base: &str, dir: &Path, files: &[&str]) {
     std::fs::create_dir_all(dir).unwrap();
-    for f in FILES {
+    for f in files {
         let dst = dir.join(f);
         if dst.exists() {
             println!("{} already present", dst.display());
@@ -34,11 +38,15 @@ fn fetch(base: &str, dir: &Path) {
 }
 
 pub fn download(dir: &Path) {
-    fetch(HF_BASE, dir);
+    fetch(HF_BASE, dir, FILES);
 }
 
 pub fn download_qwen(dir: &Path) {
-    fetch(HF_QWEN_BASE, dir);
+    fetch(HF_QWEN_BASE, dir, FILES);
+}
+
+pub fn download_tinyllama(dir: &Path) {
+    fetch(HF_TINYLLAMA_BASE, dir, FILES_SP);
 }
 
 pub fn download_wikitext2(dir: &Path) {
@@ -162,6 +170,7 @@ pub fn convert(dir: &Path) -> Model {
         layers,
         lnf_g: tensor(&st, "ln_f.weight"),
         lnf_b: tensor(&st, "ln_f.bias"),
+        lm_head: Vec::new(),
     }
 }
 
@@ -224,5 +233,71 @@ pub fn convert_qwen(dir: &Path) -> Model {
         layers,
         lnf_g: tensor(&st, "model.norm.weight"),
         lnf_b: Vec::new(),
+        lm_head: Vec::new(),
+    }
+}
+
+/// TinyLlama-1.1B: same layer layout as Qwen2 (the q/k/v concatenation and
+/// HF Linear transposes are identical) but bias-free and with an untied
+/// lm_head tensor.
+pub fn convert_tinyllama(dir: &Path) -> Model {
+    // the fp32 checkpoint is 4.4 GB — mmap it instead of reading into RAM
+    let file =
+        std::fs::File::open(dir.join("model.safetensors")).expect("run tinyllama download first");
+    let buf = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let st = SafeTensors::deserialize(&buf).unwrap();
+    let config = Config::tinyllama_11b();
+    let (e, inter) = (config.n_embd, config.n_inter);
+    let (qd, kvd, qkvd) = (config.q_dim(), config.kv_dim(), config.qkv_dim());
+
+    let layers = (0..config.n_layer)
+        .map(|l| {
+            let p = format!("model.layers.{l}");
+            let q = transpose(&tensor(&st, &format!("{p}.self_attn.q_proj.weight")), qd, e);
+            let k = transpose(
+                &tensor(&st, &format!("{p}.self_attn.k_proj.weight")),
+                kvd,
+                e,
+            );
+            let v = transpose(
+                &tensor(&st, &format!("{p}.self_attn.v_proj.weight")),
+                kvd,
+                e,
+            );
+            let mut qkv_w = vec![0.0f32; e * qkvd];
+            for i in 0..e {
+                qkv_w[i * qkvd..i * qkvd + qd].copy_from_slice(&q[i * qd..(i + 1) * qd]);
+                qkv_w[i * qkvd + qd..i * qkvd + qd + kvd]
+                    .copy_from_slice(&k[i * kvd..(i + 1) * kvd]);
+                qkv_w[i * qkvd + qd + kvd..(i + 1) * qkvd]
+                    .copy_from_slice(&v[i * kvd..(i + 1) * kvd]);
+            }
+
+            Layer {
+                ln1_g: tensor(&st, &format!("{p}.input_layernorm.weight")),
+                ln1_b: Vec::new(),
+                qkv_w,
+                qkv_b: vec![0.0; qkvd],
+                proj_w: transpose(&tensor(&st, &format!("{p}.self_attn.o_proj.weight")), e, qd),
+                proj_b: vec![0.0; e],
+                ln2_g: tensor(&st, &format!("{p}.post_attention_layernorm.weight")),
+                ln2_b: Vec::new(),
+                fc_w: transpose(&tensor(&st, &format!("{p}.mlp.gate_proj.weight")), inter, e),
+                fc_b: Vec::new(),
+                up_w: transpose(&tensor(&st, &format!("{p}.mlp.up_proj.weight")), inter, e),
+                fc2_w: transpose(&tensor(&st, &format!("{p}.mlp.down_proj.weight")), e, inter),
+                fc2_b: Vec::new(),
+            }
+        })
+        .collect();
+
+    Model {
+        config,
+        wte: tensor(&st, "model.embed_tokens.weight"),
+        wpe: Vec::new(),
+        layers,
+        lnf_g: tensor(&st, "model.norm.weight"),
+        lnf_b: Vec::new(),
+        lm_head: tensor(&st, "lm_head.weight"),
     }
 }

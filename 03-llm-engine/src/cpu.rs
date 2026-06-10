@@ -66,7 +66,9 @@ fn silu(x: f32) -> f32 {
 pub fn forward(model: &Model, tokens: &[u32]) -> Vec<f32> {
     match model.config.arch {
         Arch::Gpt2 => forward_gpt2(model, tokens),
-        Arch::Qwen2 => forward_qwen2(model, tokens),
+        // Llama differs from Qwen2 only by zero qkv bias (stored as zeros)
+        // and an untied lm_head (handled at the final projection)
+        Arch::Qwen2 | Arch::Llama => forward_qwen2(model, tokens),
     }
 }
 
@@ -227,8 +229,13 @@ fn forward_qwen2(model: &Model, tokens: &[u32]) -> Vec<f32> {
     }
 
     rmsnorm(&x, &model.lnf_g, c.norm_eps, &mut xb);
+    let head = if model.lm_head.is_empty() {
+        &model.wte
+    } else {
+        &model.lm_head
+    };
     for v in 0..c.n_vocab {
-        logits[v] = model.wte[v * e..(v + 1) * e]
+        logits[v] = head[v * e..(v + 1) * e]
             .iter()
             .zip(&xb)
             .map(|(a, b)| a * b)

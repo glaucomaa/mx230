@@ -20,6 +20,7 @@ pub const VERSION: u32 = 2;
 pub enum Arch {
     Gpt2,
     Qwen2,
+    Llama, // TinyLlama-1.1B: Qwen2 layout minus qkv bias, untied lm_head
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +73,23 @@ impl Config {
         }
     }
 
+    /// TinyLlama-1.1B (3T base checkpoint); n_ctx capped at 1024 like Qwen.
+    pub fn tinyllama_11b() -> Self {
+        Config {
+            arch: Arch::Llama,
+            n_layer: 22,
+            n_head: 32,
+            n_kv_head: 4,
+            head_dim: 64,
+            n_embd: 2048,
+            n_inter: 5632,
+            n_ctx: 1024,
+            n_vocab: 32000,
+            rope_theta: 1e4,
+            norm_eps: 1e-5,
+        }
+    }
+
     pub fn q_dim(&self) -> usize {
         self.n_head * self.head_dim
     }
@@ -104,11 +122,12 @@ pub struct Layer {
 
 pub struct Model {
     pub config: Config,
-    pub wte: Vec<f32>, // [vocab, embd]; also the (tied) lm_head
-    pub wpe: Vec<f32>, // [ctx, embd] for GPT-2, empty for Qwen2 (RoPE)
+    pub wte: Vec<f32>, // [vocab, embd]; also the lm_head when tied
+    pub wpe: Vec<f32>, // [ctx, embd] for GPT-2, empty for RoPE archs
     pub layers: Vec<Layer>,
     pub lnf_g: Vec<f32>,
     pub lnf_b: Vec<f32>,
+    pub lm_head: Vec<f32>, // [vocab, embd] when untied (Llama), empty when tied
 }
 
 fn write_tensor(out: &mut impl std::io::Write, t: &[f32]) -> std::io::Result<()> {
@@ -150,6 +169,7 @@ impl Model {
             match c.arch {
                 Arch::Gpt2 => 0,
                 Arch::Qwen2 => 1,
+                Arch::Llama => 2,
             },
             c.n_layer as u32,
             c.n_head as u32,
@@ -177,6 +197,9 @@ impl Model {
                 Arch::Qwen2 => vec![
                     &l.ln1_g, &l.qkv_w, &l.qkv_b, &l.proj_w, &l.ln2_g, &l.fc_w, &l.up_w, &l.fc2_w,
                 ],
+                Arch::Llama => vec![
+                    &l.ln1_g, &l.qkv_w, &l.proj_w, &l.ln2_g, &l.fc_w, &l.up_w, &l.fc2_w,
+                ],
             };
             for t in tensors {
                 write_tensor(&mut out, t)?;
@@ -186,11 +209,17 @@ impl Model {
         if c.arch == Arch::Gpt2 {
             write_tensor(&mut out, &self.lnf_b)?;
         }
+        if c.arch == Arch::Llama {
+            write_tensor(&mut out, &self.lm_head)?;
+        }
         Ok(())
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        let buf = fs::read(path)?;
+        // mmap instead of fs::read: a 4.4 GB model.bin plus its parsed
+        // tensors would otherwise double-buffer in RAM
+        let file = fs::File::open(path)?;
+        let buf = unsafe { memmap2::Mmap::map(&file)? };
         let mut r = Reader { buf: &buf, pos: 0 };
         assert_eq!(r.u32(), MAGIC, "not a model.bin file");
         assert_eq!(
@@ -201,6 +230,7 @@ impl Model {
         let arch = match r.u32() {
             0 => Arch::Gpt2,
             1 => Arch::Qwen2,
+            2 => Arch::Llama,
             a => panic!("unknown arch tag {a}"),
         };
         let config = Config {
@@ -221,7 +251,7 @@ impl Model {
         let wte = r.tensor(config.n_vocab * e);
         let wpe = match arch {
             Arch::Gpt2 => r.tensor(config.n_ctx * e),
-            Arch::Qwen2 => Vec::new(),
+            Arch::Qwen2 | Arch::Llama => Vec::new(),
         };
         let layers = (0..config.n_layer)
             .map(|_| match arch {
@@ -240,11 +270,15 @@ impl Model {
                     fc2_w: r.tensor(inter * e),
                     fc2_b: r.tensor(e),
                 },
-                Arch::Qwen2 => Layer {
+                Arch::Qwen2 | Arch::Llama => Layer {
                     ln1_g: r.tensor(e),
                     ln1_b: Vec::new(),
                     qkv_w: r.tensor(e * qkvd),
-                    qkv_b: r.tensor(qkvd),
+                    qkv_b: if arch == Arch::Qwen2 {
+                        r.tensor(qkvd)
+                    } else {
+                        vec![0.0; qkvd] // Llama attention has no biases
+                    },
                     proj_w: r.tensor(qd * e),
                     proj_b: vec![0.0; e],
                     ln2_g: r.tensor(e),
@@ -260,7 +294,11 @@ impl Model {
         let lnf_g = r.tensor(e);
         let lnf_b = match arch {
             Arch::Gpt2 => r.tensor(e),
-            Arch::Qwen2 => Vec::new(),
+            Arch::Qwen2 | Arch::Llama => Vec::new(),
+        };
+        let lm_head = match arch {
+            Arch::Llama => r.tensor(config.n_vocab * e),
+            _ => Vec::new(),
         };
         assert_eq!(r.pos, buf.len(), "trailing bytes in model.bin");
         Ok(Model {
@@ -270,6 +308,7 @@ impl Model {
             layers,
             lnf_g,
             lnf_b,
+            lm_head,
         })
     }
 }

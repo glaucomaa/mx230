@@ -187,6 +187,116 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
     }
 }
 
+// ---- int4 weights (Q4_0-style) ---------------------------------------------
+// Two weights per byte packed along n_in: byte (i/2)*n_out + o holds rows i
+// (low nibble) and i+1 (high nibble) of column o, nibbles store q+8 with
+// q in [-8, 7]. One fp16 scale per (32-row group, column):
+// scales[(i/32)*n_out + o]. Dequant: (nibble - 8) * scale. The group scale
+// must be applied per group, not per column, so unlike int8 the GEMM/GEMV
+// bodies dequantize inline instead of scaling the final accumulator.
+
+#define Q4_GROUP 32
+
+__device__ __forceinline__ float q4_lo(unsigned char b) { return (float)((b & 15) - 8); }
+__device__ __forceinline__ float q4_hi(unsigned char b) { return (float)((b >> 4) - 8); }
+
+// Same wide/narrow split as gemv_int8: wide outputs take 4 columns per
+// thread from one uchar4 (which now covers two n_in rows at once).
+extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned char *w,
+                                     const __half *scales, const float *b,
+                                     int n_in, int n_out) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    int n_groups = n_in / Q4_GROUP;
+    if (n_out % 4 == 0 && n_out >= 4096) {
+        const uchar4 *w4 = (const uchar4 *)w;
+        int n4 = n_out / 4;
+        for (int o4 = blockIdx.x * blockDim.x + threadIdx.x; o4 < n4;
+             o4 += gridDim.x * blockDim.x) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int g = 0; g < n_groups; ++g) {
+                float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
+                for (int i = g * Q4_GROUP; i < (g + 1) * Q4_GROUP; i += 2) {
+                    uchar4 c = w4[(size_t)(i / 2) * n4 + o4];
+                    float x0 = xs[i], x1 = xs[i + 1];
+                    g0 += x0 * q4_lo(c.x) + x1 * q4_hi(c.x);
+                    g1 += x0 * q4_lo(c.y) + x1 * q4_hi(c.y);
+                    g2 += x0 * q4_lo(c.z) + x1 * q4_hi(c.z);
+                    g3 += x0 * q4_lo(c.w) + x1 * q4_hi(c.w);
+                }
+                const __half2 *s2 = (const __half2 *)(scales + (size_t)g * n_out + 4 * o4);
+                float2 sa = __half22float2(s2[0]), sb = __half22float2(s2[1]);
+                a0 += g0 * sa.x;
+                a1 += g1 * sa.y;
+                a2 += g2 * sb.x;
+                a3 += g3 * sb.y;
+            }
+            int o = 4 * o4;
+            y[o + 0] = a0 + (b ? b[o + 0] : 0.0f);
+            y[o + 1] = a1 + (b ? b[o + 1] : 0.0f);
+            y[o + 2] = a2 + (b ? b[o + 2] : 0.0f);
+            y[o + 3] = a3 + (b ? b[o + 3] : 0.0f);
+        }
+        return;
+    }
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n_out;
+         o += gridDim.x * blockDim.x) {
+        float acc = 0.0f;
+        for (int g = 0; g < n_groups; ++g) {
+            float gs = 0.0f;
+            for (int i = g * Q4_GROUP; i < (g + 1) * Q4_GROUP; i += 2) {
+                unsigned char c = w[(size_t)(i / 2) * n_out + o];
+                gs += xs[i] * q4_lo(c) + xs[i + 1] * q4_hi(c);
+            }
+            acc += gs * __half2float(scales[(size_t)g * n_out + o]);
+        }
+        y[o] = acc + (b ? b[o] : 0.0f);
+    }
+}
+
+__device__ __forceinline__ float embed_int4_at(const unsigned char *wte_t,
+                                               const __half *scales, int i, int tok,
+                                               int n_vocab) {
+    unsigned char c = wte_t[(size_t)(i / 2) * n_vocab + tok];
+    float q = (i & 1) ? q4_hi(c) : q4_lo(c);
+    return q * __half2float(scales[(size_t)(i / Q4_GROUP) * n_vocab + tok]);
+}
+
+extern "C" __global__ void embed_int4(float *out, const unsigned char *wte_t,
+                                      const __half *scales, const float *wpe,
+                                      int tok, int pos, int n_embd, int n_vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = embed_int4_at(wte_t, scales, i, tok, n_vocab) + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int4_dyn(float *out, const unsigned char *wte_t,
+                                          const __half *scales, const float *wpe,
+                                          const int *tok_ptr, const int *pos_ptr,
+                                          int n_embd, int n_vocab) {
+    int tok = *tok_ptr;
+    int pos = *pos_ptr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = embed_int4_at(wte_t, scales, i, tok, n_vocab) + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int4_batch(float *out, const unsigned char *wte_t,
+                                            const __half *scales, const float *wpe,
+                                            const int *toks, int pos0, int n_tok,
+                                            int n_embd, int n_vocab) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_tok * n_embd) {
+        int t = idx / n_embd, i = idx % n_embd;
+        out[idx] = embed_int4_at(wte_t, scales, i, toks[t], n_vocab) +
+                   wpe[(pos0 + t) * n_embd + i];
+    }
+}
+
 extern "C" __global__ void copy_kv_dyn(float *kcache, float *vcache, const float *qkv,
                                        const int *pos_ptr, int q_dim, int kv_dim) {
     int pos = *pos_ptr;
@@ -778,6 +888,140 @@ extern "C" __global__ void gemm_rows_int8(float *C, const float *A, const signed
                                           const float *scales, const float *bias,
                                           int M, int N, int K) {
     gemm_rows_body<signed char, true>(C, A, B, scales, bias, M, N, K);
+}
+
+// int4 GEMM: same tiling as gemm_body, but the group scale depends on the k
+// row, so B dequantizes during the shared-tile fill instead of scaling the
+// final accumulator. A 16-row k-tile always sits inside one 32-row quant
+// group (k0 is a multiple of 16), so the scale row is constant per tile and
+// one byte fills two k-rows of Bs.
+template <int BM>
+__device__ void gemm_int4_body(float *C, const float *A, const unsigned char *B,
+                               const __half *scales, const float *bias,
+                               int M, int N, int K) {
+    constexpr int RM = BM / 16;
+    __shared__ float As[16][BM];
+    __shared__ float Bs[16][64];
+    int bm = blockIdx.y * BM, bn = blockIdx.x * 64;
+    int tid = threadIdx.y * 16 + threadIdx.x;
+    float acc[RM][4] = {};
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int i = tid; i < BM * 16; i += 256) {
+            int m = i / 16, k = i % 16;
+            As[k][m] = (bm + m < M) ? A[(size_t)(bm + m) * K + k0 + k] : 0.0f;
+        }
+        int gk = k0 / Q4_GROUP;
+        for (int i = tid; i < 8 * 64; i += 256) {
+            int kb = i / 64, n = i % 64; // byte row kb covers k rows 2kb, 2kb+1
+            if (bn + n < N) {
+                unsigned char c = B[(size_t)(k0 / 2 + kb) * N + bn + n];
+                float sc = __half2float(scales[(size_t)gk * N + bn + n]);
+                Bs[2 * kb][n] = q4_lo(c) * sc;
+                Bs[2 * kb + 1][n] = q4_hi(c) * sc;
+            } else {
+                Bs[2 * kb][n] = 0.0f;
+                Bs[2 * kb + 1][n] = 0.0f;
+            }
+        }
+        __syncthreads();
+        for (int k = 0; k < 16; ++k) {
+            float a[RM], b[4];
+            for (int i = 0; i < RM; ++i) a[i] = As[k][threadIdx.y * RM + i];
+            for (int j = 0; j < 4; ++j) b[j] = Bs[k][threadIdx.x * 4 + j];
+            for (int i = 0; i < RM; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < RM; ++i) {
+        int row = bm + threadIdx.y * RM + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            int col = bn + threadIdx.x * 4 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = acc[i][j] + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_int4(float *C, const float *A, const unsigned char *B,
+                                     const __half *scales, const float *bias,
+                                     int M, int N, int K) {
+    gemm_int4_body<64>(C, A, B, scales, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_int4_skinny(float *C, const float *A, const unsigned char *B,
+                                            const __half *scales, const float *bias,
+                                            int M, int N, int K) {
+    gemm_int4_body<16>(C, A, B, scales, bias, M, N, K);
+}
+
+// int4 draft-verify GEMM (M <= 8): gemm_rows with inline dequant. Scales
+// reload every 32 k-rows (K is a multiple of 32, so groups never straddle
+// the 128-row k-tile), one uchar4 covers 4 columns x 2 k-rows.
+extern "C" __global__ void gemm_rows_int4(float *C, const float *A, const unsigned char *B,
+                                          const __half *scales, const float *bias,
+                                          int M, int N, int K) {
+    __shared__ float As[ROWS_M][ROWS_KT];
+    int tid = threadIdx.x;
+    int o = blockIdx.x * blockDim.x + tid;
+    bool wide = gemm_rows_wide(N);
+    bool active = o < (wide ? N / 4 : N);
+    float acc[ROWS_M][4] = {};
+    float s[4];
+
+    for (int k0 = 0; k0 < K; k0 += ROWS_KT) {
+        int kt = min(ROWS_KT, K - k0);
+        for (int i = tid; i < ROWS_M * ROWS_KT; i += blockDim.x) {
+            int m = i / ROWS_KT, kk = i % ROWS_KT;
+            As[m][kk] = (m < M && kk < kt) ? A[(size_t)m * K + k0 + kk] : 0.0f;
+        }
+        __syncthreads();
+        if (active && wide) {
+            for (int kk = 0; kk < kt; kk += 2) {
+                if ((k0 + kk) % Q4_GROUP == 0) {
+                    const __half2 *s2 =
+                        (const __half2 *)(scales + (size_t)((k0 + kk) / Q4_GROUP) * N + 4 * o);
+                    float2 sa = __half22float2(s2[0]), sb = __half22float2(s2[1]);
+                    s[0] = sa.x, s[1] = sa.y, s[2] = sb.x, s[3] = sb.y;
+                }
+                uchar4 c = *(const uchar4 *)(B + (size_t)((k0 + kk) / 2) * N + 4 * o);
+                float b0[4] = {q4_lo(c.x) * s[0], q4_lo(c.y) * s[1],
+                               q4_lo(c.z) * s[2], q4_lo(c.w) * s[3]};
+                float b1[4] = {q4_hi(c.x) * s[0], q4_hi(c.y) * s[1],
+                               q4_hi(c.z) * s[2], q4_hi(c.w) * s[3]};
+#pragma unroll
+                for (int m = 0; m < ROWS_M; ++m) {
+                    float a0 = As[m][kk], a1 = As[m][kk + 1];
+                    acc[m][0] += a0 * b0[0] + a1 * b1[0];
+                    acc[m][1] += a0 * b0[1] + a1 * b1[1];
+                    acc[m][2] += a0 * b0[2] + a1 * b1[2];
+                    acc[m][3] += a0 * b0[3] + a1 * b1[3];
+                }
+            }
+        } else if (active) {
+            for (int kk = 0; kk < kt; kk += 2) {
+                if ((k0 + kk) % Q4_GROUP == 0) {
+                    s[0] = __half2float(scales[(size_t)((k0 + kk) / Q4_GROUP) * N + o]);
+                }
+                unsigned char c = B[(size_t)((k0 + kk) / 2) * N + o];
+                float b0 = q4_lo(c) * s[0], b1 = q4_hi(c) * s[0];
+#pragma unroll
+                for (int m = 0; m < ROWS_M; ++m)
+                    acc[m][0] += As[m][kk] * b0 + As[m][kk + 1] * b1;
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    int ncols = wide ? 4 : 1;
+    for (int m = 0; m < M; ++m) {
+        for (int j = 0; j < ncols; ++j) {
+            int col = wide ? 4 * o + j : o;
+            C[(size_t)m * N + col] = acc[m][j] + bias[col];
+        }
+    }
 }
 
 extern "C" __global__ void embed_batch(float *out, const float *wte_t, const float *wpe,
