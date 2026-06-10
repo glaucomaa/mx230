@@ -1,11 +1,15 @@
 # mx230-cuda-lab
 
-CUDA kernels + Rust host (`cudarc`) on an NVIDIA MX230 (Pascal sm_61, 2 GB VRAM,
-~40 GB/s). The constraint is the point: inference is memory-bound, so every
-saved byte of traffic shows up in the benchmarks.
+**TL;DR:** hand-written CUDA kernels + Rust host (`cudarc`) on a 2 GB NVIDIA
+MX230 with a 40 GB/s bus. Inference is memory-bound — every saved byte shows
+up in the numbers:
 
-1. `01-gemm/` — SGEMM optimization ladder, benchmarked vs cuBLAS
-2. `02-flash-attention/` — Flash Attention (forward) from scratch vs naive
-3. `03-llm-engine/` — GPT-2 124M inference engine: KV cache, int8 weights, tokens/sec
+- **`01-gemm/`** — SGEMM ladder, naive → double-buffered: **11.5 → 509 GFLOPS**
+  (48x, up to **82% of cuBLAS**)
+- **`02-flash-attention/`** — Flash Attention forward from scratch: **12–19x**
+  over naive, zero extra memory, runs where naive OOMs (N=32k needs 4.3 GB)
+- **`03-llm-engine/`** — GPT-2 124M inference in plain CUDA: KV cache,
+  int8 weights, tokens/sec vs baselines
 
-Kernels are CUDA C compiled to PTX by `build.rs`; everything host-side is Rust.
+Kernels: CUDA C → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks: Rust.
+Each stage's README has tables and the how/why.
