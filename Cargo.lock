@@ -13,6 +13,7 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "kernel-build",
 ]
 
 [[package]]
@@ -23,6 +24,19 @@ checksum = "1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc"
 dependencies = [
  "libloading",
 ]
+
+[[package]]
+name = "gemm"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "cudarc",
+ "kernel-build",
+]
+
+[[package]]
+name = "kernel-build"
+version = "0.1.0"
 
 [[package]]
 name = "libloading"

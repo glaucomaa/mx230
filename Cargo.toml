@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["common"]
+members = ["kernel-build", "common", "01-gemm"]
 
 [workspace.dependencies]
-cudarc = { version = "0.19", features = ["cuda-12090"] }
+cudarc = { version = "0.19", features = ["cuda-12090", "cublas"] }
+kernel-build = { path = "kernel-build" }
+common = { path = "common" }
+
+[profile.release]
+debug = true
