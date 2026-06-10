@@ -82,6 +82,17 @@ const KERNELS: &[Kernel] = &[
         },
         div: 128,
     },
+    Kernel {
+        name: "v6 dbuf",
+        fname: "gemm_dbuf",
+        ptx: include_str!(concat!(env!("OUT_DIR"), "/gemm_06_dbuf.ptx")),
+        cfg: |n| LaunchConfig {
+            grid_dim: (n / 128, n / 128, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        div: 128,
+    },
 ];
 
 fn gflops(n: usize, ms: f32) -> f32 {
