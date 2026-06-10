@@ -1,19 +1,70 @@
 //! CUDA inference engine: one token at a time through GEMV kernels with a
-//! per-layer KV cache. Weights are fp32 or int8 (per-output-channel absmax),
-//! chosen at load time — int8 cuts decode memory traffic ~4x, which on a
-//! 40 GB/s bus translates almost directly into tokens/sec.
+//! per-layer KV cache. Decode supports fp32, fp16-storage/fp32-math, and int8
+//! per-output-channel weight storage.
 
+use std::fmt;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    sys, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
+use half::f16;
 
 use crate::model::{Config, Model};
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightMode {
+    Fp32,
+    Fp16,
+    Int8,
+}
+
+impl WeightMode {
+    pub fn parse(args: &[String]) -> Self {
+        let fp16 = args.iter().any(|a| a == "--fp16");
+        let int8 = args.iter().any(|a| a == "--int8");
+        assert!(!(fp16 && int8), "choose only one of --fp16 or --int8");
+        if int8 {
+            WeightMode::Int8
+        } else if fp16 {
+            WeightMode::Fp16
+        } else {
+            WeightMode::Fp32
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WeightMode::Fp32 => "fp32",
+            WeightMode::Fp16 => "fp16",
+            WeightMode::Int8 => "int8",
+        }
+    }
+
+    pub fn weight_mb(self) -> f64 {
+        match self {
+            WeightMode::Fp32 => 498.0,
+            WeightMode::Fp16 => 249.0,
+            WeightMode::Int8 => 124.0,
+        }
+    }
+}
+
+impl fmt::Display for WeightMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 pub enum Weights {
     F32(CudaSlice<f32>),
-    Int8 { q: CudaSlice<i8>, scales: CudaSlice<f32> },
+    F16(CudaSlice<f16>),
+    Int8 {
+        q: CudaSlice<i8>,
+        scales: CudaSlice<f32>,
+    },
 }
 
 /// Per-output-channel absmax quantization of a [n_in, n_out] matrix.
@@ -30,6 +81,10 @@ fn quantize(w: &[f32], n_in: usize, n_out: usize) -> (Vec<i8>, Vec<f32>) {
         .map(|idx| (w[idx] / scales[idx % n_out]).round().clamp(-127.0, 127.0) as i8)
         .collect();
     (q, scales)
+}
+
+fn to_half(w: &[f32]) -> Vec<f16> {
+    w.iter().copied().map(f16::from_f32).collect()
 }
 
 struct LayerG {
@@ -49,13 +104,21 @@ struct LayerG {
 
 struct Kernels {
     embed: CudaFunction,
+    embed_half: CudaFunction,
     embed_int8: CudaFunction,
+    embed_dyn: CudaFunction,
+    embed_half_dyn: CudaFunction,
+    embed_int8_dyn: CudaFunction,
     layernorm: CudaFunction,
     gemv: CudaFunction,
+    gemv_half: CudaFunction,
     gemv_int8: CudaFunction,
+    copy_kv_dyn: CudaFunction,
     attn_decode: CudaFunction,
+    attn_decode_dyn: CudaFunction,
     add_inplace: CudaFunction,
     gelu_inplace: CudaFunction,
+    argmax_advance: CudaFunction,
 }
 
 fn cfg1d(n: usize) -> LaunchConfig {
@@ -78,7 +141,11 @@ fn layernorm(
     let n_i = n as i32;
     let mut lb = stream.launch_builder(f);
     lb.arg(out).arg(x).arg(g).arg(b).arg(&n_i);
-    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
     unsafe { lb.launch(cfg) }.unwrap();
 }
 
@@ -105,6 +172,11 @@ fn gemv(
             lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no);
             unsafe { lb.launch(cfg) }.unwrap();
         }
+        Weights::F16(w) => {
+            let mut lb = stream.launch_builder(&k.gemv_half);
+            lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
         Weights::Int8 { q, scales } => {
             let mut lb = stream.launch_builder(&k.gemv_int8);
             lb.arg(y).arg(x).arg(q).arg(scales).arg(b).arg(&ni).arg(&no);
@@ -113,7 +185,13 @@ fn gemv(
     }
 }
 
-fn add(stream: &Arc<CudaStream>, f: &CudaFunction, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, n: usize) {
+fn add(
+    stream: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &mut CudaSlice<f32>,
+    y: &CudaSlice<f32>,
+    n: usize,
+) {
     let n_i = n as i32;
     let mut lb = stream.launch_builder(f);
     lb.arg(x).arg(y).arg(&n_i);
@@ -139,33 +217,53 @@ pub struct Engine {
     h: CudaSlice<f32>,
     zero_bias: CudaSlice<f32>, // for the bias-free lm_head GEMV
     logits: CudaSlice<f32>,
+    graph_tok: CudaSlice<i32>,
+    graph_pos: CudaSlice<i32>,
+    decode_graph: Option<CudaGraph>,
 }
 
 impl Engine {
-    pub fn new(ctx: &Arc<CudaContext>, model: &Model, int8: bool) -> Self {
+    pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode) -> Self {
         let c = model.config;
         let (e, v) = (c.n_embd, c.n_vocab);
-        let stream = ctx.default_stream();
+        // This engine schedules all work on one stream. Disabling cudarc's
+        // cross-stream event tracking keeps CUDA stream capture free of
+        // external event dependencies.
+        unsafe { ctx.disable_event_tracking() };
+        let stream = ctx.new_stream().unwrap();
         let module = common::load_ptx(ctx, "llm", LLM_PTX).unwrap();
         let f = |name: &str| module.load_function(name).unwrap();
         let k = Kernels {
             embed: f("embed"),
+            embed_half: f("embed_half"),
             embed_int8: f("embed_int8"),
+            embed_dyn: f("embed_dyn"),
+            embed_half_dyn: f("embed_half_dyn"),
+            embed_int8_dyn: f("embed_int8_dyn"),
             layernorm: f("layernorm"),
             gemv: f("gemv"),
+            gemv_half: f("gemv_half"),
             gemv_int8: f("gemv_int8"),
+            copy_kv_dyn: f("copy_kv_dyn"),
             attn_decode: f("attn_decode"),
+            attn_decode_dyn: f("attn_decode_dyn"),
             add_inplace: f("add_inplace"),
             gelu_inplace: f("gelu_inplace"),
+            argmax_advance: f("argmax_advance"),
         };
 
         let up = |t: &[f32]| stream.clone_htod(t).unwrap();
         let upw = |t: &[f32], n_in: usize, n_out: usize| -> Weights {
-            if int8 {
-                let (q, s) = quantize(t, n_in, n_out);
-                Weights::Int8 { q: stream.clone_htod(&q).unwrap(), scales: up(&s) }
-            } else {
-                Weights::F32(up(t))
+            match mode {
+                WeightMode::Fp32 => Weights::F32(up(t)),
+                WeightMode::Fp16 => Weights::F16(stream.clone_htod(&to_half(t)).unwrap()),
+                WeightMode::Int8 => {
+                    let (q, s) = quantize(t, n_in, n_out);
+                    Weights::Int8 {
+                        q: stream.clone_htod(&q).unwrap(),
+                        scales: up(&s),
+                    }
+                }
             }
         };
 
@@ -204,8 +302,12 @@ impl Engine {
             layers,
             lnf_g: up(&model.lnf_g),
             lnf_b: up(&model.lnf_b),
-            kcache: (0..c.n_layer).map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap()).collect(),
-            vcache: (0..c.n_layer).map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap()).collect(),
+            kcache: (0..c.n_layer)
+                .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                .collect(),
+            vcache: (0..c.n_layer)
+                .map(|_| stream.alloc_zeros(c.n_ctx * e).unwrap())
+                .collect(),
             x: stream.alloc_zeros(e).unwrap(),
             xb: stream.alloc_zeros(e).unwrap(),
             qkv: stream.alloc_zeros(3 * e).unwrap(),
@@ -213,71 +315,409 @@ impl Engine {
             h: stream.alloc_zeros(4 * e).unwrap(),
             zero_bias: stream.alloc_zeros(v).unwrap(),
             logits: stream.alloc_zeros(v).unwrap(),
+            graph_tok: stream.alloc_zeros(1).unwrap(),
+            graph_pos: stream.alloc_zeros(1).unwrap(),
+            decode_graph: None,
             stream,
         }
     }
 
-    /// Runs one token through the model, returns logits on the host.
-    pub fn forward(&mut self, tok: u32, pos: usize) -> Vec<f32> {
+    fn launch_embed(&mut self, tok: i32, pos: i32) {
         let c = self.config;
-        let (e, v, nh, hd) = (c.n_embd, c.n_vocab, c.n_head, c.head_dim());
-        let (tok_i, pos_i, e_i, v_i) = (tok as i32, pos as i32, e as i32, v as i32);
-        assert!(pos < c.n_ctx, "context overflow");
-
+        let (e_i, v_i) = (c.n_embd as i32, c.n_vocab as i32);
         match &self.wte_t {
             Weights::F32(w) => {
                 let mut lb = self.stream.launch_builder(&self.k.embed);
-                lb.arg(&mut self.x).arg(w).arg(&self.wpe).arg(&tok_i).arg(&pos_i).arg(&e_i).arg(&v_i);
-                unsafe { lb.launch(cfg1d(e)) }.unwrap();
+                lb.arg(&mut self.x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&tok)
+                    .arg(&pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
+            Weights::F16(w) => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_half);
+                lb.arg(&mut self.x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&tok)
+                    .arg(&pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
             Weights::Int8 { q, scales } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int8);
-                lb.arg(&mut self.x).arg(q).arg(scales).arg(&self.wpe).arg(&tok_i).arg(&pos_i).arg(&e_i).arg(&v_i);
-                unsafe { lb.launch(cfg1d(e)) }.unwrap();
+                lb.arg(&mut self.x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&tok)
+                    .arg(&pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
         }
+    }
 
+    fn launch_embed_dyn(&mut self) {
+        let c = self.config;
+        let (e_i, v_i) = (c.n_embd as i32, c.n_vocab as i32);
+        match &self.wte_t {
+            Weights::F32(w) => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_dyn);
+                lb.arg(&mut self.x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&self.graph_tok)
+                    .arg(&self.graph_pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
+            Weights::F16(w) => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_half_dyn);
+                lb.arg(&mut self.x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&self.graph_tok)
+                    .arg(&self.graph_pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
+            Weights::Int8 { q, scales } => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_int8_dyn);
+                lb.arg(&mut self.x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&self.graph_tok)
+                    .arg(&self.graph_pos)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
+            }
+        }
+    }
+
+    fn forward_body(&mut self, pos: usize) {
+        let c = self.config;
+        let (e, nh, hd) = (c.n_embd, c.n_head, c.head_dim());
         for l in 0..c.n_layer {
             let layer = &self.layers[l];
 
-            layernorm(&self.stream, &self.k.layernorm, &mut self.xb, &self.x, &layer.ln1_g, &layer.ln1_b, e);
-            gemv(&self.stream, &self.k, &mut self.qkv, &self.xb, &layer.qkv_w, &layer.qkv_b, e, 3 * e);
+            layernorm(
+                &self.stream,
+                &self.k.layernorm,
+                &mut self.xb,
+                &self.x,
+                &layer.ln1_g,
+                &layer.ln1_b,
+                e,
+            );
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.qkv,
+                &self.xb,
+                &layer.qkv_w,
+                &layer.qkv_b,
+                e,
+                3 * e,
+            );
 
-            // append K and V rows to this layer's cache
             self.stream
-                .memcpy_dtod(&self.qkv.slice(e..2 * e), &mut self.kcache[l].slice_mut(pos * e..(pos + 1) * e))
+                .memcpy_dtod(
+                    &self.qkv.slice(e..2 * e),
+                    &mut self.kcache[l].slice_mut(pos * e..(pos + 1) * e),
+                )
                 .unwrap();
             self.stream
-                .memcpy_dtod(&self.qkv.slice(2 * e..3 * e), &mut self.vcache[l].slice_mut(pos * e..(pos + 1) * e))
+                .memcpy_dtod(
+                    &self.qkv.slice(2 * e..3 * e),
+                    &mut self.vcache[l].slice_mut(pos * e..(pos + 1) * e),
+                )
                 .unwrap();
 
             let (t_i, nh_i, hd_i) = (pos as i32, nh as i32, hd as i32);
             let mut lb = self.stream.launch_builder(&self.k.attn_decode);
-            lb.arg(&mut self.attn).arg(&self.qkv).arg(&self.kcache[l]).arg(&self.vcache[l]).arg(&t_i).arg(&nh_i).arg(&hd_i);
-            let cfg = LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+            lb.arg(&mut self.attn)
+                .arg(&self.qkv)
+                .arg(&self.kcache[l])
+                .arg(&self.vcache[l])
+                .arg(&t_i)
+                .arg(&nh_i)
+                .arg(&hd_i);
+            let cfg = LaunchConfig {
+                grid_dim: (nh as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe { lb.launch(cfg) }.unwrap();
 
-            gemv(&self.stream, &self.k, &mut self.xb, &self.attn, &layer.proj_w, &layer.proj_b, e, e);
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.xb,
+                &self.attn,
+                &layer.proj_w,
+                &layer.proj_b,
+                e,
+                e,
+            );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
 
-            layernorm(&self.stream, &self.k.layernorm, &mut self.xb, &self.x, &layer.ln2_g, &layer.ln2_b, e);
-            gemv(&self.stream, &self.k, &mut self.h, &self.xb, &layer.fc_w, &layer.fc_b, e, 4 * e);
+            layernorm(
+                &self.stream,
+                &self.k.layernorm,
+                &mut self.xb,
+                &self.x,
+                &layer.ln2_g,
+                &layer.ln2_b,
+                e,
+            );
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.h,
+                &self.xb,
+                &layer.fc_w,
+                &layer.fc_b,
+                e,
+                4 * e,
+            );
             let n_i = (4 * e) as i32;
             let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
             lb.arg(&mut self.h).arg(&n_i);
             unsafe { lb.launch(cfg1d(4 * e)) }.unwrap();
-            gemv(&self.stream, &self.k, &mut self.xb, &self.h, &layer.fc2_w, &layer.fc2_b, 4 * e, e);
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.xb,
+                &self.h,
+                &layer.fc2_w,
+                &layer.fc2_b,
+                4 * e,
+                e,
+            );
             add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
         }
 
-        layernorm(&self.stream, &self.k.layernorm, &mut self.xb, &self.x, &self.lnf_g, &self.lnf_b, e);
-        gemv(&self.stream, &self.k, &mut self.logits, &self.xb, &self.wte_t, &self.zero_bias, e, v);
+        layernorm(
+            &self.stream,
+            &self.k.layernorm,
+            &mut self.xb,
+            &self.x,
+            &self.lnf_g,
+            &self.lnf_b,
+            e,
+        );
+        gemv(
+            &self.stream,
+            &self.k,
+            &mut self.logits,
+            &self.xb,
+            &self.wte_t,
+            &self.zero_bias,
+            e,
+            c.n_vocab,
+        );
+    }
 
+    fn forward_body_dyn(&mut self) {
+        let c = self.config;
+        let (e, nh, hd) = (c.n_embd, c.n_head, c.head_dim());
+        for l in 0..c.n_layer {
+            let layer = &self.layers[l];
+
+            layernorm(
+                &self.stream,
+                &self.k.layernorm,
+                &mut self.xb,
+                &self.x,
+                &layer.ln1_g,
+                &layer.ln1_b,
+                e,
+            );
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.qkv,
+                &self.xb,
+                &layer.qkv_w,
+                &layer.qkv_b,
+                e,
+                3 * e,
+            );
+
+            let e_i = e as i32;
+            let mut lb = self.stream.launch_builder(&self.k.copy_kv_dyn);
+            lb.arg(&mut self.kcache[l])
+                .arg(&mut self.vcache[l])
+                .arg(&self.qkv)
+                .arg(&self.graph_pos)
+                .arg(&e_i);
+            unsafe { lb.launch(cfg1d(e)) }.unwrap();
+
+            let (nh_i, hd_i) = (nh as i32, hd as i32);
+            let mut lb = self.stream.launch_builder(&self.k.attn_decode_dyn);
+            lb.arg(&mut self.attn)
+                .arg(&self.qkv)
+                .arg(&self.kcache[l])
+                .arg(&self.vcache[l])
+                .arg(&self.graph_pos)
+                .arg(&nh_i)
+                .arg(&hd_i);
+            let cfg = LaunchConfig {
+                grid_dim: (nh as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.unwrap();
+
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.xb,
+                &self.attn,
+                &layer.proj_w,
+                &layer.proj_b,
+                e,
+                e,
+            );
+            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
+
+            layernorm(
+                &self.stream,
+                &self.k.layernorm,
+                &mut self.xb,
+                &self.x,
+                &layer.ln2_g,
+                &layer.ln2_b,
+                e,
+            );
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.h,
+                &self.xb,
+                &layer.fc_w,
+                &layer.fc_b,
+                e,
+                4 * e,
+            );
+            let n_i = (4 * e) as i32;
+            let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
+            lb.arg(&mut self.h).arg(&n_i);
+            unsafe { lb.launch(cfg1d(4 * e)) }.unwrap();
+            gemv(
+                &self.stream,
+                &self.k,
+                &mut self.xb,
+                &self.h,
+                &layer.fc2_w,
+                &layer.fc2_b,
+                4 * e,
+                e,
+            );
+            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
+        }
+
+        layernorm(
+            &self.stream,
+            &self.k.layernorm,
+            &mut self.xb,
+            &self.x,
+            &self.lnf_g,
+            &self.lnf_b,
+            e,
+        );
+        gemv(
+            &self.stream,
+            &self.k,
+            &mut self.logits,
+            &self.xb,
+            &self.wte_t,
+            &self.zero_bias,
+            e,
+            c.n_vocab,
+        );
+    }
+
+    /// Runs one token through the model, returns logits on the host.
+    pub fn forward(&mut self, tok: u32, pos: usize) -> Vec<f32> {
+        assert!(pos < self.config.n_ctx, "context overflow");
+        self.launch_embed(tok as i32, pos as i32);
+        self.forward_body(pos);
         self.stream.clone_dtoh(&self.logits).unwrap()
     }
 
+    fn capture_decode_graph(&mut self) {
+        if self.decode_graph.is_some() {
+            return;
+        }
+        self.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .unwrap();
+        self.launch_embed_dyn();
+        self.forward_body_dyn();
+        let v_i = self.config.n_vocab as i32;
+        let mut lb = self.stream.launch_builder(&self.k.argmax_advance);
+        lb.arg(&mut self.graph_tok)
+            .arg(&mut self.graph_pos)
+            .arg(&self.logits)
+            .arg(&v_i);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.unwrap();
+        let graph = self
+            .stream
+            .end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
+            .unwrap()
+            .expect("stream capture produced no graph");
+        graph.upload().unwrap();
+        self.decode_graph = Some(graph);
+    }
+
+    pub fn prepare_decode_graph(&mut self) {
+        self.capture_decode_graph();
+    }
+
+    /// Replays a captured one-token decode graph. The graph keeps token and
+    /// position on device, so the host submits one graph launch per token and
+    /// does not copy logits back between steps.
+    pub fn graph_decode(&mut self, first_tok: u32, pos: usize, n_steps: usize) -> u32 {
+        assert!(pos + n_steps <= self.config.n_ctx, "context overflow");
+        self.stream
+            .memcpy_htod(&[first_tok as i32], &mut self.graph_tok)
+            .unwrap();
+        self.stream
+            .memcpy_htod(&[pos as i32], &mut self.graph_pos)
+            .unwrap();
+        self.capture_decode_graph();
+        for _ in 0..n_steps {
+            self.decode_graph.as_ref().unwrap().launch().unwrap();
+        }
+        self.stream.synchronize().unwrap();
+        self.stream.clone_dtoh(&self.graph_tok).unwrap()[0] as u32
+    }
+
     /// Greedy generation; returns only the newly generated token ids.
-    pub fn generate(&mut self, prompt: &[u32], n_new: usize, mut on_token: impl FnMut(u32)) -> Vec<u32> {
+    pub fn generate(
+        &mut self,
+        prompt: &[u32],
+        n_new: usize,
+        mut on_token: impl FnMut(u32),
+    ) -> Vec<u32> {
         assert!(!prompt.is_empty());
         let mut logits = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {

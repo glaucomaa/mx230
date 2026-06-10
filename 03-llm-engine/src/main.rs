@@ -1,9 +1,10 @@
 //! Stage 3: GPT-2 124M inference engine in plain CUDA.
 //!
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
-//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--int8]
+//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8]
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
-//!   cargo run -rp llm-engine -- bench [-n 64]          # tokens/sec, fp32 vs int8
+//!   cargo run -rp llm-engine -- bench [-n 64] [--graphs]
+//!   cargo run -rp llm-engine -- ppl --data path [-n tokens]
 
 mod cpu;
 mod export;
@@ -22,7 +23,11 @@ fn models_dir() -> PathBuf {
 
 fn load_model() -> model::Model {
     let path = models_dir().join("gpt2.bin");
-    assert!(path.exists(), "{} not found — run `export` first", path.display());
+    assert!(
+        path.exists(),
+        "{} not found — run `export` first",
+        path.display()
+    );
     model::Model::load(&path).unwrap()
 }
 
@@ -38,6 +43,40 @@ fn opt_n(args: &[String], default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn opt_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+fn logprob(logits: &[f32], target: u32) -> f64 {
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp: f64 = logits.iter().map(|&x| ((x as f64) - m).exp()).sum();
+    logits[target as usize] as f64 - m - sum_exp.ln()
+}
+
+fn perplexity(engine: &mut gpu::Engine, tokens: &[u32]) -> (f64, usize) {
+    let ctx = engine.config.n_ctx;
+    let mut nll = 0.0f64;
+    let mut count = 0usize;
+    let mut start = 0;
+    while start + 1 < tokens.len() {
+        let end = (start + ctx).min(tokens.len());
+        let chunk = &tokens[start..end];
+        let mut logits = Vec::new();
+        for (pos, &tok) in chunk.iter().enumerate() {
+            if pos > 0 {
+                nll -= logprob(&logits, tok);
+                count += 1;
+            }
+            logits = engine.forward(tok, pos);
+        }
+        start = end - 1;
+    }
+    ((nll / count as f64).exp(), count)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -49,15 +88,21 @@ fn main() {
             model.save(&dir.join("gpt2.bin")).unwrap();
             println!("wrote {}", dir.join("gpt2.bin").display());
         }
+        Some("ppl-data") => {
+            export::download_wikitext2(&models_dir());
+        }
         Some("generate") => {
-            let prompt = args.get(1).filter(|p| !p.starts_with('-')).expect("usage: generate \"prompt\"");
+            let prompt = args
+                .get(1)
+                .filter(|p| !p.starts_with('-'))
+                .expect("usage: generate \"prompt\"");
             let n_new = opt_n(&args, 64);
-            let int8 = flag(&args, "--int8");
+            let mode = gpu::WeightMode::parse(&args);
 
             let tok = tokenizer::Tokenizer::load(&models_dir());
             let model = load_model();
             let ctx = CudaContext::new(0).unwrap();
-            let mut engine = gpu::Engine::new(&ctx, &model, int8);
+            let mut engine = gpu::Engine::new(&ctx, &model, mode);
 
             let ids = tok.encode(prompt);
             print!("{prompt}");
@@ -74,7 +119,7 @@ fn main() {
                 n_new,
                 dt,
                 (ids.len() + n_new) as f64 / dt,
-                if int8 { "int8" } else { "fp32" }
+                mode
             );
         }
         Some("verify") => {
@@ -88,60 +133,141 @@ fn main() {
             let want = cpu::forward(&model, &ids);
 
             let ctx = CudaContext::new(0).unwrap();
-            for int8 in [false, true] {
-                let mut engine = gpu::Engine::new(&ctx, &model, int8);
+            for mode in [
+                gpu::WeightMode::Fp32,
+                gpu::WeightMode::Fp16,
+                gpu::WeightMode::Int8,
+            ] {
+                let mut engine = gpu::Engine::new(&ctx, &model, mode);
                 let mut got = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     got = engine.forward(t, pos);
                 }
-                let name = if int8 { "int8" } else { "fp32" };
                 let err = common::allclose_err(&got, &want, 1e-2, 5e-2);
                 let (cw, gw) = (gpu::argmax(&want), gpu::argmax(&got));
                 println!(
-                    "GPU {name}: allclose_err = {err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?})",
+                    "GPU {mode}: allclose_err = {err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?})",
                     tok.decode(&[cw]),
                     tok.decode(&[gw]),
                 );
-                if int8 {
-                    // int8 only has to agree on ranking, not bit-exact logits
-                    assert_eq!(cw, gw, "int8 argmax mismatch");
-                } else {
+                if mode == gpu::WeightMode::Fp32 {
                     assert!(err < 1.0, "fp32 logits mismatch: {err}");
-                    assert_eq!(cw, gw, "fp32 argmax mismatch");
                 }
+                assert_eq!(cw, gw, "{mode} argmax mismatch");
                 println!("  OK");
             }
+
+            // graph decode must produce the same greedy continuation as the
+            // host loop; any divergence propagates, so comparing the token
+            // after n steps checks the whole path
+            let n_steps = 16;
+            let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32);
+            let mut logits = Vec::new();
+            for (pos, &t) in ids.iter().enumerate() {
+                logits = engine.forward(t, pos);
+            }
+            let first = gpu::argmax(&logits);
+            let mut pos = ids.len();
+            for _ in 0..n_steps {
+                let next = gpu::argmax(&logits);
+                logits = engine.forward(next, pos);
+                pos += 1;
+            }
+            let host_tok = gpu::argmax(&logits);
+
+            let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32);
+            for (pos, &t) in ids.iter().enumerate() {
+                engine.forward(t, pos);
+            }
+            let graph_tok = engine.graph_decode(first, ids.len(), n_steps);
+            assert_eq!(
+                graph_tok, host_tok,
+                "graph decode diverged from host decode after {n_steps} steps"
+            );
+            println!(
+                "graph decode: token after {n_steps} steps matches host loop ({host_tok})  OK"
+            );
         }
         Some("bench") => {
             let tok = tokenizer::Tokenizer::load(&models_dir());
             let model = load_model();
             let n_new = opt_n(&args, 64);
+            let graphs = flag(&args, "--graphs");
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
-            println!("| mode | weights | tokens/sec |");
-            println!("|------|---------|------------|");
-            for int8 in [false, true] {
-                let mut engine = gpu::Engine::new(&ctx, &model, int8);
+            println!("| mode | weights | graph | tokens/sec |");
+            println!("|------|---------|-------|------------|");
+            for mode in [
+                gpu::WeightMode::Fp32,
+                gpu::WeightMode::Fp16,
+                gpu::WeightMode::Int8,
+            ] {
+                let mut engine = gpu::Engine::new(&ctx, &model, mode);
                 // warmup + prefill
                 let mut logits = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     logits = engine.forward(t, pos);
                 }
-                let mut pos = ids.len();
+                if graphs {
+                    engine.prepare_decode_graph();
+                }
                 let t0 = Instant::now();
-                for _ in 0..n_new {
-                    let next = gpu::argmax(&logits);
-                    logits = engine.forward(next, pos);
-                    pos += 1;
+                if graphs {
+                    let first = gpu::argmax(&logits);
+                    engine.graph_decode(first, ids.len(), n_new);
+                } else {
+                    let mut pos = ids.len();
+                    for _ in 0..n_new {
+                        let next = gpu::argmax(&logits);
+                        logits = engine.forward(next, pos);
+                        pos += 1;
+                    }
                 }
                 let dt = t0.elapsed().as_secs_f64();
-                let mb = if int8 { 124.0 } else { 498.0 };
-                println!("| {} | ~{mb:.0} MB | {:.1} |", if int8 { "int8" } else { "fp32" }, n_new as f64 / dt);
+                println!(
+                    "| {mode} | ~{:.0} MB | {} | {:.1} |",
+                    mode.weight_mb(),
+                    if graphs { "yes" } else { "no" },
+                    n_new as f64 / dt
+                );
+            }
+        }
+        Some("ppl") => {
+            let default_data = models_dir().join("wikitext-2-raw/wiki.test.raw");
+            let data_path = opt_value(&args, "--data")
+                .map(PathBuf::from)
+                .unwrap_or(default_data);
+            let max_tokens = opt_n(&args, 2048);
+            assert!(
+                data_path.exists(),
+                "{} not found; run `cargo run -rp llm-engine -- ppl-data` or pass --data",
+                data_path.display()
+            );
+            let text = std::fs::read_to_string(&data_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", data_path.display()));
+            let tok = tokenizer::Tokenizer::load(&models_dir());
+            let model = load_model();
+            let mut ids = tok.encode(&text);
+            ids.truncate(max_tokens.min(ids.len()));
+            assert!(ids.len() > 1, "need at least two tokens for perplexity");
+            let ctx = CudaContext::new(0).unwrap();
+
+            println!("dataset: {} ({} tokens)", data_path.display(), ids.len());
+            println!("| mode | weights | tokens | perplexity |");
+            println!("|------|---------|--------|------------|");
+            for mode in [
+                gpu::WeightMode::Fp32,
+                gpu::WeightMode::Fp16,
+                gpu::WeightMode::Int8,
+            ] {
+                let mut engine = gpu::Engine::new(&ctx, &model, mode);
+                let (ppl, n) = perplexity(&mut engine, &ids);
+                println!("| {mode} | ~{:.0} MB | {n} | {ppl:.3} |", mode.weight_mb());
             }
         }
         _ => {
-            eprintln!("usage: llm-engine <export|generate|verify|bench> [args]");
+            eprintln!("usage: llm-engine <export|ppl-data|generate|verify|bench|ppl> [args]");
             std::process::exit(1);
         }
     }

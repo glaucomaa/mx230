@@ -24,7 +24,13 @@ pub struct Config {
 
 impl Config {
     pub fn gpt2_small() -> Self {
-        Config { n_layer: 12, n_head: 12, n_embd: 768, n_ctx: 1024, n_vocab: 50257 }
+        Config {
+            n_layer: 12,
+            n_head: 12,
+            n_embd: 768,
+            n_ctx: 1024,
+            n_vocab: 50257,
+        }
     }
     pub fn head_dim(&self) -> usize {
         self.n_embd / self.n_head
@@ -86,7 +92,15 @@ impl Model {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let c = &self.config;
         let mut out = std::io::BufWriter::new(fs::File::create(path)?);
-        for v in [MAGIC, VERSION, c.n_layer as u32, c.n_head as u32, c.n_embd as u32, c.n_ctx as u32, c.n_vocab as u32] {
+        for v in [
+            MAGIC,
+            VERSION,
+            c.n_layer as u32,
+            c.n_head as u32,
+            c.n_embd as u32,
+            c.n_ctx as u32,
+            c.n_vocab as u32,
+        ] {
             out.write_all(&v.to_le_bytes())?;
         }
         write_tensor(&mut out, &self.wte)?;
@@ -138,6 +152,13 @@ impl Model {
         let lnf_g = r.tensor(e);
         let lnf_b = r.tensor(e);
         assert_eq!(r.pos, buf.len(), "trailing bytes in model.bin");
-        Ok(Model { config, wte, wpe, layers, lnf_g, lnf_b })
+        Ok(Model {
+            config,
+            wte,
+            wpe,
+            layers,
+            lnf_g,
+            lnf_b,
+        })
     }
 }

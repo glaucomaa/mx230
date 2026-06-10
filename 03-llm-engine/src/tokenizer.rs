@@ -66,7 +66,11 @@ fn pretokenize(text: &str) -> Vec<String> {
             (i, c)
         };
         if !first.is_whitespace() {
-            let mut j = if chars[start] == ' ' { start + 1 } else { start };
+            let mut j = if chars[start] == ' ' {
+                start + 1
+            } else {
+                start
+            };
             let class = if is_letter(first) {
                 0
             } else if is_digit(first) {
@@ -85,7 +89,14 @@ fn pretokenize(text: &str) -> Vec<String> {
                 if !ok {
                     break;
                 }
-                if class == 2 && cj == '\'' && j > (if chars[start] == ' ' { start + 1 } else { start }) {
+                if class == 2
+                    && cj == '\''
+                    && j > (if chars[start] == ' ' {
+                        start + 1
+                    } else {
+                        start
+                    })
+                {
                     break;
                 }
                 j += 1;
@@ -101,7 +112,11 @@ fn pretokenize(text: &str) -> Vec<String> {
         while j < chars.len() && chars[j].is_whitespace() {
             j += 1;
         }
-        let end = if j < chars.len() && j - i > 1 { j - 1 } else { j };
+        let end = if j < chars.len() && j - i > 1 {
+            j - 1
+        } else {
+            j
+        };
         out.push(chars[i..end].iter().collect());
         i = end;
     }
@@ -128,7 +143,13 @@ impl Tokenizer {
 
         let byte_to_char = bytes_to_unicode();
         let char_to_byte = (0..256).map(|b| (byte_to_char[b], b as u8)).collect();
-        Tokenizer { vocab, inv_vocab, merges, byte_to_char, char_to_byte }
+        Tokenizer {
+            vocab,
+            inv_vocab,
+            merges,
+            byte_to_char,
+            char_to_byte,
+        }
     }
 
     fn bpe(&self, token: &str) -> Vec<u32> {
@@ -138,7 +159,9 @@ impl Tokenizer {
                 .windows(2)
                 .enumerate()
                 .filter_map(|(i, w)| {
-                    self.merges.get(&(w[0].clone(), w[1].clone())).map(|r| (*r, i))
+                    self.merges
+                        .get(&(w[0].clone(), w[1].clone()))
+                        .map(|r| (*r, i))
                 })
                 .min();
             let Some((_, i)) = best else { break };
@@ -147,7 +170,12 @@ impl Tokenizer {
         }
         parts
             .iter()
-            .map(|p| *self.vocab.get(p).unwrap_or_else(|| panic!("token piece {p:?} not in vocab")))
+            .map(|p| {
+                *self
+                    .vocab
+                    .get(p)
+                    .unwrap_or_else(|| panic!("token piece {p:?} not in vocab"))
+            })
             .collect()
     }
 
@@ -165,7 +193,10 @@ impl Tokenizer {
             .iter()
             .map(|id| self.inv_vocab.get(id).map(String::as_str).unwrap_or(""))
             .collect();
-        let bytes: Vec<u8> = chars.chars().filter_map(|c| self.char_to_byte.get(&c).copied()).collect();
+        let bytes: Vec<u8> = chars
+            .chars()
+            .filter_map(|c| self.char_to_byte.get(&c).copied())
+            .collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }

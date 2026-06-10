@@ -6,6 +6,7 @@
 // Weight matrices are [n_in, n_out] row-major (y = x @ W + b): consecutive
 // threads read consecutive outputs of the same input row — fully coalesced.
 #include <math_constants.h>
+#include <cuda_fp16.h>
 
 #define LN_EPS 1e-5f
 
@@ -19,9 +20,51 @@ extern "C" __global__ void embed(float *out, const float *wte_t, const float *wp
     }
 }
 
+extern "C" __global__ void embed_half(float *out, const __half *wte_t, const float *wpe,
+                                      int tok, int pos, int n_embd, int n_vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = __half2float(wte_t[(size_t)i * n_vocab + tok]) + wpe[pos * n_embd + i];
+    }
+}
+
 extern "C" __global__ void embed_int8(float *out, const signed char *wte_t,
                                       const float *scales, const float *wpe,
                                       int tok, int pos, int n_embd, int n_vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = (float)wte_t[(size_t)i * n_vocab + tok] * scales[tok] + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_dyn(float *out, const float *wte_t, const float *wpe,
+                                     const int *tok_ptr, const int *pos_ptr,
+                                     int n_embd, int n_vocab) {
+    int tok = *tok_ptr;
+    int pos = *pos_ptr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = wte_t[(size_t)i * n_vocab + tok] + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_half_dyn(float *out, const __half *wte_t, const float *wpe,
+                                          const int *tok_ptr, const int *pos_ptr,
+                                          int n_embd, int n_vocab) {
+    int tok = *tok_ptr;
+    int pos = *pos_ptr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = __half2float(wte_t[(size_t)i * n_vocab + tok]) + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int8_dyn(float *out, const signed char *wte_t,
+                                          const float *scales, const float *wpe,
+                                          const int *tok_ptr, const int *pos_ptr,
+                                          int n_embd, int n_vocab) {
+    int tok = *tok_ptr;
+    int pos = *pos_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_embd) {
         out[i] = (float)wte_t[(size_t)i * n_vocab + tok] * scales[tok] + wpe[pos * n_embd + i];
@@ -81,6 +124,23 @@ extern "C" __global__ void gemv(float *y, const float *x, const float *w,
     }
 }
 
+// fp16 storage, fp32 math: weights are loaded as half and immediately widened.
+extern "C" __global__ void gemv_half(float *y, const float *x, const __half *w,
+                                     const float *b, int n_in, int n_out) {
+    extern __shared__ float xs[];
+    for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n_out;
+         o += gridDim.x * blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_in; ++i) {
+            acc += xs[i] * __half2float(w[(size_t)i * n_out + o]);
+        }
+        y[o] = acc + (b ? b[o] : 0.0f);
+    }
+}
+
 // int8 weights with one fp32 scale per output column (absmax quantization).
 extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char *w,
                                      const float *scales, const float *b,
@@ -99,12 +159,22 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
     }
 }
 
+extern "C" __global__ void copy_kv_dyn(float *kcache, float *vcache, const float *qkv,
+                                       const int *pos_ptr, int n_embd) {
+    int pos = *pos_ptr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        kcache[(size_t)pos * n_embd + i] = qkv[n_embd + i];
+        vcache[(size_t)pos * n_embd + i] = qkv[2 * n_embd + i];
+    }
+}
+
 // Causal attention for one new token over the KV cache (one block per head).
 // Cache layout per layer: [t][n_embd] where each row is heads*head_dim.
 // Scores for up to n_ctx cached positions live in shared memory.
-extern "C" __global__ void attn_decode(float *out, const float *qkv,
-                                       const float *kcache, const float *vcache,
-                                       int t_cur, int n_head, int head_dim) {
+__device__ void attn_decode_impl(float *out, const float *qkv,
+                                 const float *kcache, const float *vcache,
+                                 int t_cur, int n_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
     __shared__ float red[128];
     int h = blockIdx.x;
@@ -153,6 +223,18 @@ extern "C" __global__ void attn_decode(float *out, const float *qkv,
     }
 }
 
+extern "C" __global__ void attn_decode(float *out, const float *qkv,
+                                       const float *kcache, const float *vcache,
+                                       int t_cur, int n_head, int head_dim) {
+    attn_decode_impl(out, qkv, kcache, vcache, t_cur, n_head, head_dim);
+}
+
+extern "C" __global__ void attn_decode_dyn(float *out, const float *qkv,
+                                           const float *kcache, const float *vcache,
+                                           const int *pos_ptr, int n_head, int head_dim) {
+    attn_decode_impl(out, qkv, kcache, vcache, *pos_ptr, n_head, head_dim);
+}
+
 extern "C" __global__ void add_inplace(float *x, const float *y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
@@ -163,5 +245,39 @@ extern "C" __global__ void gelu_inplace(float *x, int n) {
     if (i < n) {
         float v = x[i];
         x[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+    }
+}
+
+extern "C" __global__ void argmax_advance(int *tok_ptr, int *pos_ptr,
+                                          const float *logits, int n_vocab) {
+    __shared__ float vals[256];
+    __shared__ int idxs[256];
+    int tid = threadIdx.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < n_vocab; i += blockDim.x) {
+        float v = logits[i];
+        if (v > best || (v == best && i < best_i)) {
+            best = v;
+            best_i = i;
+        }
+    }
+    vals[tid] = best;
+    idxs[tid] = best_i;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) {
+            float other = vals[tid + k];
+            int other_i = idxs[tid + k];
+            if (other > vals[tid] || (other == vals[tid] && other_i < idxs[tid])) {
+                vals[tid] = other;
+                idxs[tid] = other_i;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        *tok_ptr = idxs[0];
+        *pos_ptr += 1;
     }
 }
