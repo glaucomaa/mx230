@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["common"]
+
+[workspace.dependencies]
+cudarc = { version = "0.19", features = ["cuda-12090"] }
