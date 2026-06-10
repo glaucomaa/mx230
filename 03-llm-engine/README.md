@@ -11,8 +11,9 @@ full attention/GQA are per-arch dispatches. One command pipeline
 ```
 cargo run -rp llm-engine -- export [--model qwen]     # download + convert weights
 cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8] [--kv8]
-cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8]
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8] [--kv8] [--spec]
+cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
+cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
 ```
@@ -64,6 +65,25 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   a negative result worth having: kernel launches are asynchronous, the host
   enqueues ~115 launches/token faster than the GPU drains them, so the GPU
   never goes idle and there is no launch overhead to remove.
+- **Batch prefill replaces token-by-token GEMV with GEMM + flash-style causal
+  attention.** A 512-token prompt now runs as tiled matmuls over the whole
+  prompt and a GQA-aware online-softmax attention pass over the KV cache.
+  On MX230/GPT-2 the measured time-to-first-token is:
+
+  | mode | token loop | batch prefill | speedup |
+  |------|------------|---------------|---------|
+  | fp32 | 7.100s     | 0.484s        | 14.65x  |
+  | fp16 | 5.001s     | 0.511s        | 9.79x   |
+  | int8 | 4.427s     | 0.514s        | 8.61x   |
+
+  The prefill path is checked against the token loop in `verify`: final logits
+  may differ at float-rounding scale, but the greedy argmax must match in every
+  weight/KV mode.
+- **Prompt-lookup speculative decoding** (`--spec`, optional `--spec-k N`) uses
+  repeated n-grams from the prompt/generated history as draft tokens, verifies
+  them with the same batch forward path, and accepts only tokens that match the
+  full model's greedy argmax. It is lossless by construction: `verify` compares
+  the speculative output token-for-token with ordinary greedy decode.
 - **int8 weights were instruction-bound until the loads got wider.** The
   first int8 GEMV issued one byte load + convert + FMA per weight — the same
   instruction count as fp32 for a quarter of the data, so below bus
@@ -145,17 +165,20 @@ progress measured on the same harness.
   (fp32 / fp16 storage / int8 with per-output-channel absmax scales and
   char4 loads on wide outputs), fused causal KV-cache attention with GQA
   (one block per query head, online scores in shared memory; fp32 and
-  int8-cache variants), quantize-on-write KV kernels, GELU, SwiGLU combine,
-  residual add, GPU argmax for graph replay.
+  int8-cache variants), batched prefill GEMM and flash-style attention,
+  quantize-on-write KV kernels, GELU, SwiGLU combine, residual add, GPU
+  argmax for graph replay and draft verification.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or
   quantized at load; per-layer KV cache (fp32 or int8 + scales); standard
-  host-greedy decode and a CUDA-graph benchmark path.
+  host-greedy decode, batch prefill, prompt-lookup speculative decode and a
+  CUDA-graph benchmark path.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked
-for argmax agreement; the graph decode path (with fp32 and int8 KV) must
-reproduce the host loop's greedy continuation token-for-token (checked 16
-steps deep).
+for argmax agreement; batch prefill must match the token loop's greedy argmax;
+prompt-lookup speculative decode must reproduce ordinary greedy tokens; the
+graph decode path (with fp32 and int8 KV) must reproduce the host loop's
+greedy continuation token-for-token (checked 16 steps deep).
 Sample output (greedy, so it loops — that's GPT-2 124M, not a bug):
 
 > Alan Turing was a brilliant mathematician, and he was a great friend of

@@ -13,6 +13,7 @@ use half::f16;
 use crate::model::{Arch, Config, Model};
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
+const MAX_SPEC_TOKENS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightMode {
@@ -142,30 +143,53 @@ struct Kernels {
     embed_dyn: CudaFunction,
     embed_half_dyn: CudaFunction,
     embed_int8_dyn: CudaFunction,
+    embed_batch: CudaFunction,
+    embed_half_batch: CudaFunction,
+    embed_int8_batch: CudaFunction,
     layernorm: CudaFunction,
     rmsnorm: CudaFunction,
     rope: CudaFunction,
     rope_dyn: CudaFunction,
+    rope_batch: CudaFunction,
     silu_mul: CudaFunction,
     gemv: CudaFunction,
     gemv_half: CudaFunction,
     gemv_int8: CudaFunction,
+    gemm_f32: CudaFunction,
+    gemm_half: CudaFunction,
+    gemm_int8: CudaFunction,
     copy_kv_dyn: CudaFunction,
+    copy_kv_batch: CudaFunction,
     quantize_kv: CudaFunction,
     quantize_kv_dyn: CudaFunction,
+    quantize_kv_batch: CudaFunction,
     attn_decode: CudaFunction,
     attn_decode_dyn: CudaFunction,
     attn_decode_q8: CudaFunction,
     attn_decode_q8_dyn: CudaFunction,
+    attn_prefill: CudaFunction,
+    attn_prefill_q8: CudaFunction,
+    layernorm_batch: CudaFunction,
+    rmsnorm_batch: CudaFunction,
     add_inplace: CudaFunction,
     gelu_inplace: CudaFunction,
     argmax_advance: CudaFunction,
+    argmax_rows: CudaFunction,
+    copy_row: CudaFunction,
 }
 
 fn cfg1d(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn cfg_gemm(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
+        block_dim: (16, 16, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -238,6 +262,90 @@ fn gemv(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gemm(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    c: &mut CudaSlice<f32>,
+    a: &CudaSlice<f32>,
+    b: &Weights,
+    bias: &CudaSlice<f32>,
+    m: usize,
+    n: usize,
+    kk: usize,
+) {
+    let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
+    let cfg = cfg_gemm(m, n);
+    match b {
+        Weights::F32(w) => {
+            let mut lb = stream.launch_builder(&k.gemm_f32);
+            lb.arg(c)
+                .arg(a)
+                .arg(w)
+                .arg(bias)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+        Weights::F16(w) => {
+            let mut lb = stream.launch_builder(&k.gemm_half);
+            lb.arg(c)
+                .arg(a)
+                .arg(w)
+                .arg(bias)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+        Weights::Int8 { q, scales } => {
+            let mut lb = stream.launch_builder(&k.gemm_int8);
+            lb.arg(c)
+                .arg(a)
+                .arg(q)
+                .arg(scales)
+                .arg(bias)
+                .arg(&m_i)
+                .arg(&n_i)
+                .arg(&k_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn norm_batch(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    out: &mut CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    b: Option<&CudaSlice<f32>>,
+    rows: usize,
+    n: usize,
+    eps: f32,
+) {
+    let (rows_i, n_i) = (rows as i32, n as i32);
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    match b {
+        Some(b) => {
+            let mut lb = stream.launch_builder(&k.layernorm_batch);
+            lb.arg(out).arg(x).arg(g).arg(b).arg(&rows_i).arg(&n_i);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+        None => {
+            let mut lb = stream.launch_builder(&k.rmsnorm_batch);
+            lb.arg(out).arg(x).arg(g).arg(&rows_i).arg(&n_i).arg(&eps);
+            unsafe { lb.launch(cfg) }.unwrap();
+        }
+    }
+}
+
 fn add(
     stream: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -270,6 +378,15 @@ pub struct Engine {
     h2: CudaSlice<f32>,        // SwiGLU up-branch scratch (Qwen2)
     zero_bias: CudaSlice<f32>, // for the bias-free lm_head GEMV
     logits: CudaSlice<f32>,
+    batch_tok: CudaSlice<i32>,
+    batch_x: CudaSlice<f32>,
+    batch_xb: CudaSlice<f32>,
+    batch_qkv: CudaSlice<f32>,
+    batch_attn: CudaSlice<f32>,
+    batch_h: CudaSlice<f32>,
+    batch_h2: CudaSlice<f32>,
+    batch_logits: CudaSlice<f32>,
+    batch_argmax: CudaSlice<i32>,
     graph_tok: CudaSlice<i32>,
     graph_pos: CudaSlice<i32>,
     decode_graph: Option<CudaGraph>,
@@ -293,24 +410,39 @@ impl Engine {
             embed_dyn: f("embed_dyn"),
             embed_half_dyn: f("embed_half_dyn"),
             embed_int8_dyn: f("embed_int8_dyn"),
+            embed_batch: f("embed_batch"),
+            embed_half_batch: f("embed_half_batch"),
+            embed_int8_batch: f("embed_int8_batch"),
             layernorm: f("layernorm"),
             rmsnorm: f("rmsnorm"),
             rope: f("rope"),
             rope_dyn: f("rope_dyn"),
+            rope_batch: f("rope_batch"),
             silu_mul: f("silu_mul"),
             gemv: f("gemv"),
             gemv_half: f("gemv_half"),
             gemv_int8: f("gemv_int8"),
+            gemm_f32: f("gemm_f32"),
+            gemm_half: f("gemm_half"),
+            gemm_int8: f("gemm_int8"),
             copy_kv_dyn: f("copy_kv_dyn"),
+            copy_kv_batch: f("copy_kv_batch"),
             quantize_kv: f("quantize_kv"),
             quantize_kv_dyn: f("quantize_kv_dyn"),
+            quantize_kv_batch: f("quantize_kv_batch"),
             attn_decode: f("attn_decode"),
             attn_decode_dyn: f("attn_decode_dyn"),
             attn_decode_q8: f("attn_decode_q8"),
             attn_decode_q8_dyn: f("attn_decode_q8_dyn"),
+            attn_prefill: f("attn_prefill"),
+            attn_prefill_q8: f("attn_prefill_q8"),
+            layernorm_batch: f("layernorm_batch"),
+            rmsnorm_batch: f("rmsnorm_batch"),
             add_inplace: f("add_inplace"),
             gelu_inplace: f("gelu_inplace"),
             argmax_advance: f("argmax_advance"),
+            argmax_rows: f("argmax_rows"),
+            copy_row: f("copy_row"),
         };
 
         let up = |t: &[f32]| stream.clone_htod(t).unwrap();
@@ -415,6 +547,15 @@ impl Engine {
             h2: stream.alloc_zeros(inter).unwrap(),
             zero_bias: stream.alloc_zeros(v).unwrap(),
             logits: stream.alloc_zeros(v).unwrap(),
+            batch_tok: stream.alloc_zeros(c.n_ctx).unwrap(),
+            batch_x: stream.alloc_zeros(c.n_ctx * e).unwrap(),
+            batch_xb: stream.alloc_zeros(c.n_ctx * e).unwrap(),
+            batch_qkv: stream.alloc_zeros(c.n_ctx * qkvd).unwrap(),
+            batch_attn: stream.alloc_zeros(c.n_ctx * qd).unwrap(),
+            batch_h: stream.alloc_zeros(c.n_ctx * inter).unwrap(),
+            batch_h2: stream.alloc_zeros(c.n_ctx * inter).unwrap(),
+            batch_logits: stream.alloc_zeros(MAX_SPEC_TOKENS * v).unwrap(),
+            batch_argmax: stream.alloc_zeros(MAX_SPEC_TOKENS).unwrap(),
             graph_tok: stream.alloc_zeros(1).unwrap(),
             graph_pos: stream.alloc_zeros(1).unwrap(),
             decode_graph: None,
@@ -903,6 +1044,381 @@ impl Engine {
         self.stream.clone_dtoh(&self.logits).unwrap()
     }
 
+    fn launch_embed_batch(&mut self, tokens: &[u32], pos0: usize) {
+        let c = self.config;
+        let n = tokens.len();
+        let host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        self.stream
+            .memcpy_htod(&host, &mut self.batch_tok.slice_mut(0..n))
+            .unwrap();
+        let (pos_i, n_i, e_i, v_i) = (pos0 as i32, n as i32, c.n_embd as i32, c.n_vocab as i32);
+        match &self.wte_t {
+            Weights::F32(w) => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_batch);
+                lb.arg(&mut self.batch_x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&self.batch_tok)
+                    .arg(&pos_i)
+                    .arg(&n_i)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
+            }
+            Weights::F16(w) => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_half_batch);
+                lb.arg(&mut self.batch_x)
+                    .arg(w)
+                    .arg(&self.wpe)
+                    .arg(&self.batch_tok)
+                    .arg(&pos_i)
+                    .arg(&n_i)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
+            }
+            Weights::Int8 { q, scales } => {
+                let mut lb = self.stream.launch_builder(&self.k.embed_int8_batch);
+                lb.arg(&mut self.batch_x)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(&self.wpe)
+                    .arg(&self.batch_tok)
+                    .arg(&pos_i)
+                    .arg(&n_i)
+                    .arg(&e_i)
+                    .arg(&v_i);
+                unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
+            }
+        }
+    }
+
+    /// Batched causal forward for prompt prefill and speculative verification.
+    /// Returns all row logits when `all_logits` is true; otherwise only the
+    /// final row's logits are returned.
+    fn batch_forward(&mut self, tokens: &[u32], pos0: usize, all_logits: bool) -> Vec<f32> {
+        assert!(!tokens.is_empty());
+        assert!(pos0 + tokens.len() <= self.config.n_ctx, "context overflow");
+        assert!(
+            self.config.head_dim == 64,
+            "prefill kernels assume head_dim=64"
+        );
+        if tokens.len() == 1 && !all_logits {
+            return self.forward(tokens[0], pos0);
+        }
+        if all_logits {
+            assert!(
+                tokens.len() <= MAX_SPEC_TOKENS,
+                "speculative verify supports at most {MAX_SPEC_TOKENS} tokens"
+            );
+        }
+
+        let c = self.config;
+        let n = tokens.len();
+        let e = c.n_embd;
+        let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let eps = c.norm_eps;
+        self.launch_embed_batch(tokens, pos0);
+
+        for l in 0..c.n_layer {
+            let layer = &self.layers[l];
+            norm_batch(
+                &self.stream,
+                &self.k,
+                &mut self.batch_xb,
+                &self.batch_x,
+                &layer.ln1_g,
+                layer.ln1_b.as_ref(),
+                n,
+                e,
+                eps,
+            );
+            gemm(
+                &self.stream,
+                &self.k,
+                &mut self.batch_qkv,
+                &self.batch_xb,
+                &layer.qkv_w,
+                &layer.qkv_b,
+                n,
+                qkvd,
+                e,
+            );
+
+            if c.arch == Arch::Qwen2 {
+                let (pos_i, n_i, nh_i, nkv_i, hd_i, stride_i) = (
+                    pos0 as i32,
+                    n as i32,
+                    nh as i32,
+                    nkv as i32,
+                    hd as i32,
+                    qkvd as i32,
+                );
+                let mut lb = self.stream.launch_builder(&self.k.rope_batch);
+                lb.arg(&mut self.batch_qkv)
+                    .arg(&pos_i)
+                    .arg(&n_i)
+                    .arg(&nh_i)
+                    .arg(&nkv_i)
+                    .arg(&hd_i)
+                    .arg(&stride_i)
+                    .arg(&c.rope_theta);
+                unsafe { lb.launch(cfg1d(n * (nh + nkv) * hd / 2)) }.unwrap();
+            }
+
+            let (pos_i, n_i, nh_i, nkv_i, qd_i, kvd_i, qkvd_i) = (
+                pos0 as i32,
+                n as i32,
+                nh as i32,
+                nkv as i32,
+                qd as i32,
+                kvd as i32,
+                qkvd as i32,
+            );
+            let attn_cfg = LaunchConfig {
+                grid_dim: (nh as u32, n.div_ceil(64) as u32, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            match &mut self.kv {
+                KvCache::F32 { k, v } => {
+                    let mut lb = self.stream.launch_builder(&self.k.copy_kv_batch);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&self.batch_qkv)
+                        .arg(&pos_i)
+                        .arg(&qd_i)
+                        .arg(&kvd_i)
+                        .arg(&qkvd_i);
+                    let copy_cfg = LaunchConfig {
+                        grid_dim: (kvd.div_ceil(256) as u32, n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe { lb.launch(copy_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_prefill);
+                    lb.arg(&mut self.batch_attn)
+                        .arg(&self.batch_qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&pos_i)
+                        .arg(&n_i)
+                        .arg(&nh_i)
+                        .arg(&nkv_i)
+                        .arg(&qkvd_i)
+                        .arg(&qd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+                KvCache::Q8 { k, v, ks, vs } => {
+                    let q_cfg = LaunchConfig {
+                        grid_dim: (nkv as u32, n as u32, 1),
+                        block_dim: (hd as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let hd_i = hd as i32;
+                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv_batch);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&mut ks[l])
+                        .arg(&mut vs[l])
+                        .arg(&self.batch_qkv)
+                        .arg(&pos_i)
+                        .arg(&qd_i)
+                        .arg(&nkv_i)
+                        .arg(&hd_i)
+                        .arg(&qkvd_i);
+                    unsafe { lb.launch(q_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_prefill_q8);
+                    lb.arg(&mut self.batch_attn)
+                        .arg(&self.batch_qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&ks[l])
+                        .arg(&vs[l])
+                        .arg(&pos_i)
+                        .arg(&n_i)
+                        .arg(&nh_i)
+                        .arg(&nkv_i)
+                        .arg(&qkvd_i)
+                        .arg(&qd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+            }
+
+            gemm(
+                &self.stream,
+                &self.k,
+                &mut self.batch_xb,
+                &self.batch_attn,
+                &layer.proj_w,
+                &layer.proj_b,
+                n,
+                e,
+                qd,
+            );
+            add(
+                &self.stream,
+                &self.k.add_inplace,
+                &mut self.batch_x,
+                &self.batch_xb,
+                n * e,
+            );
+
+            norm_batch(
+                &self.stream,
+                &self.k,
+                &mut self.batch_xb,
+                &self.batch_x,
+                &layer.ln2_g,
+                layer.ln2_b.as_ref(),
+                n,
+                e,
+                eps,
+            );
+            gemm(
+                &self.stream,
+                &self.k,
+                &mut self.batch_h,
+                &self.batch_xb,
+                &layer.fc_w,
+                layer.fc_b.as_ref().unwrap_or(&self.zero_bias),
+                n,
+                inter,
+                e,
+            );
+            let total_i = (n * inter) as i32;
+            match &layer.up_w {
+                None => {
+                    let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
+                    lb.arg(&mut self.batch_h).arg(&total_i);
+                    unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
+                }
+                Some(up_w) => {
+                    gemm(
+                        &self.stream,
+                        &self.k,
+                        &mut self.batch_h2,
+                        &self.batch_xb,
+                        up_w,
+                        &self.zero_bias,
+                        n,
+                        inter,
+                        e,
+                    );
+                    let mut lb = self.stream.launch_builder(&self.k.silu_mul);
+                    lb.arg(&mut self.batch_h).arg(&self.batch_h2).arg(&total_i);
+                    unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
+                }
+            }
+            gemm(
+                &self.stream,
+                &self.k,
+                &mut self.batch_xb,
+                &self.batch_h,
+                &layer.fc2_w,
+                layer.fc2_b.as_ref().unwrap_or(&self.zero_bias),
+                n,
+                e,
+                inter,
+            );
+            add(
+                &self.stream,
+                &self.k.add_inplace,
+                &mut self.batch_x,
+                &self.batch_xb,
+                n * e,
+            );
+        }
+
+        norm_batch(
+            &self.stream,
+            &self.k,
+            &mut self.batch_xb,
+            &self.batch_x,
+            &self.lnf_g,
+            self.lnf_b.as_ref(),
+            n,
+            e,
+            eps,
+        );
+
+        if all_logits {
+            gemm(
+                &self.stream,
+                &self.k,
+                &mut self.batch_logits,
+                &self.batch_xb,
+                &self.wte_t,
+                &self.zero_bias,
+                n,
+                c.n_vocab,
+                e,
+            );
+            let v_i = c.n_vocab as i32;
+            let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
+            lb.arg(&mut self.batch_argmax)
+                .arg(&self.batch_logits)
+                .arg(&v_i);
+            let cfg = LaunchConfig {
+                grid_dim: (n as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { lb.launch(cfg) }.unwrap();
+            return self
+                .stream
+                .clone_dtoh(&self.batch_logits.slice(0..n * c.n_vocab))
+                .unwrap();
+        }
+
+        let row_i = (n - 1) as i32;
+        let e_i = e as i32;
+        let mut lb = self.stream.launch_builder(&self.k.copy_row);
+        lb.arg(&mut self.xb)
+            .arg(&self.batch_xb)
+            .arg(&row_i)
+            .arg(&e_i);
+        unsafe { lb.launch(cfg1d(e)) }.unwrap();
+        gemv(
+            &self.stream,
+            &self.k,
+            &mut self.logits,
+            &self.xb,
+            &self.wte_t,
+            &self.zero_bias,
+            e,
+            c.n_vocab,
+        );
+        self.stream.clone_dtoh(&self.logits).unwrap()
+    }
+
+    pub fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        self.batch_forward(tokens, pos0, false)
+    }
+
+    pub fn verify_tokens(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        self.batch_forward(tokens, pos0, true)
+    }
+
+    pub fn verify_tokens_with_argmax(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+    ) -> (Vec<f32>, Vec<u32>) {
+        let logits = self.verify_tokens(tokens, pos0);
+        let argmax = self
+            .stream
+            .clone_dtoh(&self.batch_argmax.slice(0..tokens.len()))
+            .unwrap()
+            .into_iter()
+            .map(|x| x as u32)
+            .collect();
+        (logits, argmax)
+    }
+
     fn capture_decode_graph(&mut self) {
         if self.decode_graph.is_some() {
             return;
@@ -966,10 +1482,7 @@ impl Engine {
         mut on_token: impl FnMut(u32),
     ) -> Vec<u32> {
         assert!(!prompt.is_empty());
-        let mut logits = Vec::new();
-        for (pos, &tok) in prompt.iter().enumerate() {
-            logits = self.forward(tok, pos);
-        }
+        let mut logits = self.prefill(prompt, 0);
         let mut out = Vec::with_capacity(n_new);
         let mut pos = prompt.len();
         for _ in 0..n_new {
@@ -978,6 +1491,58 @@ impl Engine {
             on_token(next);
             logits = self.forward(next, pos);
             pos += 1;
+        }
+        out
+    }
+
+    /// Lossless prompt-lookup speculative decoding. Candidate tokens are copied
+    /// from earlier n-gram matches in the prompt/generated history and accepted
+    /// only when the full model's greedy verification agrees.
+    pub fn generate_speculative(
+        &mut self,
+        prompt: &[u32],
+        n_new: usize,
+        spec_k: usize,
+        mut on_token: impl FnMut(u32),
+    ) -> Vec<u32> {
+        assert!(!prompt.is_empty());
+        assert!(spec_k > 0);
+        assert!(
+            prompt.len() + n_new <= self.config.n_ctx,
+            "context overflow"
+        );
+        let mut history = prompt.to_vec();
+        let mut out = Vec::with_capacity(n_new);
+        let mut logits = self.prefill(prompt, 0);
+        let mut pos = prompt.len();
+        while out.len() < n_new {
+            let greedy = argmax(&logits);
+            let room = (n_new - out.len())
+                .min(self.config.n_ctx - pos)
+                .min(MAX_SPEC_TOKENS);
+            let mut draft = prompt_lookup(&history, spec_k.min(room));
+            if draft.first().copied() != Some(greedy) {
+                out.push(greedy);
+                history.push(greedy);
+                on_token(greedy);
+                logits = self.forward(greedy, pos);
+                pos += 1;
+                continue;
+            }
+            draft.truncate(room);
+            let (rows, row_argmax) = self.verify_tokens_with_argmax(&draft, pos);
+            let mut accepted = 1usize;
+            while accepted < draft.len() && row_argmax[accepted - 1] == draft[accepted] {
+                accepted += 1;
+            }
+            for &tok in &draft[..accepted] {
+                out.push(tok);
+                history.push(tok);
+                on_token(tok);
+            }
+            pos += accepted;
+            let v = self.config.n_vocab;
+            logits = rows[(accepted - 1) * v..accepted * v].to_vec();
         }
         out
     }
@@ -990,4 +1555,25 @@ pub fn argmax(logits: &[f32]) -> u32 {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .unwrap()
         .0 as u32
+}
+
+fn prompt_lookup(history: &[u32], max_tokens: usize) -> Vec<u32> {
+    if max_tokens == 0 || history.len() < 3 {
+        return Vec::new();
+    }
+    let max_ngram = 8.min(history.len() / 2);
+    for ngram in (2..=max_ngram).rev() {
+        let cur = history.len() - ngram;
+        let suffix = &history[cur..];
+        for i in (0..cur).rev() {
+            if &history[i..i + ngram] == suffix {
+                let start = i + ngram;
+                let end = (start + max_tokens).min(history.len());
+                if start < end {
+                    return history[start..end].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
 }

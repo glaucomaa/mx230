@@ -2,9 +2,10 @@
 //!
 //! Every subcommand takes `--model gpt2|qwen` (default gpt2):
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
-//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8] [--kv8]
+//!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8] [--kv8] [--spec]
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
+//!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
 //!   cargo run -rp llm-engine -- ppl --data path [-n tokens]
 
 mod cpu;
@@ -92,6 +93,15 @@ fn opt_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+fn opt_usize(args: &[String], name: &str, default: usize) -> usize {
+    opt_value(args, name)
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("{name} expects a number"))
+        })
+        .unwrap_or(default)
+}
+
 fn logprob(logits: &[f32], target: u32) -> f64 {
     let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let sum_exp: f64 = logits.iter().map(|&x| ((x as f64) - m).exp()).sum();
@@ -150,6 +160,8 @@ fn main() {
             let n_new = opt_n(&args, 64);
             let mode = gpu::WeightMode::parse(&args);
             let kv8 = flag(&args, "--kv8");
+            let spec = flag(&args, "--spec");
+            let spec_k = opt_usize(&args, "--spec-k", 8);
             let choice = model_choice(&args);
 
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
@@ -161,13 +173,20 @@ fn main() {
             print!("{prompt}");
             use std::io::Write;
             let t0 = Instant::now();
-            engine.generate(&ids, n_new, |id| {
-                print!("{}", tok.decode(&[id]));
-                std::io::stdout().flush().unwrap();
-            });
+            if spec {
+                engine.generate_speculative(&ids, n_new, spec_k, |id| {
+                    print!("{}", tok.decode(&[id]));
+                    std::io::stdout().flush().unwrap();
+                });
+            } else {
+                engine.generate(&ids, n_new, |id| {
+                    print!("{}", tok.decode(&[id]));
+                    std::io::stdout().flush().unwrap();
+                });
+            }
             let dt = t0.elapsed().as_secs_f64();
             println!(
-                "\n\n[{} prompt + {} new tokens in {:.2}s = {:.1} tok/s, {}]",
+                "\n\n[{} prompt + {} new tokens in {:.2}s = {:.1} tok/s, {}, {}]",
                 ids.len(),
                 n_new,
                 dt,
@@ -176,7 +195,8 @@ fn main() {
                     format!("{mode} + kv8")
                 } else {
                     mode.to_string()
-                }
+                },
+                if spec { "prompt-lookup spec" } else { "greedy" }
             );
         }
         Some("verify") => {
@@ -201,19 +221,40 @@ fn main() {
                 for (pos, &t) in ids.iter().enumerate() {
                     got = engine.forward(t, pos);
                 }
+                let batch = engine.prefill(&ids, 0);
                 let err = common::allclose_err(&got, &want, 1e-2, 5e-2);
+                let batch_err = common::allclose_err(&batch, &got, 1e-2, 5e-2);
                 let (cw, gw) = (gpu::argmax(&want), gpu::argmax(&got));
+                let bw = gpu::argmax(&batch);
                 let kv = if kv8 { "/kv8" } else { "" };
                 println!(
-                    "GPU {mode}{kv}: allclose_err = {err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?})",
+                    "GPU {mode}{kv}: allclose_err = {err:.2e}, batch_err = {batch_err:.2e}, argmax cpu={cw} ({:?}) gpu={gw} ({:?}) batch={bw} ({:?})",
                     tok.decode(&[cw]),
                     tok.decode(&[gw]),
+                    tok.decode(&[bw]),
                 );
                 if mode == gpu::WeightMode::Fp32 && !kv8 {
                     assert!(err < 1.0, "fp32 logits mismatch: {err}");
+                    assert!(batch_err < 1.0, "fp32 batch prefill mismatch: {batch_err}");
                 }
                 assert_eq!(cw, gw, "{mode}{kv} argmax mismatch");
+                assert_eq!(gw, bw, "{mode}{kv} batch prefill argmax mismatch");
                 println!("  OK");
+            }
+
+            for kv8 in [false, true] {
+                let mode = modes_for(choice.arch)[0];
+                let n_steps = 24;
+                let mut greedy_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let greedy = greedy_engine.generate(&ids, n_steps, |_| {});
+                drop(greedy_engine);
+                let mut spec_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let spec = spec_engine.generate_speculative(&ids, n_steps, 8, |_| {});
+                assert_eq!(
+                    spec, greedy,
+                    "prompt-lookup speculative decode diverged from greedy (kv8={kv8})"
+                );
+                println!("prompt-lookup speculative kv8={kv8}: {n_steps} tokens match greedy  OK");
             }
 
             // graph decode must produce the same greedy continuation as the
@@ -259,23 +300,24 @@ fn main() {
             let n_new = opt_n(&args, 64);
             let graphs = flag(&args, "--graphs");
             let kv8 = flag(&args, "--kv8");
+            let spec = flag(&args, "--spec");
+            let spec_k = opt_usize(&args, "--spec-k", 8);
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
-            println!("| mode | weights | kv | graph | tokens/sec |");
-            println!("|------|---------|----|-------|------------|");
+            println!("| mode | weights | kv | graph | spec | tokens/sec |");
+            println!("|------|---------|----|-------|------|------------|");
             for &mode in modes_for(choice.arch) {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 // warmup + prefill
-                let mut logits = Vec::new();
-                for (pos, &t) in ids.iter().enumerate() {
-                    logits = engine.forward(t, pos);
-                }
+                let mut logits = engine.prefill(&ids, 0);
                 if graphs {
                     engine.prepare_decode_graph();
                 }
                 let t0 = Instant::now();
-                if graphs {
+                if spec {
+                    engine.generate_speculative(&ids, n_new, spec_k, |_| {});
+                } else if graphs {
                     let first = gpu::argmax(&logits);
                     engine.graph_decode(first, ids.len(), n_new);
                 } else {
@@ -288,11 +330,53 @@ fn main() {
                 }
                 let dt = t0.elapsed().as_secs_f64();
                 println!(
-                    "| {mode} | ~{:.0} MB | {} | {} | {:.1} |",
+                    "| {mode} | ~{:.0} MB | {} | {} | {} | {:.1} |",
                     gpu::weight_mb(&model.config, mode),
                     if kv8 { "int8" } else { "fp32" },
                     if graphs { "yes" } else { "no" },
+                    if spec { "yes" } else { "no" },
                     n_new as f64 / dt
+                );
+            }
+        }
+        Some("prefill-bench") => {
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let max_prompt = opt_n(&args, 512).min(model.config.n_ctx);
+            let kv8 = flag(&args, "--kv8");
+            let seed = "The history of computing began with machines for arithmetic. ";
+            let mut text = String::new();
+            let mut ids = Vec::new();
+            while ids.len() < max_prompt {
+                text.push_str(seed);
+                ids = tok.encode(&text);
+            }
+            ids.truncate(max_prompt);
+            let ctx = CudaContext::new(0).unwrap();
+
+            println!("prompt tokens: {}", ids.len());
+            println!("| mode | kv | token-loop TTFT | batch TTFT | speedup |");
+            println!("|------|----|-----------------|------------|---------|");
+            for &mode in modes_for(choice.arch) {
+                let mut loop_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let t0 = Instant::now();
+                for (pos, &t) in ids.iter().enumerate() {
+                    loop_engine.forward(t, pos);
+                }
+                let loop_dt = t0.elapsed().as_secs_f64();
+                drop(loop_engine);
+
+                let mut batch_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let t0 = Instant::now();
+                batch_engine.prefill(&ids, 0);
+                let batch_dt = t0.elapsed().as_secs_f64();
+                println!(
+                    "| {mode} | {} | {:.3}s | {:.3}s | {:.2}x |",
+                    if kv8 { "int8" } else { "fp32" },
+                    loop_dt,
+                    batch_dt,
+                    loop_dt / batch_dt
                 );
             }
         }
@@ -333,7 +417,9 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: llm-engine <export|ppl-data|generate|verify|bench|ppl> [args]");
+            eprintln!(
+                "usage: llm-engine <export|ppl-data|generate|verify|bench|prefill-bench|ppl> [args]"
+            );
             std::process::exit(1);
         }
     }

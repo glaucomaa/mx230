@@ -216,6 +216,70 @@ extern "C" __global__ void rmsnorm(float *out, const float *x, const float *g,
     }
 }
 
+extern "C" __global__ void layernorm_batch(float *out, const float *x, const float *g,
+                                           const float *b, int rows, int n) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    const float *xr = x + (size_t)row * n;
+    float *orow = out + (size_t)row * n;
+
+    float s = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) s += xr[i];
+    red[tid] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        __syncthreads();
+    }
+    float mean = red[0] / n;
+    __syncthreads();
+
+    s = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float d = xr[i] - mean;
+        s += d * d;
+    }
+    red[tid] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / n + LN_EPS);
+    __syncthreads();
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        orow[i] = (xr[i] - mean) * inv * g[i] + b[i];
+    }
+}
+
+extern "C" __global__ void rmsnorm_batch(float *out, const float *x, const float *g,
+                                         int rows, int n, float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    const float *xr = x + (size_t)row * n;
+    float *orow = out + (size_t)row * n;
+
+    float s = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) s += xr[i] * xr[i];
+    red[tid] = s;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) red[tid] += red[tid + k];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / n + eps);
+    __syncthreads();
+
+    for (int i = tid; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * inv * g[i];
+    }
+}
+
 // Rotary position embedding over the Q and K sections of the qkv buffer
 // (HF rotate_half convention: pairs are (d, d + head_dim/2)). K heads follow
 // Q heads directly in memory, so one flat index covers both.
@@ -243,6 +307,27 @@ extern "C" __global__ void rope(float *qkv, int pos, int n_head, int n_kv_head,
 extern "C" __global__ void rope_dyn(float *qkv, const int *pos_ptr, int n_head,
                                     int n_kv_head, int head_dim, float theta) {
     rope_impl(qkv, *pos_ptr, n_head, n_kv_head, head_dim, theta);
+}
+
+extern "C" __global__ void rope_batch(float *qkv, int pos0, int n_tok, int n_head,
+                                      int n_kv_head, int head_dim, int stride,
+                                      float theta) {
+    int half = head_dim / 2;
+    int per_row = (n_head + n_kv_head) * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_tok * per_row;
+    if (idx >= total) return;
+    int t = idx / per_row;
+    int i = idx - t * per_row;
+    int h = i / half;
+    int d = i % half;
+    float *base = qkv + (size_t)t * stride + h * head_dim;
+    float freq = __powf(theta, -2.0f * d / head_dim);
+    float c, s;
+    __sincosf((pos0 + t) * freq, &s, &c);
+    float x1 = base[d], x2 = base[d + half];
+    base[d] = x1 * c - x2 * s;
+    base[d + half] = x1 * s + x2 * c;
 }
 
 // SwiGLU combine: x = silu(x) * y.
@@ -303,6 +388,46 @@ extern "C" __global__ void quantize_kv_dyn(signed char *kq, signed char *vq,
                                            const int *pos_ptr, int q_dim, int n_kv_head,
                                            int head_dim) {
     quantize_kv_impl(kq, vq, ks, vs, qkv, *pos_ptr, q_dim, n_kv_head, head_dim);
+}
+
+extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
+                                             float *ks, float *vs, const float *qkv,
+                                             int pos0, int q_dim, int n_kv_head,
+                                             int head_dim, int stride) {
+    __shared__ float red[128];
+    int t = blockIdx.y;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    int kv_dim = n_kv_head * head_dim;
+    const float *row = qkv + (size_t)t * stride;
+    const float *k = row + q_dim + h * head_dim;
+    const float *v = row + q_dim + kv_dim + h * head_dim;
+    int pos = pos0 + t;
+
+    red[d] = fabsf(k[d]);
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
+        __syncthreads();
+    }
+    float kscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+    __syncthreads();
+
+    red[d] = fabsf(v[d]);
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
+        __syncthreads();
+    }
+    float vscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+
+    size_t out = (size_t)pos * kv_dim + h * head_dim;
+    kq[out + d] = (signed char)lrintf(k[d] / kscale);
+    vq[out + d] = (signed char)lrintf(v[d] / vscale);
+    if (d == 0) {
+        ks[pos * n_kv_head + h] = kscale;
+        vs[pos * n_kv_head + h] = vscale;
+    }
 }
 
 // Causal attention for one new token over the KV cache (one block per query
@@ -451,6 +576,246 @@ extern "C" __global__ void attn_decode_q8_dyn(float *out, const float *qkv,
                                               const int *pos_ptr, int n_head, int n_kv_head,
                                               int head_dim) {
     attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, *pos_ptr, n_head, n_kv_head, head_dim);
+}
+
+// ---- batched prefill / speculative-verify path ----------------------------
+// Decode is one token at a time (GEMV, memory-bound); prefill and draft
+// verification process T tokens at once, so the matmuls become GEMMs that
+// read each weight once for all T rows — the stage-1 playbook (smem tiles,
+// register micro-tiles) applied inside the engine.
+
+__device__ __forceinline__ float tof(float x) { return x; }
+__device__ __forceinline__ float tof(__half x) { return __half2float(x); }
+__device__ __forceinline__ float tof(signed char x) { return (float)x; }
+
+// C[M,N] = A[M,K] @ B[K,N] (+ scales per column for int8) + bias.
+// 64x64 tiles, BK=16, 16x16 threads each computing a 4x4 micro-tile,
+// bounds-checked so any M (token count) and N work.
+template <typename BT, bool SCALED>
+__device__ void gemm_body(float *C, const float *A, const BT *B, const float *scales,
+                          const float *bias, int M, int N, int K) {
+    __shared__ float As[16][64];
+    __shared__ float Bs[16][64];
+    int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    int tid = threadIdx.y * 16 + threadIdx.x;
+    float acc[4][4] = {};
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int i = tid; i < 64 * 16; i += 256) {
+            int m = i / 16, k = i % 16;
+            As[k][m] = (bm + m < M && k0 + k < K) ? A[(size_t)(bm + m) * K + k0 + k] : 0.0f;
+        }
+        for (int i = tid; i < 16 * 64; i += 256) {
+            int k = i / 64, n = i % 64;
+            Bs[k][n] = (k0 + k < K && bn + n < N) ? tof(B[(size_t)(k0 + k) * N + bn + n]) : 0.0f;
+        }
+        __syncthreads();
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+            for (int i = 0; i < 4; ++i) a[i] = As[k][threadIdx.y * 4 + i];
+            for (int j = 0; j < 4; ++j) b[j] = Bs[k][threadIdx.x * 4 + j];
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        int row = bm + threadIdx.y * 4 + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            int col = bn + threadIdx.x * 4 + j;
+            if (col >= N) continue;
+            float v = acc[i][j];
+            if (SCALED) v *= scales[col];
+            C[(size_t)row * N + col] = v + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_f32(float *C, const float *A, const float *B,
+                                    const float *bias, int M, int N, int K) {
+    gemm_body<float, false>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_half(float *C, const float *A, const __half *B,
+                                     const float *bias, int M, int N, int K) {
+    gemm_body<__half, false>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_int8(float *C, const float *A, const signed char *B,
+                                     const float *scales, const float *bias,
+                                     int M, int N, int K) {
+    gemm_body<signed char, true>(C, A, B, scales, bias, M, N, K);
+}
+
+extern "C" __global__ void embed_batch(float *out, const float *wte_t, const float *wpe,
+                                       const int *toks, int pos0, int n_tok,
+                                       int n_embd, int n_vocab) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_tok * n_embd) {
+        int t = idx / n_embd, i = idx % n_embd;
+        out[idx] = wte_t[(size_t)i * n_vocab + toks[t]] + wpe[(pos0 + t) * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_half_batch(float *out, const __half *wte_t,
+                                            const float *wpe, const int *toks, int pos0,
+                                            int n_tok, int n_embd, int n_vocab) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_tok * n_embd) {
+        int t = idx / n_embd, i = idx % n_embd;
+        out[idx] = __half2float(wte_t[(size_t)i * n_vocab + toks[t]]) +
+                   wpe[(pos0 + t) * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int8_batch(float *out, const signed char *wte_t,
+                                            const float *scales, const float *wpe,
+                                            const int *toks, int pos0, int n_tok,
+                                            int n_embd, int n_vocab) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_tok * n_embd) {
+        int t = idx / n_embd, i = idx % n_embd;
+        int tok = toks[t];
+        out[idx] = (float)wte_t[(size_t)i * n_vocab + tok] * scales[tok] +
+                   wpe[(pos0 + t) * n_embd + i];
+    }
+}
+
+extern "C" __global__ void copy_kv_batch(float *kcache, float *vcache, const float *qkv,
+                                         int pos0, int q_dim, int kv_dim, int stride) {
+    int t = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kv_dim) {
+        kcache[(size_t)(pos0 + t) * kv_dim + i] = qkv[(size_t)t * stride + q_dim + i];
+        vcache[(size_t)(pos0 + t) * kv_dim + i] = qkv[(size_t)t * stride + q_dim + kv_dim + i];
+    }
+}
+
+// Flash-style batched causal attention over the KV cache (the stage-2
+// algorithm adapted to GQA and cache layout): one block of 64 threads per
+// (64-query tile, head); K/V tiles staged through shared memory, online
+// softmax with running max/sum, no materialized score matrix. The query at
+// row qi sits at absolute position pos0 + qi and attends to keys 0..pos0+qi.
+// head_dim is fixed at 64 (q and acc live in registers).
+template <bool Q8>
+__device__ void attn_prefill_body(float *out, const float *qkv,
+                                  const float *kcache, const float *vcache,
+                                  const signed char *kq, const signed char *vq,
+                                  const float *ks, const float *vs,
+                                  int pos0, int n_tok, int n_head, int n_kv_head,
+                                  int qkv_stride, int out_stride) {
+    __shared__ float Kt[64][64];
+    __shared__ float Vt[64][64];
+    int h = blockIdx.x;
+    int tile0 = blockIdx.y * 64;
+    int tid = threadIdx.x;
+    int kvd = n_kv_head * 64;
+    int kvh = h / (n_head / n_kv_head);
+    int qi = tile0 + tid;
+    bool active = qi < n_tok;
+    int pq = pos0 + (active ? qi : 0);
+
+    float q[64], acc[64] = {};
+    float m = -CUDART_INF_F, l = 0.0f;
+    if (active) {
+        for (int d = 0; d < 64; ++d) q[d] = qkv[(size_t)qi * qkv_stride + h * 64 + d];
+    }
+    float scale = rsqrtf(64.0f);
+
+    int max_key = pos0 + min(tile0 + 63, n_tok - 1);
+    for (int kt = 0; kt <= max_key; kt += 64) {
+        int tile_n = min(64, max_key - kt + 1);
+        for (int x = tid; x < tile_n * 64; x += 64) {
+            int r = x / 64, d = x % 64;
+            if (Q8) {
+                Kt[r][d] = (float)kq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
+                           ks[(kt + r) * n_kv_head + kvh];
+                Vt[r][d] = (float)vq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
+                           vs[(kt + r) * n_kv_head + kvh];
+            } else {
+                Kt[r][d] = kcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
+                Vt[r][d] = vcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
+            }
+        }
+        __syncthreads();
+        if (active) {
+            for (int j = 0; j < tile_n; ++j) {
+                int kp = kt + j;
+                if (kp > pq) break;
+                float dot = 0.0f;
+                for (int d = 0; d < 64; ++d) dot += q[d] * Kt[j][d];
+                float s = dot * scale;
+                float mn = fmaxf(m, s);
+                float corr = __expf(m - mn);
+                float p = __expf(s - mn);
+                l = l * corr + p;
+                for (int d = 0; d < 64; ++d) acc[d] = acc[d] * corr + p * Vt[j][d];
+                m = mn;
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        float inv = 1.0f / l;
+        for (int d = 0; d < 64; ++d) {
+            out[(size_t)qi * out_stride + h * 64 + d] = acc[d] * inv;
+        }
+    }
+}
+
+extern "C" __global__ void attn_prefill(float *out, const float *qkv,
+                                        const float *kcache, const float *vcache,
+                                        int pos0, int n_tok, int n_head, int n_kv_head,
+                                        int qkv_stride, int out_stride) {
+    attn_prefill_body<false>(out, qkv, kcache, vcache, nullptr, nullptr, nullptr, nullptr,
+                             pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
+}
+
+extern "C" __global__ void attn_prefill_q8(float *out, const float *qkv,
+                                           const signed char *kq, const signed char *vq,
+                                           const float *ks, const float *vs,
+                                           int pos0, int n_tok, int n_head, int n_kv_head,
+                                           int qkv_stride, int out_stride) {
+    attn_prefill_body<true>(out, qkv, nullptr, nullptr, kq, vq, ks, vs,
+                            pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
+}
+
+// Per-row greedy argmax for the speculative verify step (one block per row).
+extern "C" __global__ void argmax_rows(int *out, const float *logits, int n_vocab) {
+    __shared__ float vals[256];
+    __shared__ int idxs[256];
+    const float *row = logits + (size_t)blockIdx.x * n_vocab;
+    int tid = threadIdx.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < n_vocab; i += blockDim.x) {
+        float v = row[i];
+        if (v > best || (v == best && i < best_i)) {
+            best = v;
+            best_i = i;
+        }
+    }
+    vals[tid] = best;
+    idxs[tid] = best_i;
+    __syncthreads();
+    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (tid < k) {
+            float other = vals[tid + k];
+            int other_i = idxs[tid + k];
+            if (other > vals[tid] || (other == vals[tid] && other_i < idxs[tid])) {
+                vals[tid] = other;
+                idxs[tid] = other_i;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[blockIdx.x] = idxs[0];
+}
+
+extern "C" __global__ void copy_row(float *dst, const float *src, int row, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < cols) dst[i] = src[(size_t)row * cols + i];
 }
 
 extern "C" __global__ void add_inplace(float *x, const float *y, int n) {
