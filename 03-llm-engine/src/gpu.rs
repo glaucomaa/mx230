@@ -1,6 +1,7 @@
-//! CUDA inference engine: one token at a time through GEMV kernels with a
-//! per-layer KV cache. Decode supports fp32, fp16-storage/fp32-math, and int8
-//! per-output-channel weight storage.
+//! CUDA inference engine: decode runs one token at a time through GEMV
+//! kernels with a per-layer KV cache; prompt prefill and speculative draft
+//! verification batch tokens through GEMM + flash-style attention. Weights
+//! are stored fp32, fp16 (fp32 math), or int8 per-output-channel.
 
 use std::fmt;
 use std::sync::Arc;
@@ -158,6 +159,12 @@ struct Kernels {
     gemm_f32: CudaFunction,
     gemm_half: CudaFunction,
     gemm_int8: CudaFunction,
+    gemm_f32_skinny: CudaFunction,
+    gemm_half_skinny: CudaFunction,
+    gemm_int8_skinny: CudaFunction,
+    gemm_rows_f32: CudaFunction,
+    gemm_rows_half: CudaFunction,
+    gemm_rows_int8: CudaFunction,
     copy_kv_dyn: CudaFunction,
     copy_kv_batch: CudaFunction,
     quantize_kv: CudaFunction,
@@ -186,9 +193,9 @@ fn cfg1d(n: usize) -> LaunchConfig {
     }
 }
 
-fn cfg_gemm(m: usize, n: usize) -> LaunchConfig {
+fn cfg_gemm(m: usize, n: usize, bm: usize) -> LaunchConfig {
     LaunchConfig {
-        grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
+        grid_dim: (n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1),
         block_dim: (16, 16, 1),
         shared_mem_bytes: 0,
     }
@@ -274,11 +281,37 @@ fn gemm(
     n: usize,
     kk: usize,
 ) {
+    debug_assert!(kk.is_multiple_of(16), "gemm kernels assume K % 16 == 0");
     let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
-    let cfg = cfg_gemm(m, n);
+    // Three tiers by M. Tiled GEMMs burn whole-tile FMAs regardless of M, so
+    // draft-verify batches (M <= 8) go through gemm_rows — a multi-row GEMV
+    // with zero wasted compute; 16-row tiles cover the mid range, 64-row
+    // tiles the real prefill.
+    let tier = if m <= 8 {
+        0
+    } else if m <= 16 {
+        1
+    } else {
+        2
+    };
+    let cfg = if tier == 0 {
+        let cols = if n.is_multiple_of(4) && n >= 4096 {
+            n / 4
+        } else {
+            n
+        };
+        cfg1d(cols)
+    } else {
+        cfg_gemm(m, n, if tier == 1 { 16 } else { 64 })
+    };
     match b {
         Weights::F32(w) => {
-            let mut lb = stream.launch_builder(&k.gemm_f32);
+            let f = match tier {
+                0 => &k.gemm_rows_f32,
+                1 => &k.gemm_f32_skinny,
+                _ => &k.gemm_f32,
+            };
+            let mut lb = stream.launch_builder(f);
             lb.arg(c)
                 .arg(a)
                 .arg(w)
@@ -289,7 +322,12 @@ fn gemm(
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::F16(w) => {
-            let mut lb = stream.launch_builder(&k.gemm_half);
+            let f = match tier {
+                0 => &k.gemm_rows_half,
+                1 => &k.gemm_half_skinny,
+                _ => &k.gemm_half,
+            };
+            let mut lb = stream.launch_builder(f);
             lb.arg(c)
                 .arg(a)
                 .arg(w)
@@ -300,7 +338,12 @@ fn gemm(
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int8 { q, scales } => {
-            let mut lb = stream.launch_builder(&k.gemm_int8);
+            let f = match tier {
+                0 => &k.gemm_rows_int8,
+                1 => &k.gemm_int8_skinny,
+                _ => &k.gemm_int8,
+            };
+            let mut lb = stream.launch_builder(f);
             lb.arg(c)
                 .arg(a)
                 .arg(q)
@@ -425,6 +468,12 @@ impl Engine {
             gemm_f32: f("gemm_f32"),
             gemm_half: f("gemm_half"),
             gemm_int8: f("gemm_int8"),
+            gemm_f32_skinny: f("gemm_f32_skinny"),
+            gemm_half_skinny: f("gemm_half_skinny"),
+            gemm_int8_skinny: f("gemm_int8_skinny"),
+            gemm_rows_f32: f("gemm_rows_f32"),
+            gemm_rows_half: f("gemm_rows_half"),
+            gemm_rows_int8: f("gemm_rows_int8"),
             copy_kv_dyn: f("copy_kv_dyn"),
             copy_kv_batch: f("copy_kv_batch"),
             quantize_kv: f("quantize_kv"),
@@ -1093,25 +1142,16 @@ impl Engine {
         }
     }
 
-    /// Batched causal forward for prompt prefill and speculative verification.
-    /// Returns all row logits when `all_logits` is true; otherwise only the
-    /// final row's logits are returned.
-    fn batch_forward(&mut self, tokens: &[u32], pos0: usize, all_logits: bool) -> Vec<f32> {
+    /// Batched causal trunk shared by prefill and speculative verification:
+    /// embed -> layers -> final norm. Leaves the normalized hidden states for
+    /// all rows in `batch_xb`.
+    fn batch_body(&mut self, tokens: &[u32], pos0: usize) {
         assert!(!tokens.is_empty());
         assert!(pos0 + tokens.len() <= self.config.n_ctx, "context overflow");
         assert!(
             self.config.head_dim == 64,
             "prefill kernels assume head_dim=64"
         );
-        if tokens.len() == 1 && !all_logits {
-            return self.forward(tokens[0], pos0);
-        }
-        if all_logits {
-            assert!(
-                tokens.len() <= MAX_SPEC_TOKENS,
-                "speculative verify supports at most {MAX_SPEC_TOKENS} tokens"
-            );
-        }
 
         let c = self.config;
         let n = tokens.len();
@@ -1344,35 +1384,16 @@ impl Engine {
             e,
             eps,
         );
+    }
 
-        if all_logits {
-            gemm(
-                &self.stream,
-                &self.k,
-                &mut self.batch_logits,
-                &self.batch_xb,
-                &self.wte_t,
-                &self.zero_bias,
-                n,
-                c.n_vocab,
-                e,
-            );
-            let v_i = c.n_vocab as i32;
-            let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
-            lb.arg(&mut self.batch_argmax)
-                .arg(&self.batch_logits)
-                .arg(&v_i);
-            let cfg = LaunchConfig {
-                grid_dim: (n as u32, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { lb.launch(cfg) }.unwrap();
-            return self
-                .stream
-                .clone_dtoh(&self.batch_logits.slice(0..n * c.n_vocab))
-                .unwrap();
+    /// Batched prompt prefill; returns the final row's logits on the host.
+    pub fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        if tokens.len() == 1 {
+            return self.forward(tokens[0], pos0);
         }
+        self.batch_body(tokens, pos0);
+        let c = self.config;
+        let (n, e) = (tokens.len(), c.n_embd);
 
         let row_i = (n - 1) as i32;
         let e_i = e as i32;
@@ -1395,28 +1416,46 @@ impl Engine {
         self.stream.clone_dtoh(&self.logits).unwrap()
     }
 
-    pub fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
-        self.batch_forward(tokens, pos0, false)
-    }
+    /// Speculative verification: per-row greedy argmax over the lm_head
+    /// logits, computed on device. Only the n token ids cross the bus; the
+    /// n x n_vocab logits never leave the GPU.
+    pub fn verify_argmax(&mut self, tokens: &[u32], pos0: usize) -> Vec<u32> {
+        assert!(
+            tokens.len() <= MAX_SPEC_TOKENS,
+            "speculative verify supports at most {MAX_SPEC_TOKENS} tokens"
+        );
+        self.batch_body(tokens, pos0);
+        let c = self.config;
+        let n = tokens.len();
 
-    pub fn verify_tokens(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
-        self.batch_forward(tokens, pos0, true)
-    }
-
-    pub fn verify_tokens_with_argmax(
-        &mut self,
-        tokens: &[u32],
-        pos0: usize,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let logits = self.verify_tokens(tokens, pos0);
-        let argmax = self
-            .stream
-            .clone_dtoh(&self.batch_argmax.slice(0..tokens.len()))
+        gemm(
+            &self.stream,
+            &self.k,
+            &mut self.batch_logits,
+            &self.batch_xb,
+            &self.wte_t,
+            &self.zero_bias,
+            n,
+            c.n_vocab,
+            c.n_embd,
+        );
+        let v_i = c.n_vocab as i32;
+        let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
+        lb.arg(&mut self.batch_argmax)
+            .arg(&self.batch_logits)
+            .arg(&v_i);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.unwrap();
+        self.stream
+            .clone_dtoh(&self.batch_argmax.slice(0..n))
             .unwrap()
             .into_iter()
             .map(|x| x as u32)
-            .collect();
-        (logits, argmax)
+            .collect()
     }
 
     fn capture_decode_graph(&mut self) {
@@ -1503,9 +1542,25 @@ impl Engine {
         prompt: &[u32],
         n_new: usize,
         spec_k: usize,
-        mut on_token: impl FnMut(u32),
+        on_token: impl FnMut(u32),
     ) -> Vec<u32> {
         assert!(!prompt.is_empty());
+        let logits = self.prefill(prompt, 0);
+        self.speculative_loop(prompt, argmax(&logits), n_new, spec_k, on_token)
+    }
+
+    /// Decode part of speculative generation, for callers that have already
+    /// prefilled `prompt` into the KV cache: `first` is the greedy token the
+    /// prefill predicted. Logits stay on the GPU throughout — the host only
+    /// ever sees argmax token ids (one per verified row).
+    pub fn speculative_loop(
+        &mut self,
+        prompt: &[u32],
+        first: u32,
+        n_new: usize,
+        spec_k: usize,
+        mut on_token: impl FnMut(u32),
+    ) -> Vec<u32> {
         assert!(spec_k > 0);
         assert!(
             prompt.len() + n_new <= self.config.n_ctx,
@@ -1513,24 +1568,21 @@ impl Engine {
         );
         let mut history = prompt.to_vec();
         let mut out = Vec::with_capacity(n_new);
-        let mut logits = self.prefill(prompt, 0);
         let mut pos = prompt.len();
+        let mut greedy = first;
         while out.len() < n_new {
-            let greedy = argmax(&logits);
-            let room = (n_new - out.len())
-                .min(self.config.n_ctx - pos)
-                .min(MAX_SPEC_TOKENS);
-            let mut draft = prompt_lookup(&history, spec_k.min(room));
+            let room = (n_new - out.len()).min(MAX_SPEC_TOKENS);
+            let draft = prompt_lookup(&history, spec_k.min(room));
             if draft.first().copied() != Some(greedy) {
                 out.push(greedy);
                 history.push(greedy);
                 on_token(greedy);
-                logits = self.forward(greedy, pos);
+                let logits = self.forward(greedy, pos);
                 pos += 1;
+                greedy = argmax(&logits);
                 continue;
             }
-            draft.truncate(room);
-            let (rows, row_argmax) = self.verify_tokens_with_argmax(&draft, pos);
+            let row_argmax = self.verify_argmax(&draft, pos);
             let mut accepted = 1usize;
             while accepted < draft.len() && row_argmax[accepted - 1] == draft[accepted] {
                 accepted += 1;
@@ -1541,20 +1593,26 @@ impl Engine {
                 on_token(tok);
             }
             pos += accepted;
-            let v = self.config.n_vocab;
-            logits = rows[(accepted - 1) * v..accepted * v].to_vec();
+            // row `accepted-1` predicts the token after the last accepted one:
+            // the rejection's correction (or the bonus token when all passed)
+            greedy = row_argmax[accepted - 1];
         }
         out
     }
 }
 
+/// First-index argmax — ties break the same way as the device argmax kernels
+/// (`argmax_rows`, `argmax_advance`), so host and GPU greedy paths agree.
 pub fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .unwrap()
-        .0 as u32
+    let mut best = f32::NEG_INFINITY;
+    let mut best_i = 0usize;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best {
+            best = v;
+            best_i = i;
+        }
+    }
+    best_i as u32
 }
 
 fn prompt_lookup(history: &[u32], max_tokens: usize) -> Vec<u32> {

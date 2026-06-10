@@ -1,7 +1,8 @@
-// GPT-2 decode-path kernels. The engine processes one token at a time
-// (prompt prefill included), so every matmul is a GEMV: memory-bound by
-// definition, which is exactly the regime a 40 GB/s bus punishes — and the
-// reason int8 weights nearly quadruple tokens/sec.
+// LLM engine kernels. Decode processes one token at a time, so every matmul
+// is a GEMV: memory-bound by definition, which is exactly the regime a
+// 40 GB/s bus punishes — and the reason int8 weights nearly quadruple
+// tokens/sec. Prompt prefill and speculative verification instead batch T
+// tokens through GEMM + flash-style attention (second half of this file).
 //
 // Weight matrices are [n_in, n_out] row-major (y = x @ W + b): consecutive
 // threads read consecutive outputs of the same input row — fully coalesced.
@@ -588,39 +589,70 @@ __device__ __forceinline__ float tof(float x) { return x; }
 __device__ __forceinline__ float tof(__half x) { return __half2float(x); }
 __device__ __forceinline__ float tof(signed char x) { return (float)x; }
 
+// Four consecutive B elements widened to fp32 in one (or two) wide loads —
+// the char4 GEMV lesson applied to the GEMM tile loads: scalar byte/half
+// loads are instruction-bound and leave the bus idle.
+__device__ __forceinline__ void load4(const float *p, float *o) {
+    float4 v = *reinterpret_cast<const float4 *>(p);
+    o[0] = v.x, o[1] = v.y, o[2] = v.z, o[3] = v.w;
+}
+__device__ __forceinline__ void load4(const __half *p, float *o) {
+    __half2 a = *reinterpret_cast<const __half2 *>(p);
+    __half2 b = *reinterpret_cast<const __half2 *>(p + 2);
+    o[0] = __low2float(a), o[1] = __high2float(a);
+    o[2] = __low2float(b), o[3] = __high2float(b);
+}
+__device__ __forceinline__ void load4(const signed char *p, float *o) {
+    char4 c = *reinterpret_cast<const char4 *>(p);
+    o[0] = (float)c.x, o[1] = (float)c.y, o[2] = (float)c.z, o[3] = (float)c.w;
+}
+
 // C[M,N] = A[M,K] @ B[K,N] (+ scales per column for int8) + bias.
-// 64x64 tiles, BK=16, 16x16 threads each computing a 4x4 micro-tile,
-// bounds-checked so any M (token count) and N work.
-template <typename BT, bool SCALED>
+// BM x 64 tiles, BK = 16, 256 threads each computing a (BM/16) x 4 micro-tile.
+// Two tile heights: BM=64 for prefill-sized M, BM=16 for speculative verify —
+// a 64-row tile burns 8x the FMAs on an 8-row draft batch, and that compute
+// waste (not bandwidth) was the floor of the verify pass. K is a multiple of
+// 16 for every matrix in the engine; N tiles are bounds-checked, and B loads
+// vectorize whenever the tile sits fully inside an N divisible by 4.
+template <typename BT, bool SCALED, int BM>
 __device__ void gemm_body(float *C, const float *A, const BT *B, const float *scales,
                           const float *bias, int M, int N, int K) {
-    __shared__ float As[16][64];
+    constexpr int RM = BM / 16; // micro-tile rows per thread
+    __shared__ float As[16][BM];
     __shared__ float Bs[16][64];
-    int bm = blockIdx.y * 64, bn = blockIdx.x * 64;
+    int bm = blockIdx.y * BM, bn = blockIdx.x * 64;
     int tid = threadIdx.y * 16 + threadIdx.x;
-    float acc[4][4] = {};
+    float acc[RM][4] = {};
+    bool vec = (N % 4 == 0) && (bn + 64 <= N);
 
     for (int k0 = 0; k0 < K; k0 += 16) {
-        for (int i = tid; i < 64 * 16; i += 256) {
+        for (int i = tid; i < BM * 16; i += 256) {
             int m = i / 16, k = i % 16;
-            As[k][m] = (bm + m < M && k0 + k < K) ? A[(size_t)(bm + m) * K + k0 + k] : 0.0f;
+            As[k][m] = (bm + m < M) ? A[(size_t)(bm + m) * K + k0 + k] : 0.0f;
         }
-        for (int i = tid; i < 16 * 64; i += 256) {
-            int k = i / 64, n = i % 64;
-            Bs[k][n] = (k0 + k < K && bn + n < N) ? tof(B[(size_t)(k0 + k) * N + bn + n]) : 0.0f;
+        if (vec) {
+            int k = tid / 16, n = (tid % 16) * 4;
+            float t[4];
+            load4(&B[(size_t)(k0 + k) * N + bn + n], t);
+            *reinterpret_cast<float4 *>(&Bs[k][n]) = make_float4(t[0], t[1], t[2], t[3]);
+        } else {
+            for (int i = tid; i < 16 * 64; i += 256) {
+                int k = i / 64, n = i % 64;
+                Bs[k][n] = (bn + n < N) ? tof(B[(size_t)(k0 + k) * N + bn + n]) : 0.0f;
+            }
         }
         __syncthreads();
         for (int k = 0; k < 16; ++k) {
-            float a[4], b[4];
-            for (int i = 0; i < 4; ++i) a[i] = As[k][threadIdx.y * 4 + i];
+            float a[RM], b[4];
+            for (int i = 0; i < RM; ++i) a[i] = As[k][threadIdx.y * RM + i];
             for (int j = 0; j < 4; ++j) b[j] = Bs[k][threadIdx.x * 4 + j];
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < RM; ++i)
                 for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
         }
         __syncthreads();
     }
-    for (int i = 0; i < 4; ++i) {
-        int row = bm + threadIdx.y * 4 + i;
+    for (int i = 0; i < RM; ++i) {
+        int row = bm + threadIdx.y * RM + i;
         if (row >= M) continue;
         for (int j = 0; j < 4; ++j) {
             int col = bn + threadIdx.x * 4 + j;
@@ -634,18 +666,118 @@ __device__ void gemm_body(float *C, const float *A, const BT *B, const float *sc
 
 extern "C" __global__ void gemm_f32(float *C, const float *A, const float *B,
                                     const float *bias, int M, int N, int K) {
-    gemm_body<float, false>(C, A, B, nullptr, bias, M, N, K);
+    gemm_body<float, false, 64>(C, A, B, nullptr, bias, M, N, K);
 }
 
 extern "C" __global__ void gemm_half(float *C, const float *A, const __half *B,
                                      const float *bias, int M, int N, int K) {
-    gemm_body<__half, false>(C, A, B, nullptr, bias, M, N, K);
+    gemm_body<__half, false, 64>(C, A, B, nullptr, bias, M, N, K);
 }
 
 extern "C" __global__ void gemm_int8(float *C, const float *A, const signed char *B,
                                      const float *scales, const float *bias,
                                      int M, int N, int K) {
-    gemm_body<signed char, true>(C, A, B, scales, bias, M, N, K);
+    gemm_body<signed char, true, 64>(C, A, B, scales, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_f32_skinny(float *C, const float *A, const float *B,
+                                           const float *bias, int M, int N, int K) {
+    gemm_body<float, false, 16>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_half_skinny(float *C, const float *A, const __half *B,
+                                            const float *bias, int M, int N, int K) {
+    gemm_body<__half, false, 16>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_int8_skinny(float *C, const float *A, const signed char *B,
+                                            const float *scales, const float *bias,
+                                            int M, int N, int K) {
+    gemm_body<signed char, true, 16>(C, A, B, scales, bias, M, N, K);
+}
+
+// Draft-verify GEMM (M <= 8) as a multi-row GEMV: square tiles waste compute
+// when M is a handful of rows (a 16x64 tile burns 2-16x the FMAs and its 1x4
+// micro-tile is shared-load-bound), so instead each thread owns output
+// columns gemv-style — B streams through exactly once with zero wasted
+// compute, the 8-row accumulator lives in registers, and A is staged through
+// shared memory where reads are warp-broadcast (all threads read the same
+// As[m][kk]). Column ownership copies the gemv_int8 heuristic: wide matrices
+// (N % 4 == 0, N >= 4096) take 4 columns per thread via one vectorized load,
+// narrow ones keep 1 column per thread — fewer threads starve the SMs of
+// latency-hiding warps. Rows past M are zero-padded so the per-thread loops
+// fully unroll and the accumulators never spill.
+#define ROWS_M 8
+#define ROWS_KT 128
+
+__device__ __forceinline__ bool gemm_rows_wide(int N) { return N % 4 == 0 && N >= 4096; }
+
+template <typename BT, bool SCALED>
+__device__ void gemm_rows_body(float *C, const float *A, const BT *B,
+                               const float *scales, const float *bias,
+                               int M, int N, int K) {
+    __shared__ float As[ROWS_M][ROWS_KT];
+    int tid = threadIdx.x;
+    int o = blockIdx.x * blockDim.x + tid;
+    bool wide = gemm_rows_wide(N);
+    bool active = o < (wide ? N / 4 : N);
+    float acc[ROWS_M][4] = {};
+
+    for (int k0 = 0; k0 < K; k0 += ROWS_KT) {
+        int kt = min(ROWS_KT, K - k0);
+        for (int i = tid; i < ROWS_M * ROWS_KT; i += blockDim.x) {
+            int m = i / ROWS_KT, kk = i % ROWS_KT;
+            As[m][kk] = (m < M && kk < kt) ? A[(size_t)m * K + k0 + kk] : 0.0f;
+        }
+        __syncthreads();
+        if (active && wide) {
+            for (int kk = 0; kk < kt; ++kk) {
+                float b[4];
+                load4(&B[(size_t)(k0 + kk) * N + 4 * o], b);
+#pragma unroll
+                for (int m = 0; m < ROWS_M; ++m) {
+                    float a = As[m][kk];
+                    acc[m][0] += a * b[0];
+                    acc[m][1] += a * b[1];
+                    acc[m][2] += a * b[2];
+                    acc[m][3] += a * b[3];
+                }
+            }
+        } else if (active) {
+            for (int kk = 0; kk < kt; ++kk) {
+                float b = tof(B[(size_t)(k0 + kk) * N + o]);
+#pragma unroll
+                for (int m = 0; m < ROWS_M; ++m) acc[m][0] += As[m][kk] * b;
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    int ncols = wide ? 4 : 1;
+    for (int m = 0; m < M; ++m) {
+        for (int j = 0; j < ncols; ++j) {
+            int col = wide ? 4 * o + j : o;
+            float v = acc[m][j];
+            if (SCALED) v *= scales[col];
+            C[(size_t)m * N + col] = v + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_rows_f32(float *C, const float *A, const float *B,
+                                         const float *bias, int M, int N, int K) {
+    gemm_rows_body<float, false>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_rows_half(float *C, const float *A, const __half *B,
+                                          const float *bias, int M, int N, int K) {
+    gemm_rows_body<__half, false>(C, A, B, nullptr, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_rows_int8(float *C, const float *A, const signed char *B,
+                                          const float *scales, const float *bias,
+                                          int M, int N, int K) {
+    gemm_rows_body<signed char, true>(C, A, B, scales, bias, M, N, K);
 }
 
 extern "C" __global__ void embed_batch(float *out, const float *wte_t, const float *wpe,

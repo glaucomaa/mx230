@@ -242,14 +242,21 @@ fn main() {
                 println!("  OK");
             }
 
+            // a prompt with repeated n-grams guarantees prompt_lookup finds
+            // drafts, so the verify/accept path is actually exercised (the
+            // fallback path still runs on the non-repeating stretches)
+            let spec_ids = tok.encode(
+                "The quick brown fox jumps over the lazy dog. \
+                 The quick brown fox jumps over the lazy dog. The quick brown fox",
+            );
             for kv8 in [false, true] {
                 let mode = modes_for(choice.arch)[0];
-                let n_steps = 24;
+                let n_steps = 32;
                 let mut greedy_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
-                let greedy = greedy_engine.generate(&ids, n_steps, |_| {});
+                let greedy = greedy_engine.generate(&spec_ids, n_steps, |_| {});
                 drop(greedy_engine);
                 let mut spec_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
-                let spec = spec_engine.generate_speculative(&ids, n_steps, 8, |_| {});
+                let spec = spec_engine.generate_speculative(&spec_ids, n_steps, 8, |_| {});
                 assert_eq!(
                     spec, greedy,
                     "prompt-lookup speculative decode diverged from greedy (kv8={kv8})"
@@ -316,7 +323,9 @@ fn main() {
                 }
                 let t0 = Instant::now();
                 if spec {
-                    engine.generate_speculative(&ids, n_new, spec_k, |_| {});
+                    // prefill happened above, outside the timed region — same
+                    // as the non-speculative branches
+                    engine.speculative_loop(&ids, gpu::argmax(&logits), n_new, spec_k, |_| {});
                 } else if graphs {
                     let first = gpu::argmax(&logits);
                     engine.graph_decode(first, ids.len(), n_new);

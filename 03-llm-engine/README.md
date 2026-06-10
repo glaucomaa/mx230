@@ -81,9 +81,9 @@ Benchmark command:
 | model | engine | model storage | prefill / prompt processing | greedy decode |
 |-------|--------|---------------|-----------------------------|---------------|
 | GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2740.5 tok/s** (`pp512`) | **142.4 tok/s** (`tg128`) |
-| GPT-2 | ours | int8 weights, ~124 MiB | 998.1 tok/s (`512 / 0.513s`) | 130.0 tok/s |
+| GPT-2 | ours | int8 weights, ~124 MiB | 1080.2 tok/s (`512 / 0.474s`) | 130.0 tok/s |
 | Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **872.5 tok/s** (`pp512`) | 45.4 tok/s (`tg128`) |
-| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 252.0 tok/s (`512 / 2.032s`) | **52.5 tok/s** |
+| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 274.4 tok/s (`512 / 1.866s`) | **52.5 tok/s** |
 
 This is the honest split. llama.cpp is much faster on prefill: its prompt path
 is a mature batched graph over GGML kernels, while this engine's batch prefill
@@ -111,22 +111,46 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
 - **Batch prefill replaces token-by-token GEMV with GEMM + flash-style causal
   attention.** A 512-token prompt now runs as tiled matmuls over the whole
   prompt and a GQA-aware online-softmax attention pass over the KV cache.
-  On MX230/GPT-2 the measured time-to-first-token is:
+  GEMM tile loads are vectorized (`float4`/`__half2`/`char4` — the same fix
+  the int8 GEMV needed). On MX230/GPT-2 the measured time-to-first-token is:
 
   | mode | token loop | batch prefill | speedup |
   |------|------------|---------------|---------|
-  | fp32 | 7.100s     | 0.484s        | 14.65x  |
-  | fp16 | 5.001s     | 0.511s        | 9.79x   |
-  | int8 | 4.427s     | 0.514s        | 8.61x   |
+  | fp32 | 7.100s     | 0.462s        | 15.4x   |
+  | fp16 | 4.993s     | 0.468s        | 10.7x   |
+  | int8 | 4.436s     | 0.474s        | 9.4x    |
 
   The prefill path is checked against the token loop in `verify`: final logits
   may differ at float-rounding scale, but the greedy argmax must match in every
   weight/KV mode.
+- **The GEMM dispatches on M, because a square tile wastes compute on skinny
+  batches.** A 64x64 tile burns 64 rows of FMAs whether M is 512 or 8, and
+  that wasted compute — not bandwidth — was the floor of the speculative
+  verify pass: verifying 8 draft tokens cost ~6 decode steps, making spec
+  decode a net loss. Three tiers fix it: 64-row tiles for prefill, 16-row
+  tiles for mid-size M, and for M <= 8 a multi-row GEMV (`gemm_rows`) where
+  each thread owns output columns gemv-style, B streams through once with
+  zero wasted FMAs and the 8-row accumulator lives in registers. An 8-token
+  verify dropped from 49ms to 15ms (GPT-2 int8) — under 2 decode steps.
 - **Prompt-lookup speculative decoding** (`--spec`, optional `--spec-k N`) uses
   repeated n-grams from the prompt/generated history as draft tokens, verifies
-  them with the same batch forward path, and accepts only tokens that match the
-  full model's greedy argmax. It is lossless by construction: `verify` compares
-  the speculative output token-for-token with ordinary greedy decode.
+  them with one batched forward, and accepts only tokens that match the full
+  model's greedy argmax. Logits never leave the GPU: the verify pass argmaxes
+  every row on device and ships back token ids, not `n x n_vocab` floats.
+  It is lossless by construction — `verify` compares the speculative output
+  token-for-token with ordinary greedy decode (host and device argmax break
+  ties the same way, first index, so the paths cannot diverge on equal
+  logits). Measured on int8 weights, 128-256 new tokens:
+
+  | model | text | greedy | spec | gain |
+  |------|------|--------|------|------|
+  | GPT-2 | repeated sentence | 130.6 tok/s | 410.7 tok/s | 3.1x |
+  | GPT-2 | "Alan Turing was..." | 125.8 tok/s | 255.9 tok/s | 2.0x |
+  | Qwen2.5-0.5B | repeated sentence | 56.5 tok/s | 139.4 tok/s | 2.5x |
+
+  Greedy LLM output loops hard, so prompt lookup hits constantly even on
+  "normal" text; on text with no repeats spec falls back to one token per
+  forward and costs nothing.
 - **int8 weights were instruction-bound until the loads got wider.** The
   first int8 GEMV issued one byte load + convert + FMA per weight — the same
   instruction count as fp32 for a quarter of the data, so below bus
@@ -208,13 +232,15 @@ progress measured on the same harness.
   (fp32 / fp16 storage / int8 with per-output-channel absmax scales and
   char4 loads on wide outputs), fused causal KV-cache attention with GQA
   (one block per query head, online scores in shared memory; fp32 and
-  int8-cache variants), batched prefill GEMM and flash-style attention,
+  int8-cache variants), batched prefill GEMM in three M-tiers (64/16-row
+  tiles + multi-row GEMV, vectorized tile loads) and flash-style attention,
   quantize-on-write KV kernels, GELU, SwiGLU combine, residual add, GPU
-  argmax for graph replay and draft verification.
+  argmax for graph replay and per-row argmax for draft verification.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or
   quantized at load; per-layer KV cache (fp32 or int8 + scales); standard
-  host-greedy decode, batch prefill, prompt-lookup speculative decode and a
-  CUDA-graph benchmark path.
+  host-greedy decode, batch prefill, prompt-lookup speculative decode
+  (device-side verify, only token ids cross the bus) and a CUDA-graph
+  benchmark path.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked
