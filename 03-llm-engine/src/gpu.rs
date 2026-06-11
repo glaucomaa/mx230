@@ -230,6 +230,8 @@ struct Kernels {
     gemv_int4: CudaFunction,
     gemm_f32: CudaFunction,
     gemm_half: CudaFunction,
+    gemm_f32_wide: CudaFunction,
+    gemm_half_wide: CudaFunction,
     gemm_int8: CudaFunction,
     gemm_int4: CudaFunction,
     gemm_f32_skinny: CudaFunction,
@@ -273,6 +275,14 @@ fn cfg_gemm(m: usize, n: usize, bm: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(64) as u32, m.div_ceil(bm) as u32, 1),
         block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+fn cfg_gemm_wide(m: usize, n: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
+        block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -382,33 +392,39 @@ fn gemm(
 ) {
     debug_assert!(kk.is_multiple_of(16), "gemm kernels assume K % 16 == 0");
     let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
-    // Three tiers by M. Tiled GEMMs burn whole-tile FMAs regardless of M, so
+    // Four tiers by M. Tiled GEMMs burn whole-tile FMAs regardless of M, so
     // draft-verify batches (M <= 8) go through gemm_rows — a multi-row GEMV
     // with zero wasted compute; 16-row tiles cover the mid range, 64-row
-    // tiles the real prefill.
+    // tiles medium batches, and real prefill (M > 64) takes the 128x128
+    // wide tier (fp32/fp16 only — int GEMMs stay on the 64-tile dp4a path).
     let tier = if m <= 8 {
         0
     } else if m <= 16 {
         1
-    } else {
+    } else if m <= 64 {
         2
-    };
-    let cfg = if tier == 0 {
-        let cols = if n.is_multiple_of(4) && n >= 4096 {
-            n / 4
-        } else {
-            n
-        };
-        cfg1d(cols)
     } else {
-        cfg_gemm(m, n, if tier == 1 { 16 } else { 64 })
+        3
+    };
+    let cfg = match tier {
+        0 => {
+            let cols = if n.is_multiple_of(4) && n >= 4096 {
+                n / 4
+            } else {
+                n
+            };
+            cfg1d(cols)
+        }
+        3 => cfg_gemm_wide(m, n),
+        t => cfg_gemm(m, n, if t == 1 { 16 } else { 64 }),
     };
     match b {
         Weights::F32(w) => {
             let f = match tier {
                 0 => &k.gemm_rows_f32,
                 1 => &k.gemm_f32_skinny,
-                _ => &k.gemm_f32,
+                2 => &k.gemm_f32,
+                _ => &k.gemm_f32_wide,
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
@@ -424,7 +440,8 @@ fn gemm(
             let f = match tier {
                 0 => &k.gemm_rows_half,
                 1 => &k.gemm_half_skinny,
-                _ => &k.gemm_half,
+                2 => &k.gemm_half,
+                _ => &k.gemm_half_wide,
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
@@ -447,6 +464,7 @@ fn gemm(
                 .arg(&groups);
             unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
 
+            let cfg = if tier == 3 { cfg_gemm(m, n, 64) } else { cfg };
             let f = match tier {
                 0 => &k.gemm_rows_int8,
                 1 => &k.gemm_int8_skinny,
@@ -475,6 +493,7 @@ fn gemm(
                 .arg(&groups);
             unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
 
+            let cfg = if tier == 3 { cfg_gemm(m, n, 64) } else { cfg };
             let f = match tier {
                 0 => &k.gemm_rows_int4,
                 1 => &k.gemm_int4_skinny,
@@ -611,6 +630,8 @@ impl Engine {
             gemv_int4: f("gemv_int4"),
             gemm_f32: f("gemm_f32"),
             gemm_half: f("gemm_half"),
+            gemm_f32_wide: f("gemm_f32_wide"),
+            gemm_half_wide: f("gemm_half_wide"),
             gemm_int8: f("gemm_int8"),
             gemm_int4: f("gemm_int4"),
             gemm_f32_skinny: f("gemm_f32_skinny"),

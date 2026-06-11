@@ -901,6 +901,98 @@ extern "C" __global__ void gemm_half(float *C, const float *A, const __half *B,
     gemm_body<__half, false, 64>(C, A, B, nullptr, bias, M, N, K);
 }
 
+// Wide tier for real prefill (M > 64): the 01-gemm ladder's endgame
+// (gemm_05/06) grafted onto engine shapes. 128x128 tile, BK = 8, 256
+// threads each owning an 8x8 register micro-tile — 64 FMAs per 16 smem
+// reads vs the 64-tile's 16 per 8, so the kernel stops being smem-issue
+// bound. A is staged with float4 loads and stored transposed so the inner
+// loop reads both tiles contiguously; smem is double-buffered with the
+// next tile's global loads issued before the compute loop (one
+// __syncthreads per k-step, latency hidden behind FMAs). M/N edges are
+// bounds-checked: OOB rows load zeros, the N edge falls back to scalar
+// loads and the epilogue clips.
+template <typename BT>
+__device__ void gemm_wide_body(float *C, const float *A, const BT *B,
+                               const float *bias, int M, int N, int K) {
+    __shared__ float As[2][8][128]; // transposed: As[buf][k][m]
+    __shared__ float Bs[2][8][128];
+    int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    int tid = threadIdx.x;
+    int arow = tid >> 1, acol = (tid & 1) * 4;  // A tile: one float4 each
+    int brow = tid >> 5, bcol = (tid & 31) * 4; // B tile: one 4-vec each
+    int trow = tid >> 4, tcol = tid & 15;
+    bool vec = (N % 4 == 0) && (bn + 128 <= N);
+
+    float acc[8][8] = {};
+    float a4[4], b4[4];
+    // K % 16 == 0 engine-wide, so the float4 A load never crosses K.
+    auto stage = [&](int k0) {
+        if (bm + arow < M) {
+            load4(&A[(size_t)(bm + arow) * K + k0 + acol], a4);
+        } else {
+            a4[0] = a4[1] = a4[2] = a4[3] = 0.0f;
+        }
+        if (vec) {
+            load4(&B[(size_t)(k0 + brow) * N + bn + bcol], b4);
+        } else {
+            for (int j = 0; j < 4; ++j)
+                b4[j] = (bn + bcol + j < N)
+                            ? tof(B[(size_t)(k0 + brow) * N + bn + bcol + j])
+                            : 0.0f;
+        }
+    };
+    auto store = [&](int buf) {
+        As[buf][acol + 0][arow] = a4[0];
+        As[buf][acol + 1][arow] = a4[1];
+        As[buf][acol + 2][arow] = a4[2];
+        As[buf][acol + 3][arow] = a4[3];
+        *reinterpret_cast<float4 *>(&Bs[buf][brow][bcol]) =
+            make_float4(b4[0], b4[1], b4[2], b4[3]);
+    };
+
+    stage(0);
+    store(0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += 8) {
+        if (k0 + 8 < K) stage(k0 + 8);
+        for (int k = 0; k < 8; ++k) {
+            float rm[8], rn[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) rm[i] = As[buf][k][trow * 8 + i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) rn[j] = Bs[buf][k][tcol * 8 + j];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] += rm[i] * rn[j];
+        }
+        if (k0 + 8 < K) store(buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        int row = bm + trow * 8 + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 8; ++j) {
+            int col = bn + tcol * 8 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = acc[i][j] + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_f32_wide(float *C, const float *A, const float *B,
+                                         const float *bias, int M, int N, int K) {
+    gemm_wide_body<float>(C, A, B, bias, M, N, K);
+}
+
+extern "C" __global__ void gemm_half_wide(float *C, const float *A, const __half *B,
+                                          const float *bias, int M, int N, int K) {
+    gemm_wide_body<__half>(C, A, B, bias, M, N, K);
+}
+
 // int8 GEMM via dp4a: A arrives pre-quantized by quantize_act (packed int32
 // + one scale per 32-k group per row), B is the repacked int32 weight
 // layout. BK = 32 so each k-tile covers exactly one activation-scale group:
