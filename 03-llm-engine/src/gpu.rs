@@ -63,6 +63,8 @@ impl WeightMode {
 }
 
 const Q4_GROUP: usize = 32;
+/// Activation-quantization group size; must match `AG` in llm.cu.
+const ACT_GROUP: usize = 4;
 
 /// Approximate weight footprint on device for a given storage mode.
 pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
@@ -158,8 +160,12 @@ fn quantize_q4(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
     (q, scales)
 }
 
-/// Per-output-channel absmax quantization of a [n_in, n_out] matrix.
+/// Per-output-channel absmax quantization of a [n_in, n_out] matrix, packed
+/// for dp4a: int32 words of 4 consecutive n_in rows per column — byte
+/// ((i/4)*n_out + o)*4 + (i%4) holds q[i, o]. Consecutive columns stay
+/// consecutive, so coalescing matches the old row-major byte layout.
 fn quantize(w: &[f32], n_in: usize, n_out: usize) -> (Vec<i8>, Vec<f32>) {
+    assert!(n_in.is_multiple_of(4), "int8 packing needs n_in % 4 == 0");
     let mut scales = vec![0.0f32; n_out];
     for o in 0..n_out {
         let mut amax = 0.0f32;
@@ -168,9 +174,13 @@ fn quantize(w: &[f32], n_in: usize, n_out: usize) -> (Vec<i8>, Vec<f32>) {
         }
         scales[o] = if amax == 0.0 { 1.0 } else { amax / 127.0 };
     }
-    let q = (0..n_in * n_out)
-        .map(|idx| (w[idx] / scales[idx % n_out]).round().clamp(-127.0, 127.0) as i8)
-        .collect();
+    let mut q = vec![0i8; n_in * n_out];
+    for i in 0..n_in {
+        for o in 0..n_out {
+            let v = (w[i * n_out + o] / scales[o]).round().clamp(-127.0, 127.0) as i8;
+            q[((i / 4) * n_out + o) * 4 + (i % 4)] = v;
+        }
+    }
     (q, scales)
 }
 
@@ -229,6 +239,7 @@ struct Kernels {
     gemm_rows_half: CudaFunction,
     gemm_rows_int8: CudaFunction,
     gemm_rows_int4: CudaFunction,
+    quantize_act: CudaFunction,
     copy_kv_dyn: CudaFunction,
     copy_kv_batch: CudaFunction,
     quantize_kv: CudaFunction,
@@ -309,10 +320,16 @@ fn gemv(
     n_out: usize,
 ) {
     let (ni, no) = (n_in as i32, n_out as i32);
+    // fp32/fp16 stage x as floats; int8 quantizes x in-kernel into packed
+    // int32 plus one scale per 8-value group (AG in llm.cu)
+    let smem = match w {
+        Weights::Int8 { .. } => n_in + n_in / ACT_GROUP * 4,
+        _ => n_in * 4,
+    };
     let cfg = LaunchConfig {
         grid_dim: (n_out.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
-        shared_mem_bytes: (n_in * 4) as u32,
+        shared_mem_bytes: smem as u32,
     };
     match w {
         Weights::F32(w) => {
@@ -338,6 +355,14 @@ fn gemv(
     }
 }
 
+/// Scratch for on-the-fly activation quantization (the dp4a GEMM path):
+/// packed int32 rows, per-32-group absmax scales and group sums.
+pub struct ActQuant {
+    q: CudaSlice<i32>,
+    scale: CudaSlice<f32>,
+    sum: CudaSlice<i32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     stream: &Arc<CudaStream>,
@@ -349,6 +374,7 @@ fn gemm(
     m: usize,
     n: usize,
     kk: usize,
+    act: &mut ActQuant,
 ) {
     debug_assert!(kk.is_multiple_of(16), "gemm kernels assume K % 16 == 0");
     let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
@@ -407,6 +433,16 @@ fn gemm(
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int8 { q, scales } => {
+            debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            let groups = (m * kk / ACT_GROUP) as i32;
+            let mut lb = stream.launch_builder(&k.quantize_act);
+            lb.arg(&mut act.q)
+                .arg(&mut act.scale)
+                .arg(&mut act.sum)
+                .arg(a)
+                .arg(&groups);
+            unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
+
             let f = match tier {
                 0 => &k.gemm_rows_int8,
                 1 => &k.gemm_int8_skinny,
@@ -414,7 +450,8 @@ fn gemm(
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
-                .arg(a)
+                .arg(&act.q)
+                .arg(&act.scale)
                 .arg(q)
                 .arg(scales)
                 .arg(bias)
@@ -517,6 +554,7 @@ pub struct Engine {
     batch_h2: CudaSlice<f32>,
     batch_logits: CudaSlice<f32>,
     batch_argmax: CudaSlice<i32>,
+    act: ActQuant,
     graph_tok: CudaSlice<i32>,
     graph_pos: CudaSlice<i32>,
     decode_graph: Option<CudaGraph>,
@@ -568,6 +606,7 @@ impl Engine {
             gemm_rows_half: f("gemm_rows_half"),
             gemm_rows_int8: f("gemm_rows_int8"),
             gemm_rows_int4: f("gemm_rows_int4"),
+            quantize_act: f("quantize_act"),
             copy_kv_dyn: f("copy_kv_dyn"),
             copy_kv_batch: f("copy_kv_batch"),
             quantize_kv: f("quantize_kv"),
@@ -715,6 +754,13 @@ impl Engine {
             batch_h2: stream.alloc_zeros(c.n_ctx * inter).unwrap(),
             batch_logits: stream.alloc_zeros(MAX_SPEC_TOKENS * v).unwrap(),
             batch_argmax: stream.alloc_zeros(MAX_SPEC_TOKENS).unwrap(),
+            // activation-quant scratch sized for the widest K (n_inter),
+            // one scale/sum per 8-value group (AG in llm.cu)
+            act: ActQuant {
+                q: stream.alloc_zeros(c.n_ctx * inter / 4).unwrap(),
+                scale: stream.alloc_zeros(c.n_ctx * inter / ACT_GROUP).unwrap(),
+                sum: stream.alloc_zeros(c.n_ctx * inter / ACT_GROUP).unwrap(),
+            },
             graph_tok: stream.alloc_zeros(1).unwrap(),
             graph_pos: stream.alloc_zeros(1).unwrap(),
             decode_graph: None,
@@ -1331,6 +1377,7 @@ impl Engine {
                 n,
                 qkvd,
                 e,
+                &mut self.act,
             );
 
             if c.arch != Arch::Gpt2 {
@@ -1445,6 +1492,7 @@ impl Engine {
                 n,
                 e,
                 qd,
+                &mut self.act,
             );
             add(
                 &self.stream,
@@ -1475,6 +1523,7 @@ impl Engine {
                 n,
                 inter,
                 e,
+                &mut self.act,
             );
             let total_i = (n * inter) as i32;
             match &layer.up_w {
@@ -1494,6 +1543,7 @@ impl Engine {
                         n,
                         inter,
                         e,
+                        &mut self.act,
                     );
                     let mut lb = self.stream.launch_builder(&self.k.silu_mul);
                     lb.arg(&mut self.batch_h).arg(&self.batch_h2).arg(&total_i);
@@ -1510,6 +1560,7 @@ impl Engine {
                 n,
                 e,
                 inter,
+                &mut self.act,
             );
             add(
                 &self.stream,
@@ -1585,6 +1636,7 @@ impl Engine {
             n,
             c.n_vocab,
             c.n_embd,
+            &mut self.act,
         );
         let v_i = c.n_vocab as i32;
         let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
