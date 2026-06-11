@@ -116,14 +116,16 @@ pub enum Weights {
         scales: CudaSlice<f32>,
     },
     Int4 {
-        q: CudaSlice<u8>,       // [(n_in/2), n_out], two rows per byte
+        q: CudaSlice<u8>,       // int32 words of 8 rows per column (see quantize_q4)
         scales: CudaSlice<f16>, // [(n_in/32), n_out]
     },
 }
 
 /// Q4_0-style group quantization of a [n_in, n_out] matrix: per (32-row
-/// group, column), scale = signed absmax / -8, nibbles store q+8 in [0, 15],
-/// rows i and i+1 pack into one byte (low/high nibble).
+/// group, column), scale = signed absmax / -8, nibbles store q+8 in [0, 15].
+/// Packing matches the dp4a kernels: int32 word (i/8)*n_out + o holds rows
+/// i..i+7 of column o, byte j carrying rows i+j (low nibble) and i+4+j
+/// (high nibble) — both nibble planes line up with activation dp4a words.
 fn quantize_q4(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
     assert!(
         n_in.is_multiple_of(Q4_GROUP),
@@ -150,10 +152,9 @@ fn quantize_q4(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
             } else {
                 0.0
             };
-            for i in (g * Q4_GROUP..(g + 1) * Q4_GROUP).step_by(2) {
-                let lo = ((w[i * n_out + o] * id).round() + 8.0).clamp(0.0, 15.0) as u8;
-                let hi = ((w[(i + 1) * n_out + o] * id).round() + 8.0).clamp(0.0, 15.0) as u8;
-                q[i / 2 * n_out + o] = lo | (hi << 4);
+            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
+                let nib = ((w[i * n_out + o] * id).round() + 8.0).clamp(0.0, 15.0) as u8;
+                q[((i / 8) * n_out + o) * 4 + (i % 4)] |= nib << (4 * ((i % 8) / 4));
             }
         }
     }
@@ -322,8 +323,11 @@ fn gemv(
     let (ni, no) = (n_in as i32, n_out as i32);
     // fp32/fp16 stage x as floats; int8 quantizes x in-kernel into packed
     // int32 plus one scale per 8-value group (AG in llm.cu)
+    // int8/int4 quantize x in-kernel: packed words + per-group scales
+    // (+ group sums and per-32 correction sums for int4's nibble bias)
     let smem = match w {
         Weights::Int8 { .. } => n_in + n_in / ACT_GROUP * 4,
+        Weights::Int4 { .. } => 3 * n_in + n_in / 8,
         _ => n_in * 4,
     };
     let cfg = LaunchConfig {
@@ -461,6 +465,16 @@ fn gemm(
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int4 { q, scales } => {
+            debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            let groups = (m * kk / ACT_GROUP) as i32;
+            let mut lb = stream.launch_builder(&k.quantize_act);
+            lb.arg(&mut act.q)
+                .arg(&mut act.scale)
+                .arg(&mut act.sum)
+                .arg(a)
+                .arg(&groups);
+            unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
+
             let f = match tier {
                 0 => &k.gemm_rows_int4,
                 1 => &k.gemm_int4_skinny,
@@ -468,7 +482,8 @@ fn gemm(
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
-                .arg(a)
+                .arg(&act.q)
+                .arg(&act.scale)
                 .arg(q)
                 .arg(scales)
                 .arg(bias)
