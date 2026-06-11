@@ -82,44 +82,69 @@ extern "C" __global__ void embed_int8_dyn(float *out, const signed char *wte_t,
 }
 
 // One block; mean/var over n via shared-memory reduction.
+// ---- warp-shuffle block reductions -----------------------------------------
+// A block-wide reduction is two shuffle sweeps and a 32-slot smem bounce
+// (3 __syncthreads) instead of a log2(blockDim) smem tree with 8+. The
+// leading sync makes back-to-back reductions safe on one shared buffer.
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, o);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v = fmaxf(v, __shfl_down_sync(0xFFFFFFFFu, v, o));
+    return v;
+}
+template <bool MAX>
+__device__ __forceinline__ float block_red(float v, float *red) {
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __syncthreads();
+    v = MAX ? warp_max(v) : warp_sum(v);
+    if (lane == 0) red[w] = v;
+    __syncthreads();
+    if (w == 0) {
+        v = (lane < nw) ? red[lane] : (MAX ? -CUDART_INF_F : 0.0f);
+        v = MAX ? warp_max(v) : warp_sum(v);
+        if (lane == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+__device__ __forceinline__ float block_sum(float v, float *red) {
+    return block_red<false>(v, red);
+}
+__device__ __forceinline__ float block_max(float v, float *red) {
+    return block_red<true>(v, red);
+}
+
 extern "C" __global__ void layernorm(float *out, const float *x, const float *g,
                                      const float *b, int n) {
-    __shared__ float red[256];
+    __shared__ float red[32];
     int tid = threadIdx.x;
 
     float s = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) s += x[i];
-    red[tid] = s;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] += red[tid + k];
-        __syncthreads();
-    }
-    float mean = red[0] / n;
-    __syncthreads();
+    float mean = block_sum(s, red) / n;
 
     s = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) {
         float d = x[i] - mean;
         s += d * d;
     }
-    red[tid] = s;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] += red[tid + k];
-        __syncthreads();
-    }
-    float inv = rsqrtf(red[0] / n + LN_EPS);
-    __syncthreads();
+    float inv = rsqrtf(block_sum(s, red) / n + LN_EPS);
 
     for (int i = tid; i < n; i += blockDim.x) {
         out[i] = (x[i] - mean) * inv * g[i] + b[i];
     }
 }
 
-// y[o] = sum_i x[i] * w[i*n_out+o] + b[o]; x staged through shared memory.
+// y[o] (+)= sum_i x[i] * w[i*n_out+o] + b[o]; x staged through shared
+// memory. accum != 0 adds into y instead of overwriting — the residual
+// add fused into the projection that produced it, one launch instead of two.
 extern "C" __global__ void gemv(float *y, const float *x, const float *w,
-                                const float *b, int n_in, int n_out) {
+                                const float *b, int n_in, int n_out, int accum) {
     extern __shared__ float xs[];
     for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[i] = x[i];
     __syncthreads();
@@ -130,13 +155,14 @@ extern "C" __global__ void gemv(float *y, const float *x, const float *w,
         for (int i = 0; i < n_in; ++i) {
             acc += xs[i] * w[(size_t)i * n_out + o];
         }
-        y[o] = acc + (b ? b[o] : 0.0f);
+        float r = acc + (b ? b[o] : 0.0f);
+        y[o] = accum ? y[o] + r : r;
     }
 }
 
 // fp16 storage, fp32 math: weights are loaded as half and immediately widened.
 extern "C" __global__ void gemv_half(float *y, const float *x, const __half *w,
-                                     const float *b, int n_in, int n_out) {
+                                     const float *b, int n_in, int n_out, int accum) {
     extern __shared__ float xs[];
     for (int i = threadIdx.x; i < n_in; i += blockDim.x) xs[i] = x[i];
     __syncthreads();
@@ -147,7 +173,8 @@ extern "C" __global__ void gemv_half(float *y, const float *x, const __half *w,
         for (int i = 0; i < n_in; ++i) {
             acc += xs[i] * __half2float(w[(size_t)i * n_out + o]);
         }
-        y[o] = acc + (b ? b[o] : 0.0f);
+        float r = acc + (b ? b[o] : 0.0f);
+        y[o] = accum ? y[o] + r : r;
     }
 }
 
@@ -197,7 +224,7 @@ extern "C" __global__ void quantize_act(int *xq, float *xs, int *xsum,
 // before: wide outputs take 4 columns per thread via one int4 load.
 extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char *w,
                                      const float *scales, const float *b,
-                                     int n_in, int n_out) {
+                                     int n_in, int n_out, int accum) {
     extern __shared__ char smem_raw[];
     int n_groups = n_in / AG;
     int *xq = (int *)smem_raw;              // n_in bytes as n_in/4 ints
@@ -243,10 +270,14 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
                 a3 += (float)i3 * sx;
             }
             int o = 4 * o4;
-            y[o + 0] = a0 * scales[o + 0] + (b ? b[o + 0] : 0.0f);
-            y[o + 1] = a1 * scales[o + 1] + (b ? b[o + 1] : 0.0f);
-            y[o + 2] = a2 * scales[o + 2] + (b ? b[o + 2] : 0.0f);
-            y[o + 3] = a3 * scales[o + 3] + (b ? b[o + 3] : 0.0f);
+            float r0 = a0 * scales[o + 0] + (b ? b[o + 0] : 0.0f);
+            float r1 = a1 * scales[o + 1] + (b ? b[o + 1] : 0.0f);
+            float r2 = a2 * scales[o + 2] + (b ? b[o + 2] : 0.0f);
+            float r3 = a3 * scales[o + 3] + (b ? b[o + 3] : 0.0f);
+            y[o + 0] = accum ? y[o + 0] + r0 : r0;
+            y[o + 1] = accum ? y[o + 1] + r1 : r1;
+            y[o + 2] = accum ? y[o + 2] + r2 : r2;
+            y[o + 3] = accum ? y[o + 3] + r3 : r3;
         }
         return;
     }
@@ -261,7 +292,8 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
             }
             acc += (float)ig * xs[g];
         }
-        y[o] = acc * scales[o] + (b ? b[o] : 0.0f);
+        float r = acc * scales[o] + (b ? b[o] : 0.0f);
+        y[o] = accum ? y[o] + r : r;
     }
 }
 
@@ -285,7 +317,7 @@ __device__ __forceinline__ int q4_hi8(int w) { return (w >> 4) & 0x0F0F0F0F; }
 
 extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned char *w,
                                      const __half *scales, const float *b,
-                                     int n_in, int n_out) {
+                                     int n_in, int n_out, int accum) {
     extern __shared__ char smem_raw[];
     int nq = n_in / 4;        // activation dp4a words
     int nw = n_in / Q4_GROUP; // 32-row weight groups
@@ -347,10 +379,14 @@ extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned ch
                 a3 += (i3 - corr) * db.y;
             }
             int o = 4 * o4;
-            y[o + 0] = a0 + (b ? b[o + 0] : 0.0f);
-            y[o + 1] = a1 + (b ? b[o + 1] : 0.0f);
-            y[o + 2] = a2 + (b ? b[o + 2] : 0.0f);
-            y[o + 3] = a3 + (b ? b[o + 3] : 0.0f);
+            float r0 = a0 + (b ? b[o + 0] : 0.0f);
+            float r1 = a1 + (b ? b[o + 1] : 0.0f);
+            float r2 = a2 + (b ? b[o + 2] : 0.0f);
+            float r3 = a3 + (b ? b[o + 3] : 0.0f);
+            y[o + 0] = accum ? y[o + 0] + r0 : r0;
+            y[o + 1] = accum ? y[o + 1] + r1 : r1;
+            y[o + 2] = accum ? y[o + 2] + r2 : r2;
+            y[o + 3] = accum ? y[o + 3] + r3 : r3;
         }
         return;
     }
@@ -368,7 +404,8 @@ extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned ch
             acc += (inner - 8.0f * s32[wg]) *
                    __half2float(scales[(size_t)wg * n_out + o]);
         }
-        y[o] = acc + (b ? b[o] : 0.0f);
+        float r = acc + (b ? b[o] : 0.0f);
+        y[o] = accum ? y[o] + r : r;
     }
 }
 
@@ -427,23 +464,20 @@ extern "C" __global__ void copy_kv_dyn(float *kcache, float *vcache, const float
 // RMSNorm: out = x / sqrt(mean(x^2) + eps) * g. One block.
 extern "C" __global__ void rmsnorm(float *out, const float *x, const float *g,
                                    int n, float eps) {
-    __shared__ float red[256];
+    __shared__ float red[32];
     int tid = threadIdx.x;
     float s = 0.0f;
     for (int i = tid; i < n; i += blockDim.x) s += x[i] * x[i];
-    red[tid] = s;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] += red[tid + k];
-        __syncthreads();
-    }
-    float inv = rsqrtf(red[0] / n + eps);
-    __syncthreads();
+    float inv = rsqrtf(block_sum(s, red) / n + eps);
     for (int i = tid; i < n; i += blockDim.x) {
         out[i] = x[i] * inv * g[i];
     }
 }
 
+// The batch norms keep the smem-tree reduction on purpose: in prefill they
+// are a rounding error next to the GEMMs, and the tree preserves the exact
+// summation order the batch==decode argmax gate was calibrated against
+// (int4/kv8 logits sit close enough that reordering flips near-ties).
 extern "C" __global__ void layernorm_batch(float *out, const float *x, const float *g,
                                            const float *b, int rows, int n) {
     __shared__ float red[256];
@@ -572,29 +606,17 @@ extern "C" __global__ void silu_mul(float *x, const float *y, int n) {
 __device__ void quantize_kv_impl(signed char *kq, signed char *vq,
                                  float *ks, float *vs, const float *qkv,
                                  int pos, int q_dim, int n_kv_head, int head_dim) {
-    __shared__ float red[128];
+    __shared__ float red[32];
     int h = blockIdx.x;
     int d = threadIdx.x;
     int kv_dim = n_kv_head * head_dim;
     const float *k = qkv + q_dim + h * head_dim;
     const float *v = qkv + q_dim + kv_dim + h * head_dim;
 
-    red[d] = fabsf(k[d]);
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
-        __syncthreads();
-    }
-    float kscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
-    __syncthreads();
-
-    red[d] = fabsf(v[d]);
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
-        __syncthreads();
-    }
-    float vscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+    float kmax = block_max(fabsf(k[d]), red);
+    float kscale = kmax > 0.0f ? kmax / 127.0f : 1.0f;
+    float vmax = block_max(fabsf(v[d]), red);
+    float vscale = vmax > 0.0f ? vmax / 127.0f : 1.0f;
 
     size_t row = (size_t)pos * kv_dim + h * head_dim;
     kq[row + d] = (signed char)lrintf(k[d] / kscale);
@@ -622,7 +644,7 @@ extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
                                              float *ks, float *vs, const float *qkv,
                                              int pos0, int q_dim, int n_kv_head,
                                              int head_dim, int stride) {
-    __shared__ float red[128];
+    __shared__ float red[32];
     int t = blockIdx.y;
     int h = blockIdx.x;
     int d = threadIdx.x;
@@ -632,22 +654,10 @@ extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
     const float *v = row + q_dim + kv_dim + h * head_dim;
     int pos = pos0 + t;
 
-    red[d] = fabsf(k[d]);
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
-        __syncthreads();
-    }
-    float kscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
-    __syncthreads();
-
-    red[d] = fabsf(v[d]);
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
-        __syncthreads();
-    }
-    float vscale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+    float kmax = block_max(fabsf(k[d]), red);
+    float kscale = kmax > 0.0f ? kmax / 127.0f : 1.0f;
+    float vmax = block_max(fabsf(v[d]), red);
+    float vscale = vmax > 0.0f ? vmax / 127.0f : 1.0f;
 
     size_t out = (size_t)pos * kv_dim + h * head_dim;
     kq[out + d] = (signed char)lrintf(k[d] / kscale);
@@ -666,51 +676,47 @@ __device__ void attn_decode_impl(float *out, const float *qkv,
                                  const float *kcache, const float *vcache,
                                  int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
-    __shared__ float red[128];
+    __shared__ float red[32];
     int h = blockIdx.x;
     int tid = threadIdx.x;
     int kvd = n_kv_head * head_dim;
     int kvh = h / (n_head / n_kv_head);
-    const float *q = qkv + h * head_dim;
     float scale = rsqrtf((float)head_dim);
 
+    // head rows are head_dim-float aligned, so float4 loads are safe and
+    // cut the K/V load instruction count 4x (the char4 lesson, fp32 edition)
+    int hd4 = head_dim / 4;
+    const float4 *q4 = (const float4 *)(qkv + h * head_dim);
     float m = -CUDART_INF_F;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
-        const float *k = kcache + (size_t)t * kvd + kvh * head_dim;
+        const float4 *k4 = (const float4 *)(kcache + (size_t)t * kvd + kvh * head_dim);
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) dot += q[d] * k[d];
+        for (int d = 0; d < hd4; ++d) {
+            float4 qv = q4[d], kv = k4[d];
+            dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+        }
         s[t] = dot * scale;
         m = fmaxf(m, s[t]);
     }
-    red[tid] = m;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] = fmaxf(red[tid], red[tid + k]);
-        __syncthreads();
-    }
-    m = red[0];
-    __syncthreads();
+    m = block_max(m, red);
 
     float l = 0.0f;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
         s[t] = __expf(s[t] - m);
         l += s[t];
     }
-    red[tid] = l;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] += red[tid + k];
-        __syncthreads();
-    }
-    float inv = 1.0f / red[0];
-    __syncthreads();
+    float inv = 1.0f / block_sum(l, red);
 
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
+    for (int d4 = tid; d4 < hd4; d4 += blockDim.x) {
+        const float *vbase = vcache + kvh * head_dim + 4 * d4;
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
         for (int t = 0; t <= t_cur; ++t) {
-            acc += s[t] * vcache[(size_t)t * kvd + kvh * head_dim + d];
+            float4 v = *(const float4 *)(vbase + (size_t)t * kvd);
+            float st = s[t];
+            ax += st * v.x, ay += st * v.y, az += st * v.z, aw += st * v.w;
         }
-        out[h * head_dim + d] = acc * inv;
+        *(float4 *)(out + h * head_dim + 4 * d4) =
+            make_float4(ax * inv, ay * inv, az * inv, aw * inv);
     }
 }
 
@@ -735,7 +741,7 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
                                     const float *ks, const float *vs,
                                     int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
-    __shared__ float red[128];
+    __shared__ float red[32];
     int h = blockIdx.x;
     int tid = threadIdx.x;
     int kvd = n_kv_head * head_dim;
@@ -757,36 +763,26 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
         s[t] = dot * ks[t * n_kv_head + kvh] * scale;
         m = fmaxf(m, s[t]);
     }
-    red[tid] = m;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] = fmaxf(red[tid], red[tid + k]);
-        __syncthreads();
-    }
-    m = red[0];
-    __syncthreads();
+    m = block_max(m, red);
 
     float l = 0.0f;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
         s[t] = __expf(s[t] - m);
         l += s[t];
     }
-    red[tid] = l;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) red[tid] += red[tid + k];
-        __syncthreads();
-    }
-    float inv = 1.0f / red[0];
-    __syncthreads();
+    float inv = 1.0f / block_sum(l, red);
 
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
+    for (int d4 = tid; d4 < head_dim / 4; d4 += blockDim.x) {
+        const signed char *vbase = vq + kvh * head_dim + 4 * d4;
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
         for (int t = 0; t <= t_cur; ++t) {
-            acc += s[t] * vs[t * n_kv_head + kvh] *
-                   (float)vq[(size_t)t * kvd + kvh * head_dim + d];
+            char4 v = *(const char4 *)(vbase + (size_t)t * kvd);
+            float st = s[t] * vs[t * n_kv_head + kvh];
+            ax += st * (float)v.x, ay += st * (float)v.y;
+            az += st * (float)v.z, aw += st * (float)v.w;
         }
-        out[h * head_dim + d] = acc * inv;
+        *(float4 *)(out + h * head_dim + 4 * d4) =
+            make_float4(ax * inv, ay * inv, az * inv, aw * inv);
     }
 }
 
@@ -1547,10 +1543,45 @@ extern "C" __global__ void attn_prefill_q8(float *out, const float *qkv,
                             pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
 }
 
+// Block-wide (value, index) argmax with ties to the lowest index: one warp
+// shuffle sweep, a 32-slot bounce, one more sweep in warp 0. Result is valid
+// in thread 0 only.
+__device__ __forceinline__ void block_argmax(float &best, int &best_i,
+                                             float *vals, int *idxs) {
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_down_sync(0xFFFFFFFFu, best, o);
+        int oi = __shfl_down_sync(0xFFFFFFFFu, best_i, o);
+        if (ov > best || (ov == best && oi < best_i)) {
+            best = ov;
+            best_i = oi;
+        }
+    }
+    if (lane == 0) {
+        vals[w] = best;
+        idxs[w] = best_i;
+    }
+    __syncthreads();
+    if (w == 0) {
+        best = (lane < nw) ? vals[lane] : -CUDART_INF_F;
+        best_i = (lane < nw) ? idxs[lane] : 0x7FFFFFFF;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_down_sync(0xFFFFFFFFu, best, o);
+            int oi = __shfl_down_sync(0xFFFFFFFFu, best_i, o);
+            if (ov > best || (ov == best && oi < best_i)) {
+                best = ov;
+                best_i = oi;
+            }
+        }
+    }
+}
+
 // Per-row greedy argmax for the speculative verify step (one block per row).
 extern "C" __global__ void argmax_rows(int *out, const float *logits, int n_vocab) {
-    __shared__ float vals[256];
-    __shared__ int idxs[256];
+    __shared__ float vals[32];
+    __shared__ int idxs[32];
     const float *row = logits + (size_t)blockIdx.x * n_vocab;
     int tid = threadIdx.x;
     float best = -CUDART_INF_F;
@@ -1562,21 +1593,8 @@ extern "C" __global__ void argmax_rows(int *out, const float *logits, int n_voca
             best_i = i;
         }
     }
-    vals[tid] = best;
-    idxs[tid] = best_i;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) {
-            float other = vals[tid + k];
-            int other_i = idxs[tid + k];
-            if (other > vals[tid] || (other == vals[tid] && other_i < idxs[tid])) {
-                vals[tid] = other;
-                idxs[tid] = other_i;
-            }
-        }
-        __syncthreads();
-    }
-    if (tid == 0) out[blockIdx.x] = idxs[0];
+    block_argmax(best, best_i, vals, idxs);
+    if (tid == 0) out[blockIdx.x] = best_i;
 }
 
 extern "C" __global__ void copy_row(float *dst, const float *src, int row, int cols) {
@@ -1599,8 +1617,8 @@ extern "C" __global__ void gelu_inplace(float *x, int n) {
 
 extern "C" __global__ void argmax_advance(int *tok_ptr, int *pos_ptr,
                                           const float *logits, int n_vocab) {
-    __shared__ float vals[256];
-    __shared__ int idxs[256];
+    __shared__ float vals[32];
+    __shared__ int idxs[32];
     int tid = threadIdx.x;
     float best = -CUDART_INF_F;
     int best_i = 0;
@@ -1611,22 +1629,9 @@ extern "C" __global__ void argmax_advance(int *tok_ptr, int *pos_ptr,
             best_i = i;
         }
     }
-    vals[tid] = best;
-    idxs[tid] = best_i;
-    __syncthreads();
-    for (int k = blockDim.x / 2; k > 0; k >>= 1) {
-        if (tid < k) {
-            float other = vals[tid + k];
-            int other_i = idxs[tid + k];
-            if (other > vals[tid] || (other == vals[tid] && other_i < idxs[tid])) {
-                vals[tid] = other;
-                idxs[tid] = other_i;
-            }
-        }
-        __syncthreads();
-    }
+    block_argmax(best, best_i, vals, idxs);
     if (tid == 0) {
-        *tok_ptr = idxs[0];
+        *tok_ptr = best_i;
         *pos_ptr += 1;
     }
 }

@@ -329,8 +329,10 @@ fn gemv(
     b: &CudaSlice<f32>,
     n_in: usize,
     n_out: usize,
+    accum: bool,
 ) {
     let (ni, no) = (n_in as i32, n_out as i32);
+    let acc = accum as i32;
     // fp32/fp16 stage x as floats; int8 quantizes x in-kernel into packed
     // int32 plus one scale per 8-value group (AG in llm.cu)
     // int8/int4 quantize x in-kernel: packed words + per-group scales
@@ -348,22 +350,36 @@ fn gemv(
     match w {
         Weights::F32(w) => {
             let mut lb = stream.launch_builder(&k.gemv);
-            lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no);
+            lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no).arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::F16(w) => {
             let mut lb = stream.launch_builder(&k.gemv_half);
-            lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no);
+            lb.arg(y).arg(x).arg(w).arg(b).arg(&ni).arg(&no).arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int8 { q, scales } => {
             let mut lb = stream.launch_builder(&k.gemv_int8);
-            lb.arg(y).arg(x).arg(q).arg(scales).arg(b).arg(&ni).arg(&no);
+            lb.arg(y)
+                .arg(x)
+                .arg(q)
+                .arg(scales)
+                .arg(b)
+                .arg(&ni)
+                .arg(&no)
+                .arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int4 { q, scales } => {
             let mut lb = stream.launch_builder(&k.gemv_int4);
-            lb.arg(y).arg(x).arg(q).arg(scales).arg(b).arg(&ni).arg(&no);
+            lb.arg(y)
+                .arg(x)
+                .arg(q)
+                .arg(scales)
+                .arg(b)
+                .arg(&ni)
+                .arg(&no)
+                .arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
     }
@@ -938,6 +954,7 @@ impl Engine {
                 &layer.qkv_b,
                 e,
                 qkvd,
+                false,
             );
 
             let (t_i, nh_i, nkv_i, hd_i) = (pos as i32, nh as i32, nkv as i32, hd as i32);
@@ -1017,17 +1034,19 @@ impl Engine {
                 }
             }
 
+            // residual add fused into the projection epilogue: one launch
+            // and no xb round-trip
             gemv(
                 &self.stream,
                 &self.k,
-                &mut self.xb,
+                &mut self.x,
                 &self.attn,
                 &layer.proj_w,
                 &layer.proj_b,
                 qd,
                 e,
+                true,
             );
-            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
 
             norm(
                 &self.stream,
@@ -1048,6 +1067,7 @@ impl Engine {
                 layer.fc_b.as_ref().unwrap_or(&self.zero_bias),
                 e,
                 inter,
+                false,
             );
             let n_i = inter as i32;
             match &layer.up_w {
@@ -1066,6 +1086,7 @@ impl Engine {
                         &self.zero_bias,
                         e,
                         inter,
+                        false,
                     );
                     let mut lb = self.stream.launch_builder(&self.k.silu_mul);
                     lb.arg(&mut self.h).arg(&self.h2).arg(&n_i);
@@ -1075,14 +1096,14 @@ impl Engine {
             gemv(
                 &self.stream,
                 &self.k,
-                &mut self.xb,
+                &mut self.x,
                 &self.h,
                 &layer.fc2_w,
                 layer.fc2_b.as_ref().unwrap_or(&self.zero_bias),
                 inter,
                 e,
+                true,
             );
-            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
         }
 
         norm(
@@ -1104,6 +1125,7 @@ impl Engine {
             &self.zero_bias,
             e,
             c.n_vocab,
+            false,
         );
     }
 
@@ -1135,6 +1157,7 @@ impl Engine {
                 &layer.qkv_b,
                 e,
                 qkvd,
+                false,
             );
 
             let (nh_i, nkv_i, hd_i) = (nh as i32, nkv as i32, hd as i32);
@@ -1211,17 +1234,19 @@ impl Engine {
                 }
             }
 
+            // residual add fused into the projection epilogue: one launch
+            // and no xb round-trip
             gemv(
                 &self.stream,
                 &self.k,
-                &mut self.xb,
+                &mut self.x,
                 &self.attn,
                 &layer.proj_w,
                 &layer.proj_b,
                 qd,
                 e,
+                true,
             );
-            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
 
             norm(
                 &self.stream,
@@ -1242,6 +1267,7 @@ impl Engine {
                 layer.fc_b.as_ref().unwrap_or(&self.zero_bias),
                 e,
                 inter,
+                false,
             );
             let n_i = inter as i32;
             match &layer.up_w {
@@ -1260,6 +1286,7 @@ impl Engine {
                         &self.zero_bias,
                         e,
                         inter,
+                        false,
                     );
                     let mut lb = self.stream.launch_builder(&self.k.silu_mul);
                     lb.arg(&mut self.h).arg(&self.h2).arg(&n_i);
@@ -1269,14 +1296,14 @@ impl Engine {
             gemv(
                 &self.stream,
                 &self.k,
-                &mut self.xb,
+                &mut self.x,
                 &self.h,
                 &layer.fc2_w,
                 layer.fc2_b.as_ref().unwrap_or(&self.zero_bias),
                 inter,
                 e,
+                true,
             );
-            add(&self.stream, &self.k.add_inplace, &mut self.x, &self.xb, e);
         }
 
         norm(
@@ -1298,6 +1325,7 @@ impl Engine {
             &self.zero_bias,
             e,
             c.n_vocab,
+            false,
         );
     }
 
@@ -1646,6 +1674,7 @@ impl Engine {
             &self.zero_bias,
             e,
             c.n_vocab,
+            false,
         );
         self.stream.clone_dtoh(&self.logits).unwrap()
     }
