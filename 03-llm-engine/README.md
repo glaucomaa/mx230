@@ -106,9 +106,16 @@ Benchmark command (build `ac4cdde`):
 | TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **441.7 tok/s** (`pp512`) | 31.2 tok/s (`tg128`) |
 | TinyLlama-1.1B | ours | int4 weights, ~619 MB | 79.3 tok/s (`512 / 6.453s`) | **31.3 tok/s** |
 
-This is the honest split. llama.cpp is much faster on prefill everywhere: its
-prompt path is a mature batched graph over GGML kernels, while this engine's
-batch prefill is a first-pass GEMM/attention path. GPT-2 decode also goes to
+This is the honest split. llama.cpp is much faster on prefill everywhere,
+and the gap is structural, not just polish. Prefill is compute-bound, and
+(1) this engine's GEMM is a deliberately mid-ladder kernel — 64x64 tiles,
+4x4 micro-tile, no double buffering — landing at ~230-280 effective GFLOPS
+of the 941 fp32 peak, where stage 1 showed 500+ is reachable; and
+(2) llama.cpp's MMQ kernels never dequantize at all: they multiply in
+integers via `dp4a` (4 int8 MACs per instruction, and sm_61 has it), so
+their quantized GEMM ceiling is ~4x the fp32 one this engine's
+dequantize-then-FMA design accepts. Decode hides both effects because it is
+bandwidth-bound — which is exactly why the decode columns are even. GPT-2 decode also goes to
 llama.cpp (144.5 vs 130.0 tok/s). Decode on the two RoPE models goes the
 other way: the custom int8 path is 16% faster on Qwen and 31% faster on
 TinyLlama (28.9 vs 22.0 tok/s), because the hot loop is narrower and
@@ -131,7 +138,11 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   and never copies logits back. Measured gain is only **~1% in every mode** —
   a negative result worth having: kernel launches are asynchronous, the host
   enqueues ~115 launches/token faster than the GPU drains them, so the GPU
-  never goes idle and there is no launch overhead to remove.
+  never goes idle and there is no launch overhead to remove. One exception
+  appeared later: GPT-2 int4 moves only ~70 MB/step, and at that weight the
+  previously invisible costs finally peek out — graphs alone add +2.4%
+  (212.2 → 217.3 tok/s), and graphs + int8 KV reach 226.9 (+7% total). The
+  lighter the bytes, the more everything else matters.
 - **Batch prefill replaces token-by-token GEMV with GEMM + flash-style causal
   attention.** A 512-token prompt now runs as tiled matmuls over the whole
   prompt and a GQA-aware online-softmax attention pass over the KV cache.
@@ -201,7 +212,8 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   hit before `char4`, one level deeper. Unlike int8, the group scale can't
   be folded into the final accumulator (it changes every 32 rows), so the
   GEMM path dequantizes during the shared-tile fill — which is also why
-  int4 prefill (6.5s/512) trails int8 (4.8s/512).
+  int4 prefill trails int8 on every model (TinyLlama 6.5s vs 4.8s,
+  GPT-2 0.62s vs 0.47s for 512 tokens).
 - **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
   absmax scale per (position, head) and dequantized inside the attention
   kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
