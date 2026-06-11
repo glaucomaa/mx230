@@ -83,8 +83,11 @@ Models:
   `gpt2-q8_0.gguf` (GPT-2 base, Q8_0, 167.75 MiB).
 - [`neopolita/qwen2.5-0.5b-gguf`](https://huggingface.co/neopolita/qwen2.5-0.5b-gguf),
   `qwen2.5-0.5b_q8_0.gguf` (Qwen2.5-0.5B base, Q8_0, 500.79 MiB).
+- [`TheBloke/TinyLlama-1.1B-intermediate-step-1431k-3T-GGUF`](https://huggingface.co/TheBloke/TinyLlama-1.1B-intermediate-step-1431k-3T-GGUF),
+  Q4_0 (606.53 MiB) and Q8_0 (1.09 GiB) — the same base checkpoint this
+  engine runs.
 
-Benchmark command:
+Benchmark command (build `ac4cdde`):
 
 ```
 /tmp/llama.cpp/build-sm61-nofa/bin/llama-bench \
@@ -94,18 +97,25 @@ Benchmark command:
 
 | model | engine | model storage | prefill / prompt processing | greedy decode |
 |-------|--------|---------------|-----------------------------|---------------|
-| GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2740.5 tok/s** (`pp512`) | **142.4 tok/s** (`tg128`) |
+| GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2756.1 tok/s** (`pp512`) | **144.5 tok/s** (`tg128`) |
 | GPT-2 | ours | int8 weights, ~124 MiB | 1080.2 tok/s (`512 / 0.474s`) | 130.0 tok/s |
-| Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **872.5 tok/s** (`pp512`) | 45.4 tok/s (`tg128`) |
+| Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **871.2 tok/s** (`pp512`) | 45.5 tok/s (`tg128`) |
 | Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 274.4 tok/s (`512 / 1.866s`) | **52.5 tok/s** |
+| TinyLlama-1.1B | llama.cpp CUDA | Q8_0 GGUF, 1.09 GiB | **384.9 tok/s** (`pp512`) | 22.0 tok/s (`tg128`) |
+| TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | 106.2 tok/s (`512 / 4.821s`) | **28.9 tok/s** |
+| TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **441.7 tok/s** (`pp512`) | 31.2 tok/s (`tg128`) |
+| TinyLlama-1.1B | ours | int4 weights, ~619 MB | 79.3 tok/s (`512 / 6.453s`) | **31.3 tok/s** |
 
-This is the honest split. llama.cpp is much faster on prefill: its prompt path
-is a mature batched graph over GGML kernels, while this engine's batch prefill
-is a first-pass GEMM/attention path. GPT-2 decode also goes to llama.cpp
-(142.4 vs 130.0 tok/s). Qwen decode goes the other way: the custom int8 path
-is 16% faster than llama.cpp on this MX230 because the hot loop is narrower and
+This is the honest split. llama.cpp is much faster on prefill everywhere: its
+prompt path is a mature batched graph over GGML kernels, while this engine's
+batch prefill is a first-pass GEMM/attention path. GPT-2 decode also goes to
+llama.cpp (144.5 vs 130.0 tok/s). Decode on the two RoPE models goes the
+other way: the custom int8 path is 16% faster on Qwen and 31% faster on
+TinyLlama (28.9 vs 22.0 tok/s), because the hot loop is narrower and
 specialized for one architecture/layout instead of the full GGML execution
-model.
+model. At 4 bits the engines converge: 31.3 vs 31.2 tok/s on TinyLlama —
+both GEMV paths hit the same nibble-unpack instruction wall well short of
+the bus, and matching mature Q4_0 kernels exactly is a result in itself.
 
 ## What the numbers say
 
