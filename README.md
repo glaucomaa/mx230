@@ -11,15 +11,16 @@ up in the numbers:
 - **`03-llm-engine/`** — GPT-2 124M, Qwen2.5-0.5B and TinyLlama-1.1B
   inference in plain CUDA: own weight format, two from-scratch tokenizers
   (byte-level BPE and SentencePiece BPE), KV cache (fp32 or int8,
-  quantize-on-write), fp16 storage, int8/int4 quantization with `dp4a`
-  integer math (W8A8/W4A8, activations quantized on the fly — sm_61's 4x
-  int8 escape hatch from its missing tensor cores), GQA, RoPE, SwiGLU,
-  CUDA Graph decode, prompt-lookup speculative decode, WikiText-2
-  perplexity harness — GPT-2: **79 tok/s fp32 (bus saturated), 117 tok/s
-  fp16, 266 tok/s int8, 371 tok/s int4** vs 45 tok/s PyTorch CPU;
-  Qwen2.5: **74 tok/s int8, 104 int4**; TinyLlama-1.1B: **62 tok/s int4**
+  quantize-on-write), fp16 storage, int8/int4/int3/int2 quantization with
+  `dp4a` integer math (activations quantized on the fly — sm_61's 4x int8
+  escape hatch from its missing tensor cores), GQA, RoPE, SwiGLU, CUDA
+  Graph decode, prompt-lookup speculative decode, WikiText-2 perplexity
+  harness — GPT-2: **79 tok/s fp32 (bus saturated), 117 fp16, 266 int8,
+  371 int4** vs 45 tok/s PyTorch CPU; Qwen2.5: **74 int8, 104 int4**;
+  TinyLlama-1.1B: **62 tok/s int4 / 77 int3** over its full 2048 window
   on a card its fp16 weights alone wouldn't fit into (and PyTorch GPU has
-  no sm_61 kernels at all)
+  no sm_61 kernels at all). Prefill beats llama.cpp on Qwen/TinyLlama
+  Q8_0, decode beats it everywhere
 
 Kernels: CUDA C → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks: Rust.
 Each stage's README has tables and the how/why.
