@@ -678,7 +678,7 @@ extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
 __device__ void attn_decode_impl(float *out, const float *qkv,
                                  const float *kcache, const float *vcache,
                                  int t_cur, int n_head, int n_kv_head, int head_dim) {
-    __shared__ float s[1024]; // n_ctx max
+    __shared__ float s[2048]; // n_ctx max (8 KB of the 48 KB block budget)
     __shared__ float red[32];
     int h = blockIdx.x;
     int tid = threadIdx.x;
@@ -743,7 +743,7 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
                                     const signed char *kq, const signed char *vq,
                                     const float *ks, const float *vs,
                                     int t_cur, int n_head, int n_kv_head, int head_dim) {
-    __shared__ float s[1024]; // n_ctx max
+    __shared__ float s[2048]; // n_ctx max (8 KB of the 48 KB block budget)
     __shared__ float red[32];
     __shared__ int qq[32]; // q quantized to int8: head_dim/4 packed words
     int h = blockIdx.x;

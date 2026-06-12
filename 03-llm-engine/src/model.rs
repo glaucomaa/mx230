@@ -73,7 +73,9 @@ impl Config {
         }
     }
 
-    /// TinyLlama-1.1B (3T base checkpoint); n_ctx capped at 1024 like Qwen.
+    /// TinyLlama-1.1B (3T base checkpoint); n_ctx 2048 — the model's full
+    /// trained window. RoPE, so no positional tensor caps it; the KV cache
+    /// costs 92 MB fp32 / 23 MB int8 across 22 layers.
     pub fn tinyllama_11b() -> Self {
         Config {
             arch: Arch::Llama,
@@ -83,7 +85,7 @@ impl Config {
             head_dim: 64,
             n_embd: 2048,
             n_inter: 5632,
-            n_ctx: 1024,
+            n_ctx: 2048,
             n_vocab: 32000,
             rope_theta: 1e4,
             norm_eps: 1e-5,
@@ -233,7 +235,7 @@ impl Model {
             2 => Arch::Llama,
             a => panic!("unknown arch tag {a}"),
         };
-        let config = Config {
+        let mut config = Config {
             arch,
             n_layer: r.u32() as usize,
             n_head: r.u32() as usize,
@@ -246,6 +248,13 @@ impl Model {
             rope_theta: r.f32(),
             norm_eps: r.f32(),
         };
+        // For RoPE archs no tensor depends on n_ctx — the header value is
+        // just the KV window the exporter assumed. TinyLlama's trained
+        // window is 2048; honor it even for model.bin exported before the
+        // bump (the decode kernels reserve smem scores for 2048).
+        if arch == Arch::Llama {
+            config.n_ctx = 2048;
+        }
         let (e, inter) = (config.n_embd, config.n_inter);
         let (qd, qkvd) = (config.q_dim(), config.qkv_dim());
         let wte = r.tensor(config.n_vocab * e);
