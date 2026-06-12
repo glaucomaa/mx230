@@ -50,31 +50,42 @@ pub fn compile_kernels() {
             continue;
         }
         let ptx = out_dir.join(cu.file_stem().unwrap()).with_extension("ptx");
+        run_nvcc(&nvcc, &cu, &ptx, &[]);
+    }
+}
 
-        let Some(nvcc) = &nvcc else {
-            fs::write(&ptx, "").unwrap();
-            continue;
-        };
+/// Compiles one .cu into OUT_DIR/<out_name>.ptx with extra nvcc defines —
+/// for kernels parameterized at compile time (e.g. -DAG=8).
+pub fn compile_kernel_variant(cu: &str, out_name: &str, defines: &[&str]) {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let ptx = out_dir.join(out_name).with_extension("ptx");
+    run_nvcc(&find_nvcc(), Path::new(cu), &ptx, defines);
+}
 
-        let mut cmd = Command::new(nvcc);
-        cmd.args(["-ptx", "-O3", "-arch", ARCH, "-lineinfo", "-Wno-deprecated-gpu-targets"])
-            .arg(&cu)
-            .arg("-o")
-            .arg(&ptx);
-        // nvcc 12.x rejects the system gcc 16 headers — use g++-14 from the gcc14 package
-        for ccbin in ["/usr/bin/g++-14", "/usr/bin/g++-13"] {
-            if Path::new(ccbin).exists() {
-                cmd.arg("-ccbin").arg(ccbin);
-                break;
-            }
+fn run_nvcc(nvcc: &Option<PathBuf>, cu: &Path, ptx: &Path, defines: &[&str]) {
+    let Some(nvcc) = nvcc else {
+        fs::write(ptx, "").unwrap();
+        return;
+    };
+    let mut cmd = Command::new(nvcc);
+    cmd.args(["-ptx", "-O3", "-arch", ARCH, "-lineinfo", "-Wno-deprecated-gpu-targets"])
+        .args(defines)
+        .arg(cu)
+        .arg("-o")
+        .arg(ptx);
+    // nvcc 12.x rejects the system gcc 16 headers — use g++-14 from the gcc14 package
+    for ccbin in ["/usr/bin/g++-14", "/usr/bin/g++-13"] {
+        if Path::new(ccbin).exists() {
+            cmd.arg("-ccbin").arg(ccbin);
+            break;
         }
-        let out = cmd.output().expect("failed to run nvcc");
-        if !out.status.success() {
-            panic!(
-                "nvcc failed on {}:\n{}",
-                cu.display(),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+    }
+    let out = cmd.output().expect("failed to run nvcc");
+    if !out.status.success() {
+        panic!(
+            "nvcc failed on {}:\n{}",
+            cu.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -187,11 +187,14 @@ extern "C" __global__ void gemv_half(float *y, const float *x, const __half *w,
 // consecutive n_in rows: w32[(i/4)*n_out + o] holds w[i..i+3, o] —
 // consecutive columns stay consecutive in memory, coalescing unchanged.
 
-// Activation groups are 8 values (2 dp4a words): GPT-2's activation
-// outliers wreck a 32-wide absmax group (one outlier costs 31 neighbours
-// their precision, ppl 25.6 -> 26.3); at 8 the damage is contained and ppl
-// recovers, while the float work is still one scale per two dp4a.
+// Activation-group width is a compile-time knob (build.rs compiles this
+// file twice): GPT-2's activation outliers wreck wide absmax groups (a
+// 32-wide group costs ppl 25.6 -> 26.3), so it runs AG=4 — one scale per
+// dp4a word, zero ppl cost. The RoPE models have no such outliers and run
+// the AG=8 variant, halving the scale-FMAs in the dp4a GEMMs.
+#ifndef AG
 #define AG 4
+#endif
 
 // One thread per AG-value group of a row-major activation block: absmax
 // scale, AG/4 packed int32 words, and the group sum (the int4 path
@@ -1085,29 +1088,34 @@ extern "C" __global__ void gemm_int8(float *C, const int *Aq, const float *ascal
 extern "C" __global__ void gemm_int8_wide(float *C, const int *Aq, const float *ascale,
                                           const int *B32, const float *wscale,
                                           const float *bias, int M, int N, int K) {
-    static_assert(AG == 4, "wide int tiles assume one activation scale per word");
+    constexpr int WG = AG / 4; // dp4a words per activation-scale group
+    constexpr int SC = 4 / WG; // scale loads per staging thread (4 words)
     __shared__ int As[2][8][128];
-    __shared__ float Ss[2][8][128];
+    __shared__ float Ss[2][8 / WG][128];
     __shared__ int Bs[2][8][128];
     int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
     int tid = threadIdx.x;
-    int arow = tid >> 1, acol = (tid & 1) * 4;  // A/Ss: one int4/float4 each
+    int arow = tid >> 1, acol = (tid & 1) * 4;  // A: one int4 each
     int brow = tid >> 5, bcol = (tid & 31) * 4; // B: one 4-vec each
     int trow = tid >> 4, tcol = tid & 15;
     int kq = K / 4;
     bool vec = (N % 4 == 0) && (bn + 128 <= N);
     float facc[8][8] = {};
     int a4[4], b4[4];
-    float s4[4];
+    float sg[SC];
 
     auto stage = [&](int kw0) {
         if (bm + arow < M) {
             *reinterpret_cast<int4 *>(a4) =
                 *reinterpret_cast<const int4 *>(&Aq[(size_t)(bm + arow) * kq + kw0 + acol]);
-            *reinterpret_cast<float4 *>(s4) = *reinterpret_cast<const float4 *>(
-                &ascale[(size_t)(bm + arow) * kq + kw0 + acol]);
+#pragma unroll
+            for (int j = 0; j < SC; ++j)
+                sg[j] = ascale[(size_t)(bm + arow) * (kq / WG) + (kw0 + acol) / WG + j];
         } else {
-            for (int j = 0; j < 4; ++j) a4[j] = 0, s4[j] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) a4[j] = 0;
+#pragma unroll
+            for (int j = 0; j < SC; ++j) sg[j] = 0.0f;
         }
         if (vec) {
             *reinterpret_cast<int4 *>(b4) =
@@ -1120,10 +1128,9 @@ extern "C" __global__ void gemm_int8_wide(float *C, const int *Aq, const float *
     };
     auto store = [&](int buf) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            As[buf][acol + j][arow] = a4[j];
-            Ss[buf][acol + j][arow] = s4[j];
-        }
+        for (int j = 0; j < 4; ++j) As[buf][acol + j][arow] = a4[j];
+#pragma unroll
+        for (int j = 0; j < SC; ++j) Ss[buf][acol / WG + j][arow] = sg[j];
         *reinterpret_cast<int4 *>(&Bs[buf][brow][bcol]) = *reinterpret_cast<int4 *>(b4);
     };
 
@@ -1133,21 +1140,27 @@ extern "C" __global__ void gemm_int8_wide(float *C, const int *Aq, const float *
     int buf = 0;
     for (int kw0 = 0; kw0 < kq; kw0 += 8) {
         if (kw0 + 8 < kq) stage(kw0 + 8);
-        for (int w = 0; w < 8; ++w) {
-            int rm[8], rn[8];
+        for (int g = 0; g < 8 / WG; ++g) {
+            int rm[WG][8], rn[WG][8];
             float rs[8];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                rm[i] = As[buf][w][trow * 8 + i];
-                rs[i] = Ss[buf][w][trow * 8 + i];
-            }
+            for (int i = 0; i < 8; ++i) rs[i] = Ss[buf][g][trow * 8 + i];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) rn[j] = Bs[buf][w][tcol * 8 + j];
+            for (int w = 0; w < WG; ++w) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) rm[w][i] = As[buf][g * WG + w][trow * 8 + i];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) rn[w][j] = Bs[buf][g * WG + w][tcol * 8 + j];
+            }
 #pragma unroll
             for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int j = 0; j < 8; ++j)
-                    facc[i][j] += (float)__dp4a(rm[i], rn[j], 0) * rs[i];
+                for (int j = 0; j < 8; ++j) {
+                    int acc = 0;
+#pragma unroll
+                    for (int w = 0; w < WG; ++w) acc = __dp4a(rm[w][i], rn[w][j], acc);
+                    facc[i][j] += (float)acc * rs[i];
+                }
         }
         if (kw0 + 8 < kq) store(buf ^ 1);
         __syncthreads();
@@ -1425,30 +1438,33 @@ extern "C" __global__ void gemm_int4(float *C, const int *Aq, const float *ascal
 extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *ascale,
                                           const int *B32, const __half *wscale,
                                           const float *bias, int M, int N, int K) {
-    static_assert(AG == 4, "wide int tiles assume one activation scale per word");
+    constexpr int WG = AG / 4; // dp4a words per activation-scale group
+    constexpr int SC = WG == 1 ? 2 : 1; // scale loads per staging thread
     __shared__ int As[2][8][64];
-    __shared__ float Ss[2][8][64];
+    __shared__ float Ss[2][8 / WG][64];
     __shared__ int Bs[2][8][128];
     __shared__ float Sw[2][128];
     int bm = blockIdx.y * 64, bn = blockIdx.x * 128;
     int tid = threadIdx.x;
-    int arow = tid >> 2, acol = (tid & 3) * 2; // A/Ss: one int2/float2 each
+    int arow = tid >> 2, acol = (tid & 3) * 2; // A: one int2 each
     int pwr = tid >> 7, pn = tid & 127;        // B: packed words pwr and pwr+2
     int trow = tid >> 4, tcol = tid & 15;
     int kq = K / 4, kw = K / 8;
     float facc[4][8] = {};
     int a2[2], pb[2];
-    float s2[2], swv;
+    float sg[SC], swv;
 
     auto stage = [&](int k0) {
         if (bm + arow < M) {
             *reinterpret_cast<int2 *>(a2) = *reinterpret_cast<const int2 *>(
                 &Aq[(size_t)(bm + arow) * kq + k0 / 4 + acol]);
-            *reinterpret_cast<float2 *>(s2) = *reinterpret_cast<const float2 *>(
-                &ascale[(size_t)(bm + arow) * kq + k0 / 4 + acol]);
+#pragma unroll
+            for (int j = 0; j < SC; ++j)
+                sg[j] = ascale[(size_t)(bm + arow) * (kq / WG) + (k0 / 4 + acol) / WG + j];
         } else {
             a2[0] = a2[1] = 0;
-            s2[0] = s2[1] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < SC; ++j) sg[j] = 0.0f;
         }
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -1465,8 +1481,8 @@ extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *
     auto store = [&](int buf) {
         As[buf][acol + 0][arow] = a2[0];
         As[buf][acol + 1][arow] = a2[1];
-        Ss[buf][acol + 0][arow] = s2[0];
-        Ss[buf][acol + 1][arow] = s2[1];
+#pragma unroll
+        for (int j = 0; j < SC; ++j) Ss[buf][acol / WG + j][arow] = sg[j];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             int wr = pwr + 2 * r;
@@ -1483,21 +1499,27 @@ extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *
     for (int k0 = 0; k0 < K; k0 += 32) {
         if (k0 + 32 < K) stage(k0 + 32);
         float tacc[4][8] = {};
-        for (int w = 0; w < 8; ++w) {
-            int rm[4], rn[8];
+        for (int g = 0; g < 8 / WG; ++g) {
+            int rm[WG][4], rn[WG][8];
             float rs[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                rm[i] = As[buf][w][trow * 4 + i];
-                rs[i] = Ss[buf][w][trow * 4 + i];
-            }
+            for (int i = 0; i < 4; ++i) rs[i] = Ss[buf][g][trow * 4 + i];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) rn[j] = Bs[buf][w][tcol * 8 + j];
+            for (int w = 0; w < WG; ++w) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) rm[w][i] = As[buf][g * WG + w][trow * 4 + i];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) rn[w][j] = Bs[buf][g * WG + w][tcol * 8 + j];
+            }
 #pragma unroll
             for (int i = 0; i < 4; ++i)
 #pragma unroll
-                for (int j = 0; j < 8; ++j)
-                    tacc[i][j] += (float)__dp4a(rm[i], rn[j], 0) * rs[i];
+                for (int j = 0; j < 8; ++j) {
+                    int acc = 0;
+#pragma unroll
+                    for (int w = 0; w < WG; ++w) acc = __dp4a(rm[w][i], rn[w][j], acc);
+                    tacc[i][j] += (float)acc * rs[i];
+                }
         }
 #pragma unroll
         for (int i = 0; i < 4; ++i)
@@ -1569,7 +1591,8 @@ extern "C" __global__ void gemm_rows_int4(float *C, const int *Aq, const float *
 #pragma unroll
                     for (int m = 0; m < ROWS_M; ++m) {
                         int a0 = As[m][qa], a1 = As[m][qb];
-                        float s0 = Ss[m][qa], s1 = Ss[m][qb];
+                        // Ss is per AG-group, not per word
+                        float s0 = Ss[m][qa / (AG / 4)], s1 = Ss[m][qb / (AG / 4)];
                         gacc[m][0] += s0 * (float)__dp4a(blo[0], a0, 0) +
                                       s1 * (float)__dp4a(bhi[0], a1, 0);
                         gacc[m][1] += s0 * (float)__dp4a(blo[1], a0, 0) +
@@ -1602,8 +1625,9 @@ extern "C" __global__ void gemm_rows_int4(float *C, const int *Aq, const float *
                     int qa = (wg * 32) / 4 + 2 * r, qb = qa + 1;
 #pragma unroll
                     for (int m = 0; m < ROWS_M; ++m) {
-                        gacc[m] += Ss[m][qa] * (float)__dp4a(blo, As[m][qa], 0) +
-                                   Ss[m][qb] * (float)__dp4a(bhi, As[m][qb], 0);
+                        gacc[m] +=
+                            Ss[m][qa / (AG / 4)] * (float)__dp4a(blo, As[m][qa], 0) +
+                            Ss[m][qb / (AG / 4)] * (float)__dp4a(bhi, As[m][qb], 0);
                     }
                 }
                 int gw = (k0 + wg * 32) / Q4_GROUP;

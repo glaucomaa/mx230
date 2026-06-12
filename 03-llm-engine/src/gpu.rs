@@ -14,6 +14,7 @@ use half::f16;
 use crate::model::{Arch, Config, Model};
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
+const LLM_AG8_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm_ag8.ptx"));
 const MAX_SPEC_TOKENS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,8 +64,17 @@ impl WeightMode {
 }
 
 const Q4_GROUP: usize = 32;
-/// Activation-quantization group size; must match `AG` in llm.cu.
-const ACT_GROUP: usize = 4;
+
+/// Activation-quantization group size; must match `AG` of the kernel module
+/// the engine loads. GPT-2 needs 4-wide groups (activation outliers wreck
+/// wider absmax groups); the RoPE models run the AG=8 module and pay half
+/// the scale-FMAs in the dp4a GEMMs.
+fn act_group(arch: Arch) -> usize {
+    match arch {
+        Arch::Gpt2 => 4,
+        Arch::Qwen2 | Arch::Llama => 8,
+    }
+}
 
 /// Approximate weight footprint on device for a given storage mode.
 pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
@@ -206,6 +216,8 @@ struct LayerG {
 }
 
 struct Kernels {
+    /// activation-group width of the loaded module (AG in llm.cu)
+    ag: usize,
     embed: CudaFunction,
     embed_half: CudaFunction,
     embed_int8: CudaFunction,
@@ -340,7 +352,7 @@ fn gemv(
     // int8/int4 quantize x in-kernel: packed words + per-group scales
     // (+ group sums and per-32 correction sums for int4's nibble bias)
     let smem = match w {
-        Weights::Int8 { .. } => n_in + n_in / ACT_GROUP * 4,
+        Weights::Int8 { .. } => n_in + n_in / k.ag * 4,
         Weights::Int4 { .. } => 3 * n_in + n_in / 8,
         _ => n_in * 4,
     };
@@ -473,7 +485,7 @@ fn gemm(
         }
         Weights::Int8 { q, scales } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
-            let groups = (m * kk / ACT_GROUP) as i32;
+            let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
                 .arg(&mut act.scale)
@@ -502,7 +514,7 @@ fn gemm(
         }
         Weights::Int4 { q, scales } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
-            let groups = (m * kk / ACT_GROUP) as i32;
+            let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
                 .arg(&mut act.scale)
@@ -631,9 +643,15 @@ impl Engine {
         // external event dependencies.
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream().unwrap();
-        let module = common::load_ptx(ctx, "llm", LLM_PTX).unwrap();
+        let ag = act_group(c.arch);
+        let module = if ag == 8 {
+            common::load_ptx(ctx, "llm_ag8", LLM_AG8_PTX).unwrap()
+        } else {
+            common::load_ptx(ctx, "llm", LLM_PTX).unwrap()
+        };
         let f = |name: &str| module.load_function(name).unwrap();
         let k = Kernels {
+            ag,
             embed: f("embed"),
             embed_half: f("embed_half"),
             embed_int8: f("embed_int8"),
@@ -821,11 +839,11 @@ impl Engine {
             batch_logits: stream.alloc_zeros(MAX_SPEC_TOKENS * v).unwrap(),
             batch_argmax: stream.alloc_zeros(MAX_SPEC_TOKENS).unwrap(),
             // activation-quant scratch sized for the widest K (n_inter),
-            // one scale/sum per 8-value group (AG in llm.cu)
+            // one scale/sum per AG-value group of the loaded module
             act: ActQuant {
                 q: stream.alloc_zeros(c.n_ctx * inter / 4).unwrap(),
-                scale: stream.alloc_zeros(c.n_ctx * inter / ACT_GROUP).unwrap(),
-                sum: stream.alloc_zeros(c.n_ctx * inter / ACT_GROUP).unwrap(),
+                scale: stream.alloc_zeros(c.n_ctx * inter / ag).unwrap(),
+                sum: stream.alloc_zeros(c.n_ctx * inter / ag).unwrap(),
             },
             graph_tok: stream.alloc_zeros(1).unwrap(),
             graph_pos: stream.alloc_zeros(1).unwrap(),
