@@ -264,7 +264,15 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   One implementation detail mattered: a naive byte-at-a-time dequant loop
   made kv8 *slower* than fp32 (92 tok/s at 900 ctx) — the score kernel got
   instruction-bound on byte loads. Vectorizing K loads as `char4` cut the
-  load count 4x and flipped the result.
+  load count 4x and flipped the result. The dp4a treatment finished the
+  job: q is quantized on the fly inside the kernel (one absmax scale per
+  head) and the score dot runs entirely in integers — at 900 ctx with kv8
+  that is another +5–9% on the int modes (GPT-2 int4 290 → 316, TinyLlama
+  int4 52 → 56 tok/s) and +2–3% even for fp32/fp16 weights, since kv8
+  attention is the same kernel regardless of weight dtype. Quality gates
+  hold: q carries one scale per 64 values, but unlike the GEMV activations
+  (which need 4-wide groups) attention scores tolerate it — verify argmax,
+  spec and graph paths all stay green.
 
 Quality is measured separately with:
 

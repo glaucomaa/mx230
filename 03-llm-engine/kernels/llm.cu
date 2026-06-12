@@ -742,6 +742,7 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
                                     int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[1024]; // n_ctx max
     __shared__ float red[32];
+    __shared__ int qq[32]; // q quantized to int8: head_dim/4 packed words
     int h = blockIdx.x;
     int tid = threadIdx.x;
     int kvd = n_kv_head * head_dim;
@@ -749,18 +750,36 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
     const float *q = qkv + h * head_dim;
     float scale = rsqrtf((float)head_dim);
 
+    // Quantize this head's q on the fly (one absmax scale per head): with K
+    // already int8 the whole score dot runs on dp4a — 4 MACs per issue
+    // instead of one convert+FMA per byte, the same cure the GEMVs got.
+    int hd4 = head_dim / 4;
+    float qmax = block_max(tid < head_dim ? fabsf(q[tid]) : 0.0f, red);
+    float qid = qmax > 0.0f ? 127.0f / qmax : 0.0f;
+    for (int d = tid; d < hd4; d += blockDim.x) {
+        int packed = 0;
+        for (int j = 0; j < 4; ++j) {
+            int v = max(-127, min(127, __float2int_rn(q[4 * d + j] * qid)));
+            packed |= (v & 0xFF) << (8 * j);
+        }
+        qq[d] = packed;
+    }
+    __syncthreads();
+    float qs = (qmax > 0.0f ? qmax / 127.0f : 0.0f) * scale;
+
     float m = -CUDART_INF_F;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
-        // head rows are head_dim-byte aligned, so char4 loads are safe and
-        // cut the byte-load instruction count 4x
-        const char4 *k4 = (const char4 *)(kq + (size_t)t * kvd + kvh * head_dim);
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim / 4; ++d) {
-            char4 c = k4[d];
-            dot += q[4 * d] * (float)c.x + q[4 * d + 1] * (float)c.y +
-                   q[4 * d + 2] * (float)c.z + q[4 * d + 3] * (float)c.w;
+        // head rows are head_dim-byte aligned: int4 vector loads, dp4a dot
+        const int4 *k4 = (const int4 *)(kq + (size_t)t * kvd + kvh * head_dim);
+        int dot = 0;
+        for (int d = 0; d < hd4 / 4; ++d) {
+            int4 kw = k4[d];
+            dot = __dp4a(kw.x, qq[4 * d + 0], dot);
+            dot = __dp4a(kw.y, qq[4 * d + 1], dot);
+            dot = __dp4a(kw.z, qq[4 * d + 2], dot);
+            dot = __dp4a(kw.w, qq[4 * d + 3], dot);
         }
-        s[t] = dot * ks[t * n_kv_head + kvh] * scale;
+        s[t] = (float)dot * ks[t * n_kv_head + kvh] * qs;
         m = fmaxf(m, s[t]);
     }
     m = block_max(m, red);
