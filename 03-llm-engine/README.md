@@ -26,30 +26,31 @@ GPT-2 124M:
 
 | engine                  | weights | tokens/sec |
 |-------------------------|---------|------------|
-| **ours, fp32**          | 497 MB  | **77.6**   |
-| **ours, fp32 + graph**  | 497 MB  | **78.5**   |
-| **ours, fp16 storage**  | 249 MB  | **113.8**  |
-| **ours, fp16 + graph**  | 249 MB  | **115.6**  |
-| **ours, int8**          | 124 MB  | **130.0**  |
-| **ours, int8 + graph**  | 124 MB  | **131.9**  |
-| **ours, int4**          | 70 MB   | **211.3** (quality collapses — see ppl) |
+| **ours, fp32**          | 497 MB  | **79.1**   |
+| **ours, fp16 storage**  | 249 MB  | **117.0**  |
+| **ours, int8 (dp4a)**   | 124 MB  | **266.5**  |
+| **ours, int8 + graph**  | 124 MB  | **276.0**  |
+| **ours, int4 (dp4a)**   | 70 MB   | **371.1** (quality collapses — see ppl) |
+| **ours, int4 + graph + kv8** | 70 MB | **388.0** |
 | HF transformers (torch CPU) | 497 MB | 45.1   |
 
 Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
 
 | engine                  | weights | tokens/sec |
 |-------------------------|---------|------------|
-| **ours, fp16 storage**  | 988 MB  | **30.2**   |
-| **ours, int8**          | 494 MB  | **52.6**   |
-| **ours, int4**          | 278 MB  | **59.6**   |
+| **ours, fp16 storage**  | 988 MB  | **30.5**   |
+| **ours, int8 (dp4a)**   | 494 MB  | **74.3**   |
+| **ours, int4 (dp4a)**   | 278 MB  | **104.1**  |
+| **ours, int4 + graph**  | 278 MB  | **108.6**  |
+| **ours, int4 + spec**   | 278 MB  | **129.4**  |
 
 TinyLlama-1.1B (22 layers, GQA 32q/4kv, SwiGLU, RoPE, untied lm_head):
 
 | engine                  | weights | tokens/sec |
 |-------------------------|---------|------------|
-| **ours, int8**          | 1100 MB | **28.9**   |
-| **ours, int4**          | 619 MB  | **31.3**   |
-| **ours, int4 + spec**   | 619 MB  | **41.5**   |
+| **ours, int8 (dp4a)**   | 1100 MB | **38.9**   |
+| **ours, int4 (dp4a)**   | 619 MB  | **61.8**   |
+| **ours, int4 + spec**   | 619 MB  | **74.0**   |
 
 Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — it does not fit in 2 GB VRAM,
 so fp16/int8 storage is not an optimization here but the only way the model
@@ -57,7 +58,7 @@ runs at all. TinyLlama-1.1B pushes that one step further: even fp16 is
 2.2 GB, so the model exists on this card only as int8 (1.1 GB, barely) or
 int4 (619 MB, comfortably). And PyTorch still can't touch this GPU (no
 sm_61 kernels), so a 1.1B-parameter model generating coherent text at
-31 tok/s on a 2019 laptop card is the engine's closing argument.
+62 tok/s on a 2019 laptop card is the engine's closing argument.
 
 PyTorch GPU is not in the table for a reason worth stating: current torch
 wheels ship no sm_61 kernels (`cudaErrorNoKernelImageForDevice`) — Pascal is
@@ -87,7 +88,7 @@ Models:
   Q4_0 (606.53 MiB) and Q8_0 (1.09 GiB) — the same base checkpoint this
   engine runs.
 
-Benchmark command (build `ac4cdde`):
+Benchmark command (build `1593d56`):
 
 ```
 /tmp/llama.cpp/build-sm61-nofa/bin/llama-bench \
@@ -97,52 +98,70 @@ Benchmark command (build `ac4cdde`):
 
 | model | engine | model storage | prefill / prompt processing | greedy decode |
 |-------|--------|---------------|-----------------------------|---------------|
-| GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2756.1 tok/s** (`pp512`) | **144.5 tok/s** (`tg128`) |
-| GPT-2 | ours | int8 weights, ~124 MiB | 1080.2 tok/s (`512 / 0.474s`) | 130.0 tok/s |
-| Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **871.2 tok/s** (`pp512`) | 45.5 tok/s (`tg128`) |
-| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 274.4 tok/s (`512 / 1.866s`) | **52.5 tok/s** |
-| TinyLlama-1.1B | llama.cpp CUDA | Q8_0 GGUF, 1.09 GiB | **384.9 tok/s** (`pp512`) | 22.0 tok/s (`tg128`) |
-| TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | 106.2 tok/s (`512 / 4.821s`) | **28.9 tok/s** |
-| TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **441.7 tok/s** (`pp512`) | 31.2 tok/s (`tg128`) |
-| TinyLlama-1.1B | ours | int4 weights, ~619 MB | 79.3 tok/s (`512 / 6.453s`) | **31.3 tok/s** |
+| GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2756.7 tok/s** (`pp512`) | 144.0 tok/s (`tg128`) |
+| GPT-2 | ours | int8 weights, ~124 MiB | 1306 tok/s (`512 / 0.392s`) | **266.5 tok/s** |
+| Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **866.0 tok/s** (`pp512`) | 45.4 tok/s (`tg128`) |
+| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 336.6 tok/s (`512 / 1.521s`) | **74.3 tok/s** |
+| TinyLlama-1.1B | llama.cpp CUDA | Q8_0 GGUF, 1.09 GiB | **384.3 tok/s** (`pp512`) | 22.0 tok/s (`tg128`) |
+| TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | 132.3 tok/s (`512 / 3.870s`) | **38.9 tok/s** |
+| TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **430.5 tok/s** (`pp512`) | 30.8 tok/s (`tg128`) |
+| TinyLlama-1.1B | ours | int4 weights, ~619 MB | 129.4 tok/s (`512 / 3.958s`) | **61.8 tok/s** |
 
-This is the honest split. llama.cpp is much faster on prefill everywhere,
-and the gap is structural, not just polish. Prefill is compute-bound, and
-(1) this engine's GEMM is a deliberately mid-ladder kernel — 64x64 tiles,
-4x4 micro-tile, no double buffering — landing at ~230-280 effective GFLOPS
-of the 941 fp32 peak, where stage 1 showed 500+ is reachable; and
-(2) llama.cpp's MMQ kernels never dequantize at all: they multiply in
-integers via `dp4a` (4 int8 MACs per instruction, and sm_61 has it), so
-their quantized GEMM ceiling is ~4x the fp32 one this engine's
-dequantize-then-FMA design accepts. Decode hides both effects because it is
-bandwidth-bound — which is exactly why the decode columns are even. GPT-2 decode also goes to
-llama.cpp (144.5 vs 130.0 tok/s). Decode on the two RoPE models goes the
-other way: the custom int8 path is 16% faster on Qwen and 31% faster on
-TinyLlama (28.9 vs 22.0 tok/s), because the hot loop is narrower and
-specialized for one architecture/layout instead of the full GGML execution
-model. At 4 bits the engines converge: 31.3 vs 31.2 tok/s on TinyLlama —
-both GEMV paths hit the same nibble-unpack instruction wall well short of
-the bus, and matching mature Q4_0 kernels exactly is a result in itself.
+Before the dp4a rewrite this table read very differently: llama.cpp won
+GPT-2 decode (144 vs 130), tied TinyLlama Q4_0 (31.2 vs 31.3), and its
+prefill lead ran up to 5.6x. The diagnosis then was structural — "llama.cpp's
+MMQ kernels never dequantize, they multiply in integers via dp4a, so their
+quantized GEMM ceiling is ~4x the fp32 one this engine's
+dequantize-then-FMA design accepts." Adopting the same weapon settled it:
+**decode now goes to this engine on every row** — +85% on GPT-2 (266.5 vs
+144.0), +64% on Qwen, +77% on TinyLlama int8, and the int4 "dead heat"
+broke open to 2x (61.8 vs 30.8 tok/s), because the specialized hot loop
+(one architecture, one layout, activations quantized straight into shared
+memory) keeps more of the dp4a ceiling than GGML's general execution model.
+Prefill still belongs to llama.cpp, but the gap is polish now, not
+structure: 2.1x on GPT-2 (was 2.6x), 2.6x on Qwen (was 3.2x), 2.9–3.3x on
+TinyLlama (was 3.6–5.6x) — their MMQ tiles, stream management and years of
+shape-specific tuning against a first-pass dp4a GEMM with one tile size
+per tier.
 
 ## What the numbers say
 
 Decode is one GEMV per weight matrix per token — pure memory streaming:
 
-- **fp32: 78 tok/s × 498 MB = 38.8 GB/s — the memory bus is saturated.**
-  The fp32 engine is provably optimal for this hardware; no further kernel
+- **fp32: 79 tok/s × 497 MB = 39.3 GB/s — the memory bus is saturated**
+  (the measured streaming roof is 43.8 GB/s, `common/examples/isa`). The
+  fp32 engine is provably near-optimal for this hardware; no further kernel
   cleverness can help, only smaller weights.
 - **fp16 storage cuts traffic 2x** while still accumulating in fp32. On Pascal
   this avoids slow fp16 arithmetic and tests the pure "smaller weights" axis.
+- **dp4a: integer math without tensor cores.** sm_61 has one genuinely
+  modern instruction: `dp4a`, 4 int8 MACs per issue. The ISA microbench
+  (`common/examples/isa`) measures 2941 GOPS of int8 dot-product against
+  735 GFLOPS of fp32 FMA — a real 4.0x — while half2 arithmetic crawls at
+  1/64 rate (13 GFLOPS, useless). So the quantized paths stopped
+  dequantizing: weights are repacked at load into int32 words along n_in,
+  activations are quantized on the fly (absmax per 4-value group,
+  llama.cpp Q8-style — small groups because GPT-2's activation outliers
+  wreck 32-wide ones), and the inner loop is `__dp4a` on packed words with
+  one float multiply per group instead of one per weight. int4 packs both
+  nibble planes of 8 rows into one int32 so `w & 0x0F0F0F0F` and
+  `(w >> 4) & 0x0F0F0F0F` feed dp4a directly, and the Q4_0 "+8" nibble
+  bias folds away analytically (`dot -= 8 * Σx_group` per weight group) —
+  no unpack-to-bytes in the GEMV at all. Decode: GPT-2 int8 130 → 266.5,
+  int4 211 → 371; Qwen int8 52.6 → 74.3, int4 59.6 → 104.1; TinyLlama
+  int8 28.9 → 38.9, int4 31.3 → 61.8 tok/s. TinyLlama int8 now moves
+  ~42.8 GB/s — the bus, not instructions, is the wall again, which was
+  the whole point.
 - **CUDA graphs** capture one decode step with token and position kept on the
   device: argmax runs on the GPU, the host submits one graph launch per token
-  and never copies logits back. Measured gain is only **~1% in every mode** —
+  and never copies logits back. At fp32/fp16 weights the gain is **~1%** —
   a negative result worth having: kernel launches are asynchronous, the host
   enqueues ~115 launches/token faster than the GPU drains them, so the GPU
-  never goes idle and there is no launch overhead to remove. One exception
-  appeared later: GPT-2 int4 moves only ~70 MB/step, and at that weight the
-  previously invisible costs finally peek out — graphs alone add +2.4%
-  (212.2 → 217.3 tok/s), and graphs + int8 KV reach 226.9 (+7% total). The
-  lighter the bytes, the more everything else matters.
+  never goes idle and there is no launch overhead to remove. But the lighter
+  the step, the more the fixed costs matter: after dp4a, GPT-2 int8 picks up
+  +3.6% from graphs (266.5 → 276.0) and int4 +4.4% (371.1 → 387.5, 388.0
+  with int8 KV) — at ~70 MB/step the previously invisible overheads finally
+  peek out.
 - **Batch prefill replaces token-by-token GEMV with GEMM + flash-style causal
   attention.** A 512-token prompt now runs as tiled matmuls over the whole
   prompt and a GQA-aware online-softmax attention pass over the KV cache.
@@ -151,22 +170,30 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
 
   | mode | token loop | batch prefill | speedup |
   |------|------------|---------------|---------|
-  | fp32 | 7.100s     | 0.462s        | 15.4x   |
-  | fp16 | 4.993s     | 0.468s        | 10.7x   |
-  | int8 | 4.436s     | 0.474s        | 9.4x    |
+  | fp32 | 6.744s     | 0.240s        | 28.1x   |
+  | fp16 | 4.659s     | 0.273s        | 17.1x   |
+  | int8 | 2.184s     | 0.392s        | 5.6x    |
+  | int4 | 1.658s     | 0.393s        | 4.2x    |
 
-  The prefill path is checked against the token loop in `verify`: final logits
-  may differ at float-rounding scale, but the greedy argmax must match in every
-  weight/KV mode.
+  (int8/int4 prefill is dp4a GEMM; their token loops are so fast after dp4a
+  that the batch speedup *ratio* shrinks while the absolute TTFT keeps
+  falling.) The prefill path is checked against the token loop in `verify`:
+  final logits may differ at float-rounding scale, but the greedy argmax
+  must match in every weight/KV mode.
 - **The GEMM dispatches on M, because a square tile wastes compute on skinny
   batches.** A 64x64 tile burns 64 rows of FMAs whether M is 512 or 8, and
   that wasted compute — not bandwidth — was the floor of the speculative
   verify pass: verifying 8 draft tokens cost ~6 decode steps, making spec
-  decode a net loss. Three tiers fix it: 64-row tiles for prefill, 16-row
-  tiles for mid-size M, and for M <= 8 a multi-row GEMV (`gemm_rows`) where
-  each thread owns output columns gemv-style, B streams through once with
-  zero wasted FMAs and the 8-row accumulator lives in registers. An 8-token
-  verify dropped from 49ms to 15ms (GPT-2 int8) — under 2 decode steps.
+  decode a net loss. Four tiers fix it: for real prefill (M > 64) a
+  128x128x8 tile with an 8x8 register micro-tile, float4-staged transposed
+  A and double-buffered smem — the 01-gemm ladder's endgame grafted into
+  the engine, worth 1.7–1.9x on fp32/fp16 prefill (GPT-2 fp32 0.462 →
+  0.240s, Qwen fp16 1.821 → 1.026s); 64-row tiles for mid-size batches;
+  16-row tiles below that; and for M <= 8 a multi-row GEMV (`gemm_rows`)
+  where each thread owns output columns gemv-style, B streams through once
+  with zero wasted FMAs and the 8-row accumulator lives in registers. An
+  8-token verify dropped from 49ms to 15ms (GPT-2 int8) — under 2 decode
+  steps.
 - **Prompt-lookup speculative decoding** (`--spec`, optional `--spec-k N`) uses
   repeated n-grams from the prompt/generated history as draft tokens, verifies
   them with one batched forward, and accepts only tokens that match the full
@@ -175,51 +202,55 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   It is lossless by construction — `verify` compares the speculative output
   token-for-token with ordinary greedy decode (host and device argmax break
   ties the same way, first index, so the paths cannot diverge on equal
-  logits). Measured on int8 weights, 128-256 new tokens:
+  logits). Measured with `bench --spec` (128 tokens, greedy output loops so
+  prompt lookup hits constantly):
 
-  | model | text | greedy | spec | gain |
+  | model | mode | greedy | spec | gain |
   |------|------|--------|------|------|
-  | GPT-2 | repeated sentence | 130.6 tok/s | 410.7 tok/s | 3.1x |
-  | GPT-2 | "Alan Turing was..." | 125.8 tok/s | 255.9 tok/s | 2.0x |
-  | Qwen2.5-0.5B | repeated sentence | 56.5 tok/s | 139.4 tok/s | 2.5x |
+  | GPT-2 | int8 | 266.5 tok/s | 315.2 tok/s | 1.18x |
+  | GPT-2 | int4 | 371.1 tok/s | 389.9 tok/s | 1.05x |
+  | Qwen2.5-0.5B | int4 | 104.1 tok/s | 129.4 tok/s | 1.24x |
+  | TinyLlama-1.1B | int4 | 61.8 tok/s | 74.0 tok/s | 1.20x |
 
-  Greedy LLM output loops hard, so prompt lookup hits constantly even on
-  "normal" text; on text with no repeats spec falls back to one token per
-  forward and costs nothing.
-- **int8 weights were instruction-bound until the loads got wider.** The
-  first int8 GEMV issued one byte load + convert + FMA per weight — the same
-  instruction count as fp32 for a quarter of the data, so below bus
-  saturation it ran at fp32's pace (and on Qwen actually *lost* to fp16,
-  28 vs 30 tok/s). Switching wide matrices (`n_out >= 4096`) to `char4`
-  loads with 4 outputs per thread fixed it: Qwen int8 28 → 52.6 tok/s,
-  GPT-2 int8 122 → 130. Narrow matrices keep one output per thread — cutting
-  the thread count 4x there starves the 3 SMs of latency-hiding warps and
-  costs more than the wider loads gain.
-- **int8 still lands at 1.7x over fp32, not 4x.** With launch overhead ruled
-  out by the graph experiment and load instructions widened, the remaining
-  wall is the serial fraction of the decode step: narrow GEMVs, fp32
-  attention traffic, and one-block reductions (layernorm, softmax) that
-  scale with depth, not bytes.
+  The spec margins shrank as dp4a made plain decode faster — speculation
+  pays in proportion to how expensive a forward pass is; on text with no
+  repeats it falls back to one token per forward and costs nothing.
+- **int8 weights were instruction-bound until the math went integer.** The
+  story has three chapters. The first int8 GEMV issued one byte load +
+  convert + FMA per weight — the same instruction count as fp32 for a
+  quarter of the data, so it ran at fp32's pace (on Qwen it *lost* to
+  fp16, 28 vs 30 tok/s). Chapter two: `char4` loads with 4 outputs per
+  thread on wide matrices (`n_out >= 4096`) — Qwen 28 → 52.6 tok/s, GPT-2
+  122 → 130; narrow matrices keep one output per thread because cutting
+  the thread count 4x starves 3 SMs of latency-hiding warps. Chapter
+  three: stop converting at all — dp4a multiplies the packed bytes
+  directly (W8A8), and the convert+FMA instruction stream collapses into
+  one MAC per 4 weights: GPT-2 130 → 266.5, Qwen 52.6 → 74.3, TinyLlama
+  28.9 → 38.9 tok/s. TinyLlama int8 is now bus-bound (~42.8 of 43.8 GB/s
+  measured roof); the smaller models still carry per-token fixed costs,
+  which is what graphs (+3.6%) and the decode-tail pass (warp-shuffle
+  reductions, residual add fused into the GEMV epilogue, float4 K/V
+  attention loads: int8 +7%, int4 +10% on GPT-2) keep trimming.
 - **int4 weights pack two per byte** (Q4_0-style: one fp16 scale per 32
   weights of an output column, nibbles store q+8). Memory-wise it is the
-  only way TinyLlama-1.1B fits comfortably; speed-wise it beats int8 on
-  every model (GPT-2 130 → 211, Qwen 52 → 59.6, TinyLlama 28.9 → 31.3
-  tok/s) — bytes win again. But the margins shrink with model width:
-  TinyLlama int4 moves only ~20 GB/s of a 40 GB/s bus, while its int8 run
-  saturates at ~32 GB/s. The int4 GEMV pays extra instructions per weight
-  (nibble unpack, per-group scale loads), and the narrow qkv/proj matrices
-  (n_out < 4096) sit on the scalar path — the same instruction wall int8
-  hit before `char4`, one level deeper. Unlike int8, the group scale can't
-  be folded into the final accumulator (it changes every 32 rows), so the
-  GEMM path dequantizes during the shared-tile fill — which is also why
-  int4 prefill trails int8 on every model (TinyLlama 6.5s vs 4.8s,
-  GPT-2 0.62s vs 0.47s for 512 tokens).
+  only way TinyLlama-1.1B fits comfortably; speed-wise it now beats int8
+  on every model by close to the byte ratio (GPT-2 266 → 371, Qwen 74 →
+  104, TinyLlama 39 → 62 tok/s) instead of the few percent it managed
+  pre-dp4a, because the nibble-unpack instruction wall is gone: both
+  nibble planes go straight into dp4a as masked words, the +8 bias is
+  subtracted analytically per 32-row group, and no per-weight unpack or
+  convert survives in the GEMV. The int4 GEMM unpacks each tile once into
+  signed bytes (`__vsubss4`) and reuses the int8 micro-kernel shape, so
+  int4 prefill no longer trails int8 (GPT-2 0.393s vs 0.392s, TinyLlama
+  3.96s vs 3.87s @512 — a dead heat instead of 35% behind).
 - **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
   absmax scale per (position, head) and dequantized inside the attention
   kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
   of decode that grows with context — drops 4x. KV traffic only matters at
   long context (at position 900 it is 66 MB/token fp32, more than half the
-  int8 weights), so that is where the gain shows:
+  int8 weights), so that is where the gain shows (table measured pre-dp4a;
+  the ratios are the point, and post-dp4a the lighter weights only make KV
+  bytes a *larger* fraction of the step):
 
   | model | mode | kv | tok/s @128 ctx | tok/s @900 ctx |
   |------|------|------|------|------|
@@ -249,30 +280,35 @@ quality-vs-traffic table instead of only argmax agreement.
 |------|------|------|----------------------------|------------|
 | GPT-2 | fp32 | fp32 | 2047                  | 25.388     |
 | GPT-2 | fp16 | fp32 | 2047                  | 25.396     |
-| GPT-2 | int8 | fp32 | 2047                  | 25.601     |
-| GPT-2 | int4 | fp32 | 2047                  | **261.3**  |
-| GPT-2 | fp32 | int8 | 2047                  | 25.378     |
-| GPT-2 | fp16 | int8 | 2047                  | 25.367     |
-| GPT-2 | int8 | int8 | 2047                  | 25.596     |
+| GPT-2 | int8 | fp32 | 2047                  | 25.657     |
+| GPT-2 | int4 | fp32 | 2047                  | **264.2**  |
+| GPT-2 | fp32 | int8 | 2047                  | 25.363     |
+| GPT-2 | fp16 | int8 | 2047                  | 25.377     |
+| GPT-2 | int8 | int8 | 2047                  | 25.651     |
 | Qwen  | fp16 | fp32 | 2047                  | 12.463     |
-| Qwen  | int8 | fp32 | 2047                  | 12.464     |
-| Qwen  | int4 | fp32 | 2047                  | 14.262     |
-| Qwen  | fp16 | int8 | 2047                  | 12.941     |
-| Qwen  | int8 | int8 | 2047                  | 12.944     |
-| TinyLlama | int8 | fp32 | 2047              | 7.357      |
-| TinyLlama | int4 | fp32 | 2047              | 7.692      |
-| TinyLlama | int8 | int8 | 2047              | 7.356      |
-| TinyLlama | int4 | int8 | 2047              | 7.695      |
+| Qwen  | int8 | fp32 | 2047                  | 12.468     |
+| Qwen  | int4 | fp32 | 2047                  | 14.269     |
+| Qwen  | fp16 | int8 | 2047                  | 12.951     |
+| Qwen  | int8 | int8 | 2047                  | 12.938     |
+| TinyLlama | int8 | fp32 | 2047              | 7.356      |
+| TinyLlama | int4 | fp32 | 2047              | 7.694      |
+| TinyLlama | int8 | int8 | 2047              | 7.359      |
+| TinyLlama | int4 | int8 | 2047              | 7.703     |
 
-Several quality stories in one table. Int8 *weights* are free on every model
-(on Qwen literally so: 12.464 vs 12.463). The int8 *KV cache* depends on GQA
+(int8/int4 here are the dp4a W8A8/W4A8 paths — activations quantized on the
+fly in 4-value absmax groups. The group size matters: 32-wide groups cost
+GPT-2 +0.7 ppl because of its activation outliers; at 4 the damage is zero
+and the speed identical.)
+
+Several quality stories in one table. Int8 *weights* stay almost free on
+every model (Qwen 12.468 vs 12.463 fp16). The int8 *KV cache* depends on GQA
 width: free on GPT-2 (12 KV heads, errors average out) and on TinyLlama
 (4 KV heads), but costs Qwen +0.48 — with only 2 KV heads each quantized
 K/V row is reused by 7 query heads and its error has nowhere to hide.
 
 Int4 *weights* are a clean function of model scale. TinyLlama-1.1B barely
 notices (+0.34), Qwen-0.5B pays a real but workable +1.8, and GPT-2 124M
-collapses outright (25.6 → 261; greedy output degenerates into "the only,
+collapses outright (25.7 → 264; greedy output degenerates into "the only,
 the only, the only..."), exactly the small-old-model quantization
 sensitivity the literature warns about — group-32 absmax has no answer to
 GPT-2's weight outliers. The decode speed ladder runs the same direction as
@@ -299,17 +335,19 @@ it tolerates best.
   both verified token-for-token against HF tokenizers.
 - `src/cpu.rs` — slow, obvious reference forwards for all archs; ground
   truth for the GPU.
-- `kernels/llm.cu` — embed, layernorm/rmsnorm (block reduction), RoPE, GEMV
-  (fp32 / fp16 storage / int8 with per-output-channel absmax scales and
-  char4 loads on wide outputs / int4 with two weights per byte and
-  per-group fp16 scales, uchar4 loads covering 4 columns x 2 rows), fused
-  causal KV-cache attention with GQA (one block per query head, online
-  scores in shared memory; fp32 and int8-cache variants), batched prefill
-  GEMM in three M-tiers (64/16-row tiles + multi-row GEMV, vectorized tile
-  loads; int4 variants dequantize during the tile fill), flash-style
-  attention, quantize-on-write KV kernels, GELU, SwiGLU combine, residual
-  add, GPU argmax for graph replay and per-row argmax for draft
-  verification.
+- `kernels/llm.cu` — embed, layernorm/rmsnorm (warp-shuffle reductions on
+  the decode side), RoPE, GEMV (fp32 / fp16 storage / int8 and int4 as
+  dp4a paths: weights repacked into int32 words, activations quantized
+  in-kernel to absmax 4-value groups, int4's +8 nibble bias folded
+  analytically; residual add fused into the epilogue via an accum flag),
+  fused causal KV-cache attention with GQA (one block per query head,
+  online scores in shared memory, float4/char4 K/V loads; fp32 and
+  int8-cache variants), batched prefill GEMM in four M-tiers (128x128
+  double-buffered 8x8-micro-tile wide tier for fp32/fp16 prefill,
+  64/16-row dp4a-or-FMA tiles, multi-row GEMV for M <= 8; int GEMMs run
+  integer micro-kernels with per-tile scale epilogues), flash-style
+  attention, quantize-on-write KV kernels, GELU, SwiGLU combine, GPU
+  argmax for graph replay and per-row argmax for draft verification.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or
   quantized to int8/int4 at load; tied or untied lm_head; per-layer KV
   cache (fp32 or int8 + scales); standard host-greedy decode, batch
