@@ -81,17 +81,20 @@ fn modes_for(arch: model::Arch) -> &'static [gpu::WeightMode] {
             gpu::WeightMode::Fp16,
             gpu::WeightMode::Int8,
             gpu::WeightMode::Int4,
+            gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
         ],
         model::Arch::Qwen2 => &[
             gpu::WeightMode::Fp16,
             gpu::WeightMode::Int8,
             gpu::WeightMode::Int4,
+            gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
         ],
         model::Arch::Llama => &[
             gpu::WeightMode::Int4,
             gpu::WeightMode::Int8,
+            gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
         ],
     }
@@ -278,7 +281,10 @@ fn main() {
                 // quantization damage is real — see the perplexity table),
                 // so the CPU comparison is informational there; internal
                 // consistency between decode and batch prefill always holds
-                if matches!(mode, gpu::WeightMode::Int4 | gpu::WeightMode::Int2) {
+                if matches!(
+                    mode,
+                    gpu::WeightMode::Int4 | gpu::WeightMode::Int3 | gpu::WeightMode::Int2
+                ) {
                     if cw != gw {
                         println!(
                             "  note: {} argmax differs from fp32 CPU (quantization)",
