@@ -99,13 +99,13 @@ Benchmark command (build `1593d56`):
 | model | engine | model storage | prefill / prompt processing | greedy decode |
 |-------|--------|---------------|-----------------------------|---------------|
 | GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2756.7 tok/s** (`pp512`) | 144.0 tok/s (`tg128`) |
-| GPT-2 | ours | int8 weights, ~124 MiB | 1306 tok/s (`512 / 0.392s`) | **266.5 tok/s** |
+| GPT-2 | ours | int8 weights, ~124 MiB | 2032 tok/s (`512 / 0.252s`) | **266.5 tok/s** |
 | Qwen2.5-0.5B | llama.cpp CUDA | Q8_0 GGUF, 500.79 MiB | **866.0 tok/s** (`pp512`) | 45.4 tok/s (`tg128`) |
-| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 336.6 tok/s (`512 / 1.521s`) | **74.3 tok/s** |
+| Qwen2.5-0.5B | ours | int8 weights, ~494 MiB | 553 tok/s (`512 / 0.926s`) | **74.3 tok/s** |
 | TinyLlama-1.1B | llama.cpp CUDA | Q8_0 GGUF, 1.09 GiB | **384.3 tok/s** (`pp512`) | 22.0 tok/s (`tg128`) |
-| TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | 132.3 tok/s (`512 / 3.870s`) | **38.9 tok/s** |
+| TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | 230 tok/s (`512 / 2.225s`) | **38.9 tok/s** |
 | TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **430.5 tok/s** (`pp512`) | 30.8 tok/s (`tg128`) |
-| TinyLlama-1.1B | ours | int4 weights, ~619 MB | 129.4 tok/s (`512 / 3.958s`) | **61.8 tok/s** |
+| TinyLlama-1.1B | ours | int4 weights, ~619 MB | 189 tok/s (`512 / 2.709s`) | **61.8 tok/s** |
 
 Before the dp4a rewrite this table read very differently: llama.cpp won
 GPT-2 decode (144 vs 130), tied TinyLlama Q4_0 (31.2 vs 31.3), and its
@@ -118,11 +118,12 @@ dequantize-then-FMA design accepts." Adopting the same weapon settled it:
 broke open to 2x (61.8 vs 30.8 tok/s), because the specialized hot loop
 (one architecture, one layout, activations quantized straight into shared
 memory) keeps more of the dp4a ceiling than GGML's general execution model.
-Prefill still belongs to llama.cpp, but the gap is polish now, not
-structure: 2.1x on GPT-2 (was 2.6x), 2.6x on Qwen (was 3.2x), 2.9–3.3x on
-TinyLlama (was 3.6–5.6x) — their MMQ tiles, stream management and years of
-shape-specific tuning against a first-pass dp4a GEMM with one tile size
-per tier.
+Prefill still belongs to llama.cpp, but the gap stopped being structural:
+once the dp4a GEMMs got their own wide tiles (int8 128x128, int4 64x128
+over 32 k-values) it is 1.36x on GPT-2 (was 2.6x), 1.57x on Qwen (was
+3.2x), 1.67–2.3x on TinyLlama (was 3.6–5.6x) — what remains is MMQ's
+per-quant-format specialization and years of shape tuning against a
+two-shape dp4a tile, plus int4's per-tile weight-scale fold.
 
 ## What the numbers say
 
@@ -172,23 +173,28 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   |------|------------|---------------|---------|
   | fp32 | 6.744s     | 0.240s        | 28.1x   |
   | fp16 | 4.659s     | 0.273s        | 17.1x   |
-  | int8 | 2.184s     | 0.392s        | 5.6x    |
-  | int4 | 1.658s     | 0.393s        | 4.2x    |
+  | int8 | 2.178s     | 0.252s        | 8.6x    |
+  | int4 | 1.654s     | 0.294s        | 5.6x    |
 
-  (int8/int4 prefill is dp4a GEMM; their token loops are so fast after dp4a
-  that the batch speedup *ratio* shrinks while the absolute TTFT keeps
-  falling.) The prefill path is checked against the token loop in `verify`:
-  final logits may differ at float-rounding scale, but the greedy argmax
-  must match in every weight/KV mode.
+  (int8/int4 prefill is dp4a GEMM on the wide tile; their token loops are
+  so fast after dp4a that the batch speedup *ratio* shrinks while the
+  absolute TTFT keeps falling.) The prefill path is checked against the
+  token loop in `verify`: final logits may differ at float-rounding scale,
+  but the greedy argmax must match in every weight/KV mode.
 - **The GEMM dispatches on M, because a square tile wastes compute on skinny
   batches.** A 64x64 tile burns 64 rows of FMAs whether M is 512 or 8, and
   that wasted compute — not bandwidth — was the floor of the speculative
   verify pass: verifying 8 draft tokens cost ~6 decode steps, making spec
-  decode a net loss. Four tiers fix it: for real prefill (M > 64) a
-  128x128x8 tile with an 8x8 register micro-tile, float4-staged transposed
-  A and double-buffered smem — the 01-gemm ladder's endgame grafted into
-  the engine, worth 1.7–1.9x on fp32/fp16 prefill (GPT-2 fp32 0.462 →
-  0.240s, Qwen fp16 1.821 → 1.026s); 64-row tiles for mid-size batches;
+  decode a net loss. Four tiers fix it: for real prefill (M > 64) a wide
+  tile — fp32/fp16 get 128x128x8 with an 8x8 register micro-tile,
+  float4-staged transposed A and double-buffered smem (the 01-gemm
+  ladder's endgame grafted into the engine, worth 1.7–1.9x: GPT-2 fp32
+  0.462 → 0.240s, Qwen fp16 1.821 → 1.026s), and the dp4a paths get the
+  int edition — int8 as 128x128 over 32 k-values (8x8 micro-tile of
+  dp4a+scale-FMA pairs), int4 as 64x128 (4x8 micro-tile plus a per-tile
+  partial so the 32-row fp16 weight scale folds once per tile), worth
+  another 36–43% on int prefill (GPT-2 int8 0.392 → 0.252s, TinyLlama
+  int8 3.87 → 2.23s); 64-row tiles for mid-size batches;
   16-row tiles below that; and for M <= 8 a multi-row GEMV (`gemm_rows`)
   where each thread owns output columns gemv-style, B streams through once
   with zero wasted FMAs and the 8-row accumulator lives in registers. An
@@ -241,8 +247,9 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   subtracted analytically per 32-row group, and no per-weight unpack or
   convert survives in the GEMV. The int4 GEMM unpacks each tile once into
   signed bytes (`__vsubss4`) and reuses the int8 micro-kernel shape, so
-  int4 prefill no longer trails int8 (GPT-2 0.393s vs 0.392s, TinyLlama
-  3.96s vs 3.87s @512 — a dead heat instead of 35% behind).
+  int4 prefill went from 35% behind int8 to nearly level (GPT-2 0.294s vs
+  0.252s, TinyLlama 2.71s vs 2.23s @512) — the remaining gap is the
+  per-tile weight-scale fold and the half-height wide tile it forces.
 - **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
   absmax scale per (position, head) and dequantized inside the attention
   kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
@@ -350,10 +357,11 @@ it tolerates best.
   analytically; residual add fused into the epilogue via an accum flag),
   fused causal KV-cache attention with GQA (one block per query head,
   online scores in shared memory, float4/char4 K/V loads; fp32 and
-  int8-cache variants), batched prefill GEMM in four M-tiers (128x128
-  double-buffered 8x8-micro-tile wide tier for fp32/fp16 prefill,
-  64/16-row dp4a-or-FMA tiles, multi-row GEMV for M <= 8; int GEMMs run
-  integer micro-kernels with per-tile scale epilogues), flash-style
+  int8-cache variants), batched prefill GEMM in four M-tiers (wide tiles
+  for prefill: 128x128 double-buffered 8x8 micro-tile for fp32/fp16,
+  128x128 and 64x128 dp4a tiles for int8/int4; 64/16-row tiles below,
+  multi-row GEMV for M <= 8; int GEMMs run integer micro-kernels with
+  per-tile scale epilogues), flash-style
   attention, quantize-on-write KV kernels, GELU, SwiGLU combine, GPU
   argmax for graph replay and per-row argmax for draft verification.
 - `src/gpu.rs` — engine: weights uploaded fp32, converted to fp16, or

@@ -232,6 +232,8 @@ struct Kernels {
     gemm_half: CudaFunction,
     gemm_f32_wide: CudaFunction,
     gemm_half_wide: CudaFunction,
+    gemm_int8_wide: CudaFunction,
+    gemm_int4_wide: CudaFunction,
     gemm_int8: CudaFunction,
     gemm_int4: CudaFunction,
     gemm_f32_skinny: CudaFunction,
@@ -480,11 +482,11 @@ fn gemm(
                 .arg(&groups);
             unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
 
-            let cfg = if tier == 3 { cfg_gemm(m, n, 64) } else { cfg };
             let f = match tier {
                 0 => &k.gemm_rows_int8,
                 1 => &k.gemm_int8_skinny,
-                _ => &k.gemm_int8,
+                2 => &k.gemm_int8,
+                _ => &k.gemm_int8_wide,
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
@@ -509,11 +511,21 @@ fn gemm(
                 .arg(&groups);
             unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
 
-            let cfg = if tier == 3 { cfg_gemm(m, n, 64) } else { cfg };
+            // int4 wide tile is 64 rows (not 128) — see gemm_int4_wide
+            let cfg = if tier == 3 {
+                LaunchConfig {
+                    grid_dim: (n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                }
+            } else {
+                cfg
+            };
             let f = match tier {
                 0 => &k.gemm_rows_int4,
                 1 => &k.gemm_int4_skinny,
-                _ => &k.gemm_int4,
+                2 => &k.gemm_int4,
+                _ => &k.gemm_int4_wide,
             };
             let mut lb = stream.launch_builder(f);
             lb.arg(c)
@@ -648,6 +660,8 @@ impl Engine {
             gemm_half: f("gemm_half"),
             gemm_f32_wide: f("gemm_f32_wide"),
             gemm_half_wide: f("gemm_half_wide"),
+            gemm_int8_wide: f("gemm_int8_wide"),
+            gemm_int4_wide: f("gemm_int4_wide"),
             gemm_int8: f("gemm_int8"),
             gemm_int4: f("gemm_int4"),
             gemm_f32_skinny: f("gemm_f32_skinny"),

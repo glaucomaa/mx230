@@ -1075,6 +1075,68 @@ extern "C" __global__ void gemm_int8(float *C, const int *Aq, const float *ascal
     gemm_i8_body<64>(C, Aq, ascale, B32, wscale, bias, M, N, K);
 }
 
+// Wide dp4a tier for real prefill (M > 64), the int edition of the fp32
+// wide tier: 128x128 tile over 32 k-values (8 dp4a words), 256 threads
+// each owning an 8x8 micro-tile — 64 dp4a + 64 scale-FMAs per 24 smem
+// reads, double the old 64-tile's compute-to-smem ratio. With AG == 4
+// each packed word carries its own activation scale, so the scale tile
+// Ss mirrors As word-for-word and the micro-kernel pays one float FMA
+// per dp4a (the price of outlier-proof 4-wide activation groups).
+extern "C" __global__ void gemm_int8_wide(float *C, const int *Aq, const float *ascale,
+                                          const int *B32, const float *wscale,
+                                          const float *bias, int M, int N, int K) {
+    static_assert(AG == 4, "wide int tiles assume one activation scale per word");
+    __shared__ int As[8][128];
+    __shared__ float Ss[8][128];
+    __shared__ int Bs[8][128];
+    int bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    int tid = threadIdx.x;
+    int trow = tid >> 4, tcol = tid & 15;
+    int kq = K / 4;
+    float facc[8][8] = {};
+
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        int kw0 = k0 / 4;
+        for (int i = tid; i < 128 * 8; i += 256) {
+            int m = i >> 3, w = i & 7;
+            bool in = bm + m < M;
+            As[w][m] = in ? Aq[(size_t)(bm + m) * kq + kw0 + w] : 0;
+            Ss[w][m] = in ? ascale[(size_t)(bm + m) * kq + kw0 + w] : 0.0f;
+        }
+        for (int i = tid; i < 8 * 128; i += 256) {
+            int w = i >> 7, n = i & 127;
+            Bs[w][n] = (bn + n < N) ? B32[(size_t)(kw0 + w) * N + bn + n] : 0;
+        }
+        __syncthreads();
+        for (int w = 0; w < 8; ++w) {
+            int rm[8], rn[8];
+            float rs[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                rm[i] = As[w][trow * 8 + i];
+                rs[i] = Ss[w][trow * 8 + i];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) rn[j] = Bs[w][tcol * 8 + j];
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    facc[i][j] += (float)__dp4a(rm[i], rn[j], 0) * rs[i];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < 8; ++i) {
+        int row = bm + trow * 8 + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 8; ++j) {
+            int col = bn + tcol * 8 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = facc[i][j] * wscale[col] + bias[col];
+        }
+    }
+}
+
 extern "C" __global__ void gemm_f32_skinny(float *C, const float *A, const float *B,
                                            const float *bias, int M, int N, int K) {
     gemm_body<float, false, 16>(C, A, B, nullptr, bias, M, N, K);
@@ -1323,6 +1385,84 @@ extern "C" __global__ void gemm_int4(float *C, const int *Aq, const float *ascal
                                      const int *B32, const __half *wscale,
                                      const float *bias, int M, int N, int K) {
     gemm_i4_body<64>(C, Aq, ascale, B32, wscale, bias, M, N, K);
+}
+
+// Wide int4 tier: 64x128 tile over 32 k-values, 256 threads with a 4x8
+// micro-tile. Half the row height of the int8 wide tier because int4
+// needs a second accumulator: the per-32-row fp16 weight scale changes
+// every k-tile, so the micro-kernel collects an activation-scaled partial
+// (tacc) and folds the weight scale once per tile — 4x8 keeps
+// facc + tacc at 64 registers where 8x8 would spill. Packed nibbles
+// unpack to signed bytes once per tile during the Bs fill (__vsubss4),
+// exactly like the 64-tile body.
+extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *ascale,
+                                          const int *B32, const __half *wscale,
+                                          const float *bias, int M, int N, int K) {
+    static_assert(AG == 4, "wide int tiles assume one activation scale per word");
+    __shared__ int As[8][64];
+    __shared__ float Ss[8][64];
+    __shared__ int Bs[8][128];
+    __shared__ float Sw[128];
+    int bm = blockIdx.y * 64, bn = blockIdx.x * 128;
+    int tid = threadIdx.x;
+    int trow = tid >> 4, tcol = tid & 15;
+    int kq = K / 4, kw = K / 8;
+    float facc[4][8] = {};
+
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        int kw0 = k0 / 4;
+        for (int i = tid; i < 64 * 8; i += 256) {
+            int m = i >> 3, w = i & 7;
+            bool in = bm + m < M;
+            As[w][m] = in ? Aq[(size_t)(bm + m) * kq + kw0 + w] : 0;
+            Ss[w][m] = in ? ascale[(size_t)(bm + m) * kq + kw0 + w] : 0.0f;
+        }
+        for (int i = tid; i < 4 * 128; i += 256) {
+            int wr = i >> 7, n = i & 127; // packed word wr = k rows 8wr..8wr+7
+            int wv = (bn + n < N && k0 / 8 + wr < kw)
+                         ? B32[(size_t)(k0 / 8 + wr) * N + bn + n]
+                         : 0x88888888; // nibbles of 8 unpack to 0
+            Bs[2 * wr][n] = __vsubss4(q4_lo8(wv), 0x08080808);
+            Bs[2 * wr + 1][n] = __vsubss4(q4_hi8(wv), 0x08080808);
+        }
+        if (tid < 128) {
+            Sw[tid] = (bn + tid < N)
+                          ? __half2float(wscale[(size_t)(k0 / 32) * N + bn + tid])
+                          : 0.0f;
+        }
+        __syncthreads();
+        float tacc[4][8] = {};
+        for (int w = 0; w < 8; ++w) {
+            int rm[4], rn[8];
+            float rs[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                rm[i] = As[w][trow * 4 + i];
+                rs[i] = Ss[w][trow * 4 + i];
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) rn[j] = Bs[w][tcol * 8 + j];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    tacc[i][j] += (float)__dp4a(rm[i], rn[j], 0) * rs[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) facc[i][j] += tacc[i][j] * Sw[tcol * 8 + j];
+        __syncthreads();
+    }
+    for (int i = 0; i < 4; ++i) {
+        int row = bm + trow * 4 + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 8; ++j) {
+            int col = bn + tcol * 8 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = facc[i][j] + bias[col];
+        }
+    }
 }
 
 extern "C" __global__ void gemm_int4_skinny(float *C, const int *Aq, const float *ascale,
