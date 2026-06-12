@@ -65,15 +65,39 @@ impl WeightMode {
             WeightMode::Int8 => 1.0,
             // packed nibble + one fp16 scale per 32-weight group
             WeightMode::Int4 => 0.5 + 2.0 / Q4_GROUP as f64,
-            // three bits per weight (2-bit planes + hi-bit word) + scale
-            WeightMode::Int3 => 0.375 + 2.0 / Q4_GROUP as f64,
-            // two bits per weight + the same per-32 fp16 scale
-            WeightMode::Int2 => 0.25 + 2.0 / Q4_GROUP as f64,
+            // three bits per weight (2-bit planes + hi-bit word) + k-quants
+            // scales: one (sd, sm) byte per 16, one fp16 (d, m) per 128
+            WeightMode::Int3 => 0.375 + 1.0 / Q_SUB as f64 + 4.0 / Q_SUPER as f64,
+            // two bits per weight + the same two-level scales
+            WeightMode::Int2 => 0.25 + 1.0 / Q_SUB as f64 + 4.0 / Q_SUPER as f64,
+        }
+    }
+
+    /// Storage tier for embeddings and lm_head. Below int4 these tensors
+    /// destroy quality far out of proportion to their bytes, so the low
+    /// rungs keep them one tier up — the same move llama.cpp's Q2_K/Q3_K
+    /// presets make (token_embd/output stay at Q4_K/Q6_K).
+    fn embed_mode(self) -> WeightMode {
+        match self {
+            WeightMode::Int3 | WeightMode::Int2 => WeightMode::Int4,
+            m => m,
+        }
+    }
+
+    /// Storage tier for ffn_down (fc2): the second most damage-prone
+    /// tensor in the Q2_K playbook, bumped one tier on the bottom rung.
+    fn ffn_down_mode(self) -> WeightMode {
+        match self {
+            WeightMode::Int2 => WeightMode::Int4,
+            m => m,
         }
     }
 }
 
 const Q4_GROUP: usize = 32;
+/// k-quants-style two-level blocks for int3/int2 (see quantize_kq)
+const Q_SUB: usize = 16;
+const Q_SUPER: usize = 128;
 
 /// Activation-quantization group size; must match `AG` of the kernel module
 /// the engine loads. GPT-2 needs 4-wide groups (activation outliers wreck
@@ -87,13 +111,15 @@ fn act_group(arch: Arch) -> usize {
 }
 
 /// Approximate weight footprint on device for a given storage mode.
+/// Embeddings/lm_head count at embed_mode and ffn_down at ffn_down_mode
+/// (the low rungs keep those tensors one tier up).
 pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
     let (e, inter) = (c.n_embd, c.n_inter);
-    let mlp = match c.arch {
-        Arch::Gpt2 => 2 * e * inter,
-        Arch::Qwen2 | Arch::Llama => 3 * e * inter,
+    let mlp_up = match c.arch {
+        Arch::Gpt2 => e * inter,
+        Arch::Qwen2 | Arch::Llama => 2 * e * inter,
     };
-    let per_layer = e * c.qkv_dim() + c.q_dim() * e + mlp;
+    let per_layer = e * c.qkv_dim() + c.q_dim() * e + mlp_up;
     let wpe = match c.arch {
         Arch::Gpt2 => c.n_ctx * e,
         _ => 0,
@@ -102,8 +128,13 @@ pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
         Arch::Llama => 2, // untied lm_head
         _ => 1,
     };
-    let params = heads * c.n_vocab * e + wpe + c.n_layer * per_layer;
-    params as f64 * mode.bytes_per_param() / 1e6
+    let embed = heads * c.n_vocab * e;
+    let ffn_down = c.n_layer * inter * e;
+    let body = wpe + c.n_layer * per_layer;
+    (embed as f64 * mode.embed_mode().bytes_per_param()
+        + ffn_down as f64 * mode.ffn_down_mode().bytes_per_param()
+        + body as f64 * mode.bytes_per_param())
+        / 1e6
 }
 
 impl fmt::Display for WeightMode {
@@ -140,12 +171,14 @@ pub enum Weights {
         scales: CudaSlice<f16>, // [(n_in/32), n_out]
     },
     Int3 {
-        q: CudaSlice<u8>,       // 3 int32 words per 32 rows per column (quantize_q3)
-        scales: CudaSlice<f16>, // [(n_in/32), n_out]
+        q: CudaSlice<u8>,   // 3 int32 words per 32 rows per column (quantize_q3)
+        sub: CudaSlice<u8>, // 4-bit (sd, sm) per (16-row sub-block, column)
+        dm: CudaSlice<f16>, // fp16 (d, m) pair per (128-row super-block, column)
     },
     Int2 {
-        q: CudaSlice<u8>,       // int32 words of 16 rows per column (see quantize_q2)
-        scales: CudaSlice<f16>, // [(n_in/32), n_out]
+        q: CudaSlice<u8>,   // int32 words of 16 rows per column (see quantize_q2)
+        sub: CudaSlice<u8>, // 4-bit (sd, sm) per (16-row sub-block, column)
+        dm: CudaSlice<f16>, // fp16 (d, m) pair per (128-row super-block, column)
     },
 }
 
@@ -189,84 +222,189 @@ fn quantize_q4(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
     (q, scales)
 }
 
-/// int3 group quantization: per (32-row group, column), scale = signed
-/// absmax / -4, stored value q+4 in [0, 7] split into two int2-style lo
-/// plane words plus one hi-bit word (byte i%4, bit (i%32)/4) — word rows
-/// interleave as (i/32)*3 + j, matching the dp4a kernels' q3_plane.
-fn quantize_q3(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
-    assert!(
-        n_in.is_multiple_of(Q4_GROUP),
-        "int3 needs n_in divisible by {Q4_GROUP}"
-    );
-    let n_groups = n_in / Q4_GROUP;
-    let mut scales = vec![f16::ZERO; n_groups * n_out];
-    let mut q = vec![0u8; n_groups * 3 * 4 * n_out];
-    for o in 0..n_out {
-        for g in 0..n_groups {
-            let mut m = 0.0f32; // value with the largest magnitude, sign kept
-            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
-                let v = w[i * n_out + o];
-                if v.abs() > m.abs() {
-                    m = v;
-                }
-            }
-            let d = m / -4.0;
-            let dh = f16::from_f32(d);
-            scales[g * n_out + o] = dh;
-            let id = if dh.to_f32() != 0.0 {
-                1.0 / dh.to_f32()
-            } else {
-                0.0
-            };
-            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
-                let v = ((w[i * n_out + o] * id).round() + 4.0).clamp(0.0, 7.0) as u8;
-                let base = (i / 32) * 3;
-                q[((base + (i % 32) / 16) * n_out + o) * 4 + (i % 4)] |=
-                    (v & 3) << (2 * ((i % 16) / 4));
-                q[((base + 2) * n_out + o) * 4 + (i % 4)] |= (v >> 2) << ((i % 32) / 4);
-            }
+/// Least-squares fit of w ~ d*q - m over one sub-block (q unsigned in
+/// [0, qmax], m >= 0), k-quants style: try a grid of scale candidates,
+/// round to q, then solve the 2x2 normal equations for (d, m) and keep
+/// the candidate with the lowest squared error. The fit is uniform:
+/// importance-weighting by |w| (llama.cpp's Q2_K choice) was tried and
+/// cost TinyLlama int2 a 24x perplexity regression on this scheme.
+fn fit_sub(x: &[f32], qmax: f32) -> (f32, f32) {
+    let lo = x.iter().copied().fold(0.0f32, f32::min);
+    let hi = x.iter().copied().fold(0.0f32, f32::max);
+    if hi == lo {
+        return (0.0, 0.0);
+    }
+    let n = x.len() as f32;
+    let sumx: f32 = x.iter().sum();
+    let mut best_dm = ((hi - lo) / qmax, -lo);
+    let mut best_err = f32::INFINITY;
+    for is in -9..=9 {
+        let iscale = (qmax + 0.1 * is as f32) / (hi - lo);
+        let (mut suml, mut suml2, mut sumlx) = (0.0f32, 0.0f32, 0.0f32);
+        let qs: Vec<f32> = x
+            .iter()
+            .map(|&v| ((v - lo) * iscale).round().clamp(0.0, qmax))
+            .collect();
+        for (&v, &q) in x.iter().zip(&qs) {
+            suml += q;
+            suml2 += q * q;
+            sumlx += q * v;
+        }
+        let det = n * suml2 - suml * suml;
+        let (mut d, mut m) = if det > 0.0 {
+            let d = (n * sumlx - sumx * suml) / det;
+            (d, (d * suml - sumx) / n)
+        } else {
+            ((hi - lo) / qmax, -lo)
+        };
+        if m < 0.0 {
+            // negative min can't be stored (4-bit unsigned): refit d alone
+            m = 0.0;
+            d = if suml2 > 0.0 { sumlx / suml2 } else { 0.0 };
+        }
+        let err: f32 = x
+            .iter()
+            .zip(&qs)
+            .map(|(&v, &q)| (d * q - m - v) * (d * q - m - v))
+            .sum();
+        if err < best_err {
+            best_err = err;
+            best_dm = (d, m);
         }
     }
-    (q, scales)
+    best_dm
 }
 
-/// int2 group quantization: per (32-row group, column), scale = signed
-/// absmax / -2, bit pairs store q+2 in [0, 3]. Packing matches the dp4a
-/// kernels: int32 word (i/16)*n_out + o holds rows i..i+15 of column o,
-/// byte j carrying rows i+j, i+4+j, i+8+j, i+12+j in successive bit pairs —
-/// each 2-bit plane lines up with one activation dp4a word.
-fn quantize_q2(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<f16>) {
+/// Two-level k-quants-style quantization shared by int3/int2: asymmetric
+/// w ~ d*q - m per 16-row sub-block (q unsigned in [0, qmax]), with
+/// d = d_super * sd and m = m_super * sm, sd/sm 4-bit packed in one byte
+/// per (sub-block, column) (lo nibble = sd), and (d_super, m_super) one
+/// fp16 pair per (128-row super-block, column). Returns the per-element
+/// q values (column-major [n_out][n_in]) plus both scale planes.
+fn quantize_kq(
+    w: &[f32],
+    n_in: usize,
+    n_out: usize,
+    qmax: u8,
+) -> (Vec<u8>, Vec<u8>, Vec<f16>) {
     assert!(
-        n_in.is_multiple_of(Q4_GROUP),
-        "int2 needs n_in divisible by {Q4_GROUP}"
+        n_in.is_multiple_of(Q_SUPER),
+        "int3/int2 need n_in divisible by {Q_SUPER}"
     );
-    let n_groups = n_in / Q4_GROUP;
-    let mut scales = vec![f16::ZERO; n_groups * n_out];
-    let mut q = vec![0u8; n_in / 4 * n_out];
-    for o in 0..n_out {
-        for g in 0..n_groups {
-            let mut m = 0.0f32; // value with the largest magnitude, sign kept
-            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
-                let v = w[i * n_out + o];
-                if v.abs() > m.abs() {
-                    m = v;
+    let (n_subs, n_supers) = (n_in / Q_SUB, n_in / Q_SUPER);
+    // column-major worker outputs so the grid-search fit (the expensive
+    // part) parallelizes over disjoint column chunks
+    let mut qv_t = vec![0u8; n_in * n_out];
+    let mut sub_t = vec![0u8; n_subs * n_out];
+    let mut dm_t = vec![f16::ZERO; 2 * n_supers * n_out];
+    let qmaxf = qmax as f32;
+    let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cpc = n_out.div_ceil(nthreads); // columns per chunk
+    std::thread::scope(|sc| {
+        let chunks = qv_t
+            .chunks_mut(cpc * n_in)
+            .zip(sub_t.chunks_mut(cpc * n_subs))
+            .zip(dm_t.chunks_mut(cpc * 2 * n_supers));
+        for (ci, ((qc, sc_), dc)) in chunks.enumerate() {
+            sc.spawn(move || {
+                let mut col = vec![0.0f32; Q_SUB];
+                for oc in 0..qc.len() / n_in {
+                    let o = ci * cpc + oc;
+                    for s in 0..n_supers {
+                        let mut fits = [(0.0f32, 0.0f32); Q_SUPER / Q_SUB];
+                        for (t, fit) in fits.iter_mut().enumerate() {
+                            let row0 = s * Q_SUPER + t * Q_SUB;
+                            for (j, c) in col.iter_mut().enumerate() {
+                                *c = w[(row0 + j) * n_out + o];
+                            }
+                            *fit = fit_sub(&col, qmaxf);
+                        }
+                        let dmax = fits.iter().fold(0.0f32, |a, f| a.max(f.0));
+                        let mmax = fits.iter().fold(0.0f32, |a, f| a.max(f.1));
+                        let dsup = f16::from_f32(dmax / 15.0);
+                        let msup = f16::from_f32(mmax / 15.0);
+                        dc[(oc * n_supers + s) * 2] = dsup;
+                        dc[(oc * n_supers + s) * 2 + 1] = msup;
+                        let (dsf, msf) = (dsup.to_f32(), msup.to_f32());
+                        for (t, fit) in fits.iter().enumerate() {
+                            let sd = if dsf > 0.0 {
+                                (fit.0 / dsf).round().clamp(0.0, 15.0) as u8
+                            } else {
+                                0
+                            };
+                            let sm = if msf > 0.0 {
+                                (fit.1 / msf).round().clamp(0.0, 15.0) as u8
+                            } else {
+                                0
+                            };
+                            let row0 = s * Q_SUPER + t * Q_SUB;
+                            sc_[oc * n_subs + row0 / Q_SUB] = sd | (sm << 4);
+                            // re-quantize against the scales the kernel
+                            // will actually use
+                            let (d, m) = (dsf * sd as f32, msf * sm as f32);
+                            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                            for j in 0..Q_SUB {
+                                let i = row0 + j;
+                                qc[oc * n_in + i] = ((w[i * n_out + o] + m) * id)
+                                    .round()
+                                    .clamp(0.0, qmaxf)
+                                    as u8;
+                            }
+                        }
+                    }
                 }
-            }
-            let d = m / -2.0;
-            let dh = f16::from_f32(d);
-            scales[g * n_out + o] = dh;
-            let id = if dh.to_f32() != 0.0 {
-                1.0 / dh.to_f32()
-            } else {
-                0.0
-            };
-            for i in g * Q4_GROUP..(g + 1) * Q4_GROUP {
-                let v = ((w[i * n_out + o] * id).round() + 2.0).clamp(0.0, 3.0) as u8;
-                q[((i / 16) * n_out + o) * 4 + (i % 4)] |= v << (2 * ((i % 16) / 4));
-            }
+            });
+        }
+    });
+    // transpose back to the row-major [block, n_out] device layouts
+    let mut sub = vec![0u8; n_subs * n_out];
+    let mut dm = vec![f16::ZERO; 2 * n_supers * n_out];
+    for o in 0..n_out {
+        for t in 0..n_subs {
+            sub[t * n_out + o] = sub_t[o * n_subs + t];
+        }
+        for s in 0..n_supers {
+            dm[(s * n_out + o) * 2] = dm_t[(o * n_supers + s) * 2];
+            dm[(s * n_out + o) * 2 + 1] = dm_t[(o * n_supers + s) * 2 + 1];
         }
     }
-    (q, scales)
+    (qv_t, sub, dm)
+}
+
+
+/// int3 packing: per-element q in [0, 7] from quantize_kq split into two
+/// int2-style lo plane words plus one hi-bit word (byte i%4, bit (i%32)/4)
+/// — word rows interleave as (i/32)*3 + j, matching the dp4a kernels'
+/// q3_plane.
+fn quantize_q3(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<u8>, Vec<f16>) {
+    let (qv, sub, dm) = quantize_kq(w, n_in, n_out, 7);
+    let mut q = vec![0u8; n_in / 32 * 3 * 4 * n_out];
+    for i in 0..n_in {
+        for o in 0..n_out {
+            let v = qv[o * n_in + i];
+            let base = (i / 32) * 3;
+            q[((base + (i % 32) / 16) * n_out + o) * 4 + (i % 4)] |=
+                (v & 3) << (2 * ((i % 16) / 4));
+            q[((base + 2) * n_out + o) * 4 + (i % 4)] |= (v >> 2) << ((i % 32) / 4);
+        }
+    }
+    (q, sub, dm)
+}
+
+/// int2 packing: per-element q in [0, 3] from quantize_kq into bit pairs.
+/// int32 word (i/16)*n_out + o holds rows i..i+15 of column o, byte j
+/// carrying rows i+j, i+4+j, i+8+j, i+12+j in successive bit pairs — each
+/// 2-bit plane lines up with one activation dp4a word.
+fn quantize_q2(w: &[f32], n_in: usize, n_out: usize) -> (Vec<u8>, Vec<u8>, Vec<f16>) {
+    let (qv, sub, dm) = quantize_kq(w, n_in, n_out, 3);
+    let mut q = vec![0u8; n_in / 4 * n_out];
+    for i in 0..n_in {
+        for o in 0..n_out {
+            q[((i / 16) * n_out + o) * 4 + (i % 4)] |=
+                qv[o * n_in + i] << (2 * ((i % 16) / 4));
+        }
+    }
+    (q, sub, dm)
 }
 
 /// Per-output-channel absmax quantization of a [n_in, n_out] matrix, packed
@@ -465,7 +603,9 @@ fn gemv(
     // (+ group sums and per-32 correction sums for int4's nibble bias)
     let smem = match w {
         Weights::Int8 { .. } => n_in + n_in / k.ag * 4,
-        Weights::Int4 { .. } | Weights::Int3 { .. } | Weights::Int2 { .. } => 3 * n_in + n_in / 8,
+        Weights::Int4 { .. } => 3 * n_in + n_in / 8,
+        // + one fp32 correction sum per 16-row sub-block
+        Weights::Int3 { .. } | Weights::Int2 { .. } => 3 * n_in + n_in / 4,
         _ => n_in * 4,
     };
     let cfg = LaunchConfig {
@@ -508,24 +648,26 @@ fn gemv(
                 .arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int3 { q, scales } => {
+        Weights::Int3 { q, sub, dm } => {
             let mut lb = stream.launch_builder(&k.gemv_int3);
             lb.arg(y)
                 .arg(x)
                 .arg(q)
-                .arg(scales)
+                .arg(sub)
+                .arg(dm)
                 .arg(b)
                 .arg(&ni)
                 .arg(&no)
                 .arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int2 { q, scales } => {
+        Weights::Int2 { q, sub, dm } => {
             let mut lb = stream.launch_builder(&k.gemv_int2);
             lb.arg(y)
                 .arg(x)
                 .arg(q)
-                .arg(scales)
+                .arg(sub)
+                .arg(dm)
                 .arg(b)
                 .arg(&ni)
                 .arg(&no)
@@ -687,7 +829,7 @@ fn gemm(
                 .arg(&k_i);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int3 { q, scales } => {
+        Weights::Int3 { q, sub, dm } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
@@ -710,14 +852,15 @@ fn gemm(
                 .arg(&act.q)
                 .arg(&act.scale)
                 .arg(q)
-                .arg(scales)
+                .arg(sub)
+                .arg(dm)
                 .arg(bias)
                 .arg(&m_i)
                 .arg(&n_i)
                 .arg(&k_i);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int2 { q, scales } => {
+        Weights::Int2 { q, sub, dm } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
@@ -741,7 +884,8 @@ fn gemm(
                 .arg(&act.q)
                 .arg(&act.scale)
                 .arg(q)
-                .arg(scales)
+                .arg(sub)
+                .arg(dm)
                 .arg(bias)
                 .arg(&m_i)
                 .arg(&n_i)
@@ -923,7 +1067,7 @@ impl Engine {
         };
 
         let up = |t: &[f32]| stream.clone_htod(t).unwrap();
-        let upw = |t: &[f32], n_in: usize, n_out: usize| -> Weights {
+        let upw_as = |t: &[f32], n_in: usize, n_out: usize, mode: WeightMode| -> Weights {
             match mode {
                 WeightMode::Fp32 => Weights::F32(up(t)),
                 WeightMode::Fp16 => Weights::F16(stream.clone_htod(&to_half(t)).unwrap()),
@@ -942,21 +1086,24 @@ impl Engine {
                     }
                 }
                 WeightMode::Int3 => {
-                    let (q, s) = quantize_q3(t, n_in, n_out);
+                    let (q, sub, dm) = quantize_q3(t, n_in, n_out);
                     Weights::Int3 {
                         q: stream.clone_htod(&q).unwrap(),
-                        scales: stream.clone_htod(&s).unwrap(),
+                        sub: stream.clone_htod(&sub).unwrap(),
+                        dm: stream.clone_htod(&dm).unwrap(),
                     }
                 }
                 WeightMode::Int2 => {
-                    let (q, s) = quantize_q2(t, n_in, n_out);
+                    let (q, sub, dm) = quantize_q2(t, n_in, n_out);
                     Weights::Int2 {
                         q: stream.clone_htod(&q).unwrap(),
-                        scales: stream.clone_htod(&s).unwrap(),
+                        sub: stream.clone_htod(&sub).unwrap(),
+                        dm: stream.clone_htod(&dm).unwrap(),
                     }
                 }
             }
         };
+        let upw = |t: &[f32], n_in: usize, n_out: usize| upw_as(t, n_in, n_out, mode);
 
         // transpose [v, e] -> [e, v] so the lm_head GEMV is coalesced
         let transpose_ve = |w: &[f32]| {
@@ -997,7 +1144,7 @@ impl Engine {
                 } else {
                     Some(upw(&l.up_w, e, inter))
                 },
-                fc2_w: upw(&l.fc2_w, inter, e),
+                fc2_w: upw_as(&l.fc2_w, inter, e, mode.ffn_down_mode()),
                 fc2_b: opt(&l.fc2_b),
             })
             .collect();
@@ -1005,11 +1152,18 @@ impl Engine {
         Engine {
             config: c,
             k,
-            wte_t: upw(&wte_t, e, v),
+            // embeddings/lm_head stay one tier up on the low rungs — see
+            // WeightMode::embed_mode
+            wte_t: upw_as(&wte_t, e, v, mode.embed_mode()),
             lm_head_t: if model.lm_head.is_empty() {
                 None
             } else {
-                Some(upw(&transpose_ve(&model.lm_head), e, v))
+                Some(upw_as(
+                    &transpose_ve(&model.lm_head),
+                    e,
+                    v,
+                    mode.embed_mode(),
+                ))
             },
             // RoPE models have no learned positions; a zero table keeps the
             // embed kernels uniform across archs
@@ -1127,11 +1281,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int3 { q, scales } => {
+            Weights::Int3 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int3);
                 lb.arg(&mut self.x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&tok)
                     .arg(&pos)
@@ -1139,11 +1294,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int2 { q, scales } => {
+            Weights::Int2 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int2);
                 lb.arg(&mut self.x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&tok)
                     .arg(&pos)
@@ -1204,11 +1360,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int3 { q, scales } => {
+            Weights::Int3 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int3_dyn);
                 lb.arg(&mut self.x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&self.graph_tok)
                     .arg(&self.graph_pos)
@@ -1216,11 +1373,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int2 { q, scales } => {
+            Weights::Int2 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int2_dyn);
                 lb.arg(&mut self.x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&self.graph_tok)
                     .arg(&self.graph_pos)
@@ -1701,11 +1859,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
             }
-            Weights::Int3 { q, scales } => {
+            Weights::Int3 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int3_batch);
                 lb.arg(&mut self.batch_x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
@@ -1714,11 +1873,12 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
             }
-            Weights::Int2 { q, scales } => {
+            Weights::Int2 { q, sub, dm } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int2_batch);
                 lb.arg(&mut self.batch_x)
                     .arg(q)
-                    .arg(scales)
+                    .arg(sub)
+                    .arg(dm)
                     .arg(&self.wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)

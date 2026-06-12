@@ -33,7 +33,7 @@ GPT-2 124M:
 | **ours, int8 + graph**  | 124 MB  | **276.0**  |
 | **ours, int4 (dp4a)**   | 70 MB   | **371.1** (quality collapses — see ppl) |
 | **ours, int4 + graph + kv8** | 70 MB | **388.0** |
-| **ours, int3 / int2**   | 54 / 39 MB | **395.3 / 420.5** (quality long gone) |
+| **ours, int3 / int2**   | 62 / 57 MB | **429.4 / 424.0** (k-quants rungs — see ppl) |
 | HF transformers (torch CPU) | 497 MB | 45.1   |
 
 Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
@@ -45,7 +45,7 @@ Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
 | **ours, int4 (dp4a)**   | 278 MB  | **104.1**  |
 | **ours, int4 + graph**  | 278 MB  | **108.6**  |
 | **ours, int4 + spec**   | 278 MB  | **129.4**  |
-| **ours, int3 / int2**   | 216 / 154 MB | **124.7 / 149.8** (see ppl) |
+| **ours, int3 / int2**   | 244 / 222 MB | **125.2 / 125.4** (see ppl) |
 
 TinyLlama-1.1B (22 layers, GQA 32q/4kv, SwiGLU, RoPE, untied lm_head,
 n_ctx 2048 — the full trained window):
@@ -55,16 +55,16 @@ n_ctx 2048 — the full trained window):
 | **ours, int8 (dp4a)**   | 1100 MB | **38.9**   |
 | **ours, int4 (dp4a)**   | 619 MB  | **61.8**   |
 | **ours, int4 + spec**   | 619 MB  | **74.0**   |
-| **ours, int3 (dp4a)**   | 481 MB  | **76.8** (+1.1 ppl — usable) |
-| **ours, int2 (dp4a)**   | 344 MB  | **92.6** (quality collapses) |
+| **ours, int3 (dp4a)**   | 528 MB  | **71.7** (+0.65 ppl — usable) |
+| **ours, int2 (dp4a)**   | 462 MB  | **79.2** (ppl 40 — bottom rung) |
 
 Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — it does not fit in 2 GB VRAM,
 so fp16/int8 storage is not an optimization here but the only way the model
 runs at all. TinyLlama-1.1B pushes that one step further: even fp16 is
 2.2 GB, so the model exists on this card only as int8 (1.1 GB, barely) or
-int4 (619 MB, comfortably) or int3 (481 MB, +1.1 ppl). And PyTorch still
+int4 (619 MB, comfortably) or int3 (528 MB, +0.65 ppl). And PyTorch still
 can't touch this GPU (no sm_61 kernels), so a 1.1B-parameter model
-generating coherent text at 62–77 tok/s over its full 2048-token window
+generating coherent text at 62–72 tok/s over its full 2048-token window
 on a 2019 laptop card is the engine's closing argument.
 
 PyTorch GPU is not in the table for a reason worth stating: current torch
@@ -263,15 +263,35 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   int4 prefill went from 35% behind int8 to nearly level (GPT-2 0.225s vs
   0.202s, TinyLlama 1.56s vs 1.19s @512) — the remaining gap is the
   per-tile weight-scale fold and the half-height wide tile it forces.
-- **int3 and int2 finish the bit ladder.** int3 packs two int2-style
-  lo-plane words plus a hi-bit word per 32-row group (a dp4a plane
-  assembles as `lo2 | hi << 2`); int2 is four bit-pair planes in one
-  word. Both fold their bias analytically in the GEMV like int4 does.
-  On TinyLlama int3 is a real operating point — 76.8 tok/s at 481 MB for
-  +1.1 ppl over int4 — while int2 (92.6 tok/s, 344 MB) destroys quality
-  on every model (ppl 152 on TinyLlama, 4e4 on Qwen, 1e12 on GPT-2):
-  naive absmax at 2 bits has no answer to anything, exactly in model-size
-  order. Bytes keep winning until the bits run out.
+- **int3 and int2 finish the bit ladder — with k-quants two-level
+  scales.** int3 packs two int2-style lo-plane words plus a hi-bit word
+  per 32-row group (a dp4a plane assembles as `lo2 | hi << 2`); int2 is
+  four bit-pair planes in one word. The first cut used one fp16 absmax
+  scale per 32 rows, and below 4 bits that simply dies (ppl 152 on
+  TinyLlama, 4e4 on Qwen, 1e12 on GPT-2). The fix is the Q2_K/Q3_K
+  playbook from llama.cpp, both halves of it. First, two-level
+  asymmetric scales: `w = d*q - m` per 16-row sub-block (a grid-search
+  least-squares fit, q stored unsigned in the same bit planes), with
+  4-bit sub-scales for d and m packed one byte per sub-block and one
+  fp16 (d, m) pair per 128-row super-block — 2.75/3.75 bits per weight
+  instead of 2.5/3.5. The `-m` term folds analytically into the same
+  activation sums the int4 path already tracks (in the GEMMs one extra
+  `dp4a(a, 0x01010101)` per word builds them). Second, mixed precision:
+  embeddings, lm_head and ffn_down are exactly the tensors llama.cpp
+  refuses to take below 4 bits, and the bottom rungs here do the same
+  (int4 for embeddings/lm_head on int3/int2, plus ffn_down on int2).
+  Result: int3 becomes a real operating point everywhere it wasn't —
+  TinyLlama 6.69 ppl (+0.65 over int4, was +1.1) at 528 MB, Qwen 17.1
+  (was 27.7) — and int2 climbs out of total collapse on every model
+  (TinyLlama 152 → 40, Qwen 4e4 → 82, GPT-2 1e12 → 6268) while staying
+  unusable, which is itself the honest result: at 2 bits the scales are
+  no longer the problem, the 4 quantization levels are. One trade
+  surfaced: the ffn_down bump hands back enough bytes that int2 loses
+  its speed edge over int3 (GPT-2 424 vs 429 tok/s, Qwen 125.4 vs
+  125.2) — int3 now strictly dominates it on this card. A negative
+  result worth recording: importance-weighting the fit by |w| (which
+  llama.cpp does) made TinyLlama int2 24x *worse* here — uniform
+  least-squares won.
 - **int8 KV cache** (`--kv8`): K/V rows are quantized on write with one
   absmax scale per (position, head) and dequantized inside the attention
   kernel. The cache shrinks 75.5 → 19.6 MB and its traffic — the only part
@@ -319,22 +339,22 @@ quality-vs-traffic table instead of only argmax agreement.
 | GPT-2 | fp16 | fp32 | 2047                  | 25.396     |
 | GPT-2 | int8 | fp32 | 2047                  | 25.657     |
 | GPT-2 | int4 | fp32 | 2047                  | **264.2**  |
-| GPT-2 | int3 | fp32 | 2047                  | **3.2e5**  |
-| GPT-2 | int2 | fp32 | 2047                  | **1.3e12** |
+| GPT-2 | int3 | fp32 | 2047                  | **408.5** (was 3.2e5 pre-k-quants) |
+| GPT-2 | int2 | fp32 | 2047                  | **6268** (was 1.3e12) |
 | GPT-2 | fp32 | int8 | 2047                  | 25.363     |
 | GPT-2 | fp16 | int8 | 2047                  | 25.377     |
 | GPT-2 | int8 | int8 | 2047                  | 25.651     |
 | Qwen  | fp16 | fp32 | 2047                  | 12.463     |
 | Qwen  | int8 | fp32 | 2047                  | 12.460     |
 | Qwen  | int4 | fp32 | 2047                  | 14.269     |
-| Qwen  | int3 | fp32 | 2047                  | 27.701     |
-| Qwen  | int2 | fp32 | 2047                  | **4.0e4**  |
+| Qwen  | int3 | fp32 | 2047                  | 17.083 (was 27.7) |
+| Qwen  | int2 | fp32 | 2047                  | **82.4** (was 4.0e4) |
 | Qwen  | fp16 | int8 | 2047                  | 12.939     |
 | Qwen  | int8 | int8 | 2047                  | 12.953     |
 | TinyLlama | int8 | fp32 | 2047              | 5.782      |
 | TinyLlama | int4 | fp32 | 2047              | 6.043      |
-| TinyLlama | int3 | fp32 | 2047              | 7.152      |
-| TinyLlama | int2 | fp32 | 2047              | **152.3**  |
+| TinyLlama | int3 | fp32 | 2047              | 6.686 (was 7.152) |
+| TinyLlama | int2 | fp32 | 2047              | **40.1** (was 152.3) |
 | TinyLlama | int8 | int8 | 2047              | 5.786      |
 | TinyLlama | int4 | int8 | 2047              | 6.043     |
 
@@ -346,6 +366,11 @@ project for zero weight bytes.)
 fly in 4-value absmax groups. The group size matters: 32-wide groups cost
 GPT-2 +0.7 ppl because of its activation outliers; at 4 the damage is zero
 and the speed identical.)
+
+(int3/int2 are the k-quants-style two-level rows: 16-row sub-blocks fit as
+`w = d*q - m` with 4-bit sub-scales under a 128-row fp16 super-scale pair,
+and embeddings/lm_head — plus ffn_down on int2 — stay at int4, the same
+tensors llama.cpp's Q2_K/Q3_K presets refuse to shrink.)
 
 Several quality stories in one table. Int8 *weights* stay almost free on
 every model (Qwen 12.468 vs 12.463 fp16). The int8 *KV cache* depends on GQA
