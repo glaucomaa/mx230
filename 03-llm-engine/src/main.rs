@@ -311,6 +311,32 @@ fn main() {
                 println!("  OK");
             }
 
+            // the short prompt above stays under 64 tokens, so its batch
+            // prefill only exercises the small GEMM tiers. A >64-token prompt
+            // drives the wide tier (tier 3: gemm_*_wide); batch-vs-decode
+            // argmax must still agree for every weight mode.
+            let mut long_ids = Vec::new();
+            while long_ids.len() <= 80 {
+                long_ids.extend(tok.encode(
+                    "Alan Turing was a British mathematician and pioneer of computer science. ",
+                ));
+            }
+            long_ids.truncate(96);
+            println!("wide-tier batch prefill (M={}):", long_ids.len());
+            for &mode in modes_for(choice.arch) {
+                let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
+                let mut logits = Vec::new();
+                for (pos, &t) in long_ids.iter().enumerate() {
+                    logits = engine.forward(t, pos);
+                }
+                let d = gpu::argmax(&logits);
+                drop(engine);
+                let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
+                let b = gpu::argmax(&engine.prefill(&long_ids, 0));
+                assert_eq!(d, b, "{mode} wide-tier batch prefill argmax mismatch (M={})", long_ids.len());
+                println!("  {mode}: decode={d} batch={b}  OK");
+            }
+
             // a prompt with repeated n-grams guarantees prompt_lookup finds
             // drafts, so the verify/accept path is actually exercised (the
             // fallback path still runs on the non-repeating stretches)

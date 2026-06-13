@@ -801,10 +801,10 @@ fn gemm(
                 .arg(&groups);
             unsafe { lb.launch(cfg1d(groups as usize)) }.unwrap();
 
-            // int4 wide tile is 64 rows (not 128) — see gemm_int4_wide
+            // int4 wide tile is 128x64 (full row height) — see gemm_int4_wide
             let cfg = if tier == 3 {
                 LaunchConfig {
-                    grid_dim: (n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1),
+                    grid_dim: (n.div_ceil(64) as u32, m.div_ceil(128) as u32, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 }

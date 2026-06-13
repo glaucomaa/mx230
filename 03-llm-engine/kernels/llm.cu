@@ -1766,69 +1766,65 @@ extern "C" __global__ void gemm_int4(float *C, const int *Aq, const float *ascal
     gemm_i4_body<64>(C, Aq, ascale, B32, wscale, bias, M, N, K);
 }
 
-// Wide int4 tier: 64x128 tile over 32 k-values, 256 threads with a 4x8
-// micro-tile. Half the row height of the int8 wide tier because int4
-// needs a second accumulator: the per-32-row fp16 weight scale changes
-// every k-tile, so the micro-kernel collects an activation-scaled partial
-// (tacc) and folds the weight scale once per tile — 4x8 keeps
-// facc + tacc at 64 registers where 8x8 would spill. Packed nibbles
-// unpack to signed bytes once per tile during the Bs fill (__vsubss4),
-// exactly like the 64-tile body.
+// Wide int4 tier: 128x64 tile over 32 k-values, 256 threads with an 8x4
+// micro-tile. Full row height (matches the int8 wide tier), so prefill reads
+// the weight matrix M/128 times, not M/64 — the old half-height tile doubled
+// weight traffic, which dominates a memory-bound prefill. int4 still needs a
+// second accumulator (the per-32-row fp16 weight scale changes every k-tile),
+// so the micro-kernel keeps an activation-scaled partial (tacc) and folds the
+// weight scale once per tile; an 8x4 micro-tile holds facc + tacc in the same
+// 64 registers the old 64x128 4x8 shape used — taller tile, free of cost.
+// Packed nibbles unpack to signed bytes once per tile during the Bs fill
+// (__vsubss4), exactly like the 64-tile body.
 extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *ascale,
                                           const int *B32, const __half *wscale,
                                           const float *bias, int M, int N, int K) {
-    constexpr int WG = AG / 4; // dp4a words per activation-scale group
-    constexpr int SC = WG == 1 ? 2 : 1; // scale loads per staging thread
-    __shared__ int As[2][8][64];
-    __shared__ float Ss[2][8 / WG][64];
-    __shared__ int Bs[2][8][128];
-    __shared__ float Sw[2][128];
-    int bm = blockIdx.y * 64, bn = blockIdx.x * 128;
+    constexpr int WG = AG / 4;   // dp4a words per activation-scale group
+    constexpr int SC = 4 / WG;   // scale loads per staging thread (4 A words)
+    __shared__ int As[2][8][128];
+    __shared__ float Ss[2][8 / WG][128];
+    __shared__ int Bs[2][8][64];
+    __shared__ float Sw[2][64];
+    int bm = blockIdx.y * 128, bn = blockIdx.x * 64;
     int tid = threadIdx.x;
-    int arow = tid >> 2, acol = (tid & 3) * 2; // A: one int2 each
-    int pwr = tid >> 7, pn = tid & 127;        // B: packed words pwr and pwr+2
+    int arow = tid >> 1, acol = (tid & 1) * 4; // A: one int4 (4 words) each
+    int bwr = tid >> 6, bcol = tid & 63;       // B: packed word bwr, column bcol
     int trow = tid >> 4, tcol = tid & 15;
     int kq = K / 4, kw = K / 8;
-    float facc[4][8] = {};
-    int a2[2], pb[2];
+    float facc[8][4] = {};
+    int a4[4], pb;
     float sg[SC], swv;
 
     auto stage = [&](int k0) {
         if (bm + arow < M) {
-            *reinterpret_cast<int2 *>(a2) = *reinterpret_cast<const int2 *>(
+            *reinterpret_cast<int4 *>(a4) = *reinterpret_cast<const int4 *>(
                 &Aq[(size_t)(bm + arow) * kq + k0 / 4 + acol]);
 #pragma unroll
             for (int j = 0; j < SC; ++j)
                 sg[j] = ascale[(size_t)(bm + arow) * (kq / WG) + (k0 / 4 + acol) / WG + j];
         } else {
-            a2[0] = a2[1] = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) a4[j] = 0;
 #pragma unroll
             for (int j = 0; j < SC; ++j) sg[j] = 0.0f;
         }
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            int wr = pwr + 2 * r; // packed word wr covers k rows 8wr..8wr+7
-            pb[r] = (bn + pn < N && k0 / 8 + wr < kw)
-                        ? B32[(size_t)(k0 / 8 + wr) * N + bn + pn]
-                        : 0x88888888; // nibbles of 8 unpack to 0
-        }
-        if (tid < 128)
+        // packed word bwr covers k rows 8*bwr..8*bwr+7 of this 32-k tile
+        pb = (bn + bcol < N && k0 / 8 + bwr < kw)
+                 ? B32[(size_t)(k0 / 8 + bwr) * N + bn + bcol]
+                 : 0x88888888; // nibbles of 8 unpack to 0
+        if (tid < 64)
             swv = (bn + tid < N)
                       ? __half2float(wscale[(size_t)(k0 / 32) * N + bn + tid])
                       : 0.0f;
     };
     auto store = [&](int buf) {
-        As[buf][acol + 0][arow] = a2[0];
-        As[buf][acol + 1][arow] = a2[1];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) As[buf][acol + j][arow] = a4[j];
 #pragma unroll
         for (int j = 0; j < SC; ++j) Ss[buf][acol / WG + j][arow] = sg[j];
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            int wr = pwr + 2 * r;
-            Bs[buf][2 * wr][pn] = __vsubss4(q4_lo8(pb[r]), 0x08080808);
-            Bs[buf][2 * wr + 1][pn] = __vsubss4(q4_hi8(pb[r]), 0x08080808);
-        }
-        if (tid < 128) Sw[buf][tid] = swv;
+        Bs[buf][2 * bwr][bcol] = __vsubss4(q4_lo8(pb), 0x08080808);
+        Bs[buf][2 * bwr + 1][bcol] = __vsubss4(q4_hi8(pb), 0x08080808);
+        if (tid < 64) Sw[buf][tid] = swv;
     };
 
     stage(0);
@@ -1837,23 +1833,23 @@ extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *
     int buf = 0;
     for (int k0 = 0; k0 < K; k0 += 32) {
         if (k0 + 32 < K) stage(k0 + 32);
-        float tacc[4][8] = {};
+        float tacc[8][4] = {};
         for (int g = 0; g < 8 / WG; ++g) {
-            int rm[WG][4], rn[WG][8];
-            float rs[4];
+            int rm[WG][8], rn[WG][4];
+            float rs[8];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) rs[i] = Ss[buf][g][trow * 4 + i];
+            for (int i = 0; i < 8; ++i) rs[i] = Ss[buf][g][trow * 8 + i];
 #pragma unroll
             for (int w = 0; w < WG; ++w) {
 #pragma unroll
-                for (int i = 0; i < 4; ++i) rm[w][i] = As[buf][g * WG + w][trow * 4 + i];
+                for (int i = 0; i < 8; ++i) rm[w][i] = As[buf][g * WG + w][trow * 8 + i];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) rn[w][j] = Bs[buf][g * WG + w][tcol * 8 + j];
+                for (int j = 0; j < 4; ++j) rn[w][j] = Bs[buf][g * WG + w][tcol * 4 + j];
             }
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 8; ++i)
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
+                for (int j = 0; j < 4; ++j) {
                     int acc = 0;
 #pragma unroll
                     for (int w = 0; w < WG; ++w) acc = __dp4a(rm[w][i], rn[w][j], acc);
@@ -1861,19 +1857,19 @@ extern "C" __global__ void gemm_int4_wide(float *C, const int *Aq, const float *
                 }
         }
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 8; ++i)
 #pragma unroll
-            for (int j = 0; j < 8; ++j)
-                facc[i][j] += tacc[i][j] * Sw[buf][tcol * 8 + j];
+            for (int j = 0; j < 4; ++j)
+                facc[i][j] += tacc[i][j] * Sw[buf][tcol * 4 + j];
         if (k0 + 32 < K) store(buf ^ 1);
         __syncthreads();
         buf ^= 1;
     }
-    for (int i = 0; i < 4; ++i) {
-        int row = bm + trow * 4 + i;
+    for (int i = 0; i < 8; ++i) {
+        int row = bm + trow * 8 + i;
         if (row >= M) continue;
-        for (int j = 0; j < 8; ++j) {
-            int col = bn + tcol * 8 + j;
+        for (int j = 0; j < 4; ++j) {
+            int col = bn + tcol * 4 + j;
             if (col >= N) continue;
             C[(size_t)row * N + col] = facc[i][j] + bias[col];
         }
