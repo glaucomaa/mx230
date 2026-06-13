@@ -155,6 +155,19 @@ fn perplexity(engine: &mut gpu::Engine, tokens: &[u32]) -> (f64, usize) {
     ((nll / count as f64).exp(), count)
 }
 
+/// A mode flag restricts a sweep to that one mode (fast iteration: the
+/// k-quants load-time fit is minutes on the 1.1B model).
+fn mode_filter(args: &[String]) -> Option<gpu::WeightMode> {
+    args.iter()
+        .any(|a| {
+            matches!(
+                a.as_str(),
+                "--fp32" | "--fp16" | "--int8" | "--int4" | "--int3" | "--int2"
+            )
+        })
+        .then(|| gpu::WeightMode::parse(args))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -368,9 +381,13 @@ fn main() {
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
+            let only = mode_filter(&args);
             println!("| mode | weights | kv | graph | spec | tokens/sec |");
             println!("|------|---------|----|-------|------|------------|");
             for &mode in modes_for(choice.arch) {
+                if only.is_some_and(|m| m != mode) {
+                    continue;
+                }
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 // warmup + prefill
                 let mut logits = engine.prefill(&ids, 0);
@@ -420,10 +437,14 @@ fn main() {
             ids.truncate(max_prompt);
             let ctx = CudaContext::new(0).unwrap();
 
+            let only = mode_filter(&args);
             println!("prompt tokens: {}", ids.len());
             println!("| mode | kv | token-loop TTFT | batch TTFT | speedup |");
             println!("|------|----|-----------------|------------|---------|");
             for &mode in modes_for(choice.arch) {
+                if only.is_some_and(|m| m != mode) {
+                    continue;
+                }
                 let mut loop_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 let t0 = Instant::now();
                 for (pos, &t) in ids.iter().enumerate() {
@@ -466,17 +487,7 @@ fn main() {
             assert!(ids.len() > 1, "need at least two tokens for perplexity");
             let ctx = CudaContext::new(0).unwrap();
 
-            // a mode flag restricts the sweep to that mode (fast iteration:
-            // the k-quants load-time fit is minutes on the 1.1B model)
-            let only = args
-                .iter()
-                .any(|a| {
-                    matches!(
-                        a.as_str(),
-                        "--fp32" | "--fp16" | "--int8" | "--int4" | "--int3" | "--int2"
-                    )
-                })
-                .then(|| gpu::WeightMode::parse(&args));
+            let only = mode_filter(&args);
             println!("dataset: {} ({} tokens)", data_path.display(), ids.len());
             println!("| mode | weights | kv | tokens | perplexity |");
             println!("|------|---------|----|--------|------------|");

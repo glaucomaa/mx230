@@ -2496,6 +2496,12 @@ extern "C" __global__ void copy_kv_batch(float *kcache, float *vcache, const flo
 // softmax with running max/sum, no materialized score matrix. The query at
 // row qi sits at absolute position pos0 + qi and attends to keys 0..pos0+qi.
 // head_dim is fixed at 64 (q and acc live in registers).
+//
+// The Q8 (kv8) variant scores on dp4a like the decode kernel: K tiles stay
+// int8 in shared memory (16 words per row instead of 64 floats), q is
+// quantized in registers with one absmax scale per (row, head), and the
+// 64-dim dot is 16 dp4a. V still dequantizes to floats — the softmax-
+// weighted accumulation stays fp32.
 template <bool Q8>
 __device__ void attn_prefill_body(float *out, const float *qkv,
                                   const float *kcache, const float *vcache,
@@ -2503,7 +2509,9 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                                   const float *ks, const float *vs,
                                   int pos0, int n_tok, int n_head, int n_kv_head,
                                   int qkv_stride, int out_stride) {
-    __shared__ float Kt[64][64];
+    __shared__ float Kt[Q8 ? 1 : 64][64];
+    __shared__ int Kq[Q8 ? 64 : 1][16];
+    __shared__ float Ks[Q8 ? 64 : 1];
     __shared__ float Vt[64][64];
     int h = blockIdx.x;
     int tile0 = blockIdx.y * 64;
@@ -2515,20 +2523,44 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
     int pq = pos0 + (active ? qi : 0);
 
     float q[64], acc[64] = {};
+    int qw[16];
+    float qs = 0.0f; // dequant scale of this thread's quantized q row
     float m = -CUDART_INF_F, l = 0.0f;
     if (active) {
         for (int d = 0; d < 64; ++d) q[d] = qkv[(size_t)qi * qkv_stride + h * 64 + d];
+        if (Q8) {
+            float amax = 0.0f;
+            for (int d = 0; d < 64; ++d) amax = fmaxf(amax, fabsf(q[d]));
+            float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+            for (int w = 0; w < 16; ++w) {
+                int packed = 0;
+                for (int j = 0; j < 4; ++j) {
+                    int v = max(-127, min(127, __float2int_rn(q[4 * w + j] * id)));
+                    packed |= (v & 0xFF) << (8 * j);
+                }
+                qw[w] = packed;
+            }
+            qs = amax > 0.0f ? amax / 127.0f : 0.0f;
+        }
     }
     float scale = rsqrtf(64.0f);
 
     int max_key = pos0 + min(tile0 + 63, n_tok - 1);
     for (int kt = 0; kt <= max_key; kt += 64) {
         int tile_n = min(64, max_key - kt + 1);
+        if (Q8) {
+            const int *k32 = (const int *)kq;
+            for (int x = tid; x < tile_n * 16; x += 64) {
+                int r = x / 16, w = x % 16;
+                Kq[r][w] = k32[((size_t)(kt + r) * kvd + kvh * 64) / 4 + w];
+            }
+            for (int r = tid; r < tile_n; r += 64) {
+                Ks[r] = ks[(kt + r) * n_kv_head + kvh];
+            }
+        }
         for (int x = tid; x < tile_n * 64; x += 64) {
             int r = x / 64, d = x % 64;
             if (Q8) {
-                Kt[r][d] = (float)kq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
-                           ks[(kt + r) * n_kv_head + kvh];
                 Vt[r][d] = (float)vq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
                            vs[(kt + r) * n_kv_head + kvh];
             } else {
@@ -2541,9 +2573,17 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
             for (int j = 0; j < tile_n; ++j) {
                 int kp = kt + j;
                 if (kp > pq) break;
-                float dot = 0.0f;
-                for (int d = 0; d < 64; ++d) dot += q[d] * Kt[j][d];
-                float s = dot * scale;
+                float s;
+                if (Q8) {
+                    int dot = 0;
+#pragma unroll
+                    for (int w = 0; w < 16; ++w) dot = __dp4a(qw[w], Kq[j][w], dot);
+                    s = (float)dot * qs * Ks[j] * scale;
+                } else {
+                    float dot = 0.0f;
+                    for (int d = 0; d < 64; ++d) dot += q[d] * Kt[j][d];
+                    s = dot * scale;
+                }
                 float mn = fmaxf(m, s);
                 float corr = __expf(m - mn);
                 float p = __expf(s - mn);
