@@ -13,7 +13,7 @@ pipeline (`--model gpt2|qwen|tinyllama`, default gpt2):
 ```
 cargo run -rp llm-engine -- export [--model qwen]     # download + convert weights
 cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int3|--int2] [--kv8] [--spec]
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec]
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
@@ -263,6 +263,26 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   int4 prefill went from 35% behind int8 to nearly level (GPT-2 0.225s vs
   0.202s, TinyLlama 1.56s vs 1.19s @512) — the remaining gap is the
   per-tile weight-scale fold and the half-height wide tile it forces.
+- **`--int4k` is the same nibbles with k-quants two-level scales (Q4_K),
+  a separate opt-in mode — quality up, speed down.** It reuses the int4
+  nibble packing but swaps the single Q4_0 scale for the same two-level
+  `w = d*q - m` fit the int3/int2 paths use (16-row sub-blocks, 128-row
+  fp16 super-pair, the `-m` term folded through the activation sums), at
+  4.75 bits/weight vs 4.5. The quality gain tracks how fragile the model
+  is: GPT-2 perplexity 264 → 81 (the 124M model's outliers were wrecking
+  one scale per 32 rows), but only 14.27 → 14.00 on Qwen and 6.04 → 5.98
+  on TinyLlama, where Q4_0 is already near the 4-bit floor. The cost is
+  real on this card: the richer dequant is ~2x the scale work per row at
+  the same dp4a density, so decode drops 20-32% and prefill rises ~25%.
+  One occupancy lesson on the way: the first wide-tile cut spent 150
+  registers (a per-tile `sx[2][8]` plus a doubled per-sub-block fold) and
+  fell to one block/SM (12.5% occupancy), nearly doubling prefill;
+  `__launch_bounds__(256, 2)` pinned it to exactly 128 registers with
+  zero spills — two blocks/SM, same as the int8 wide tile — and a single
+  `tacc[8][4]` folded per sub-block (not the `tacc[2][...]` that spilled
+  the int3/int2 wide attempts) kept it there. So `--int4` stays the fast
+  default and `--int4k` is there when the bits matter more than the
+  tokens/sec.
 - **int3 and int2 finish the bit ladder — with k-quants two-level
   scales.** int3 packs two int2-style lo-plane words plus a hi-bit word
   per 32-row group (a dp4a plane assembles as `lo2 | hi << 2`); int2 is
@@ -338,7 +358,8 @@ quality-vs-traffic table instead of only argmax agreement.
 | GPT-2 | fp32 | fp32 | 2047                  | 25.388     |
 | GPT-2 | fp16 | fp32 | 2047                  | 25.396     |
 | GPT-2 | int8 | fp32 | 2047                  | 25.657     |
-| GPT-2 | int4 | fp32 | 2047                  | **264.2**  |
+| GPT-2 | int4 | fp32 | 2047                  | **264.2** (Q4_0) |
+| GPT-2 | int4k | fp32 | 2047                 | **81.25** (Q4_K — 3.25x better than Q4_0) |
 | GPT-2 | int3 | fp32 | 2047                  | **408.5** (was 3.2e5 pre-k-quants) |
 | GPT-2 | int2 | fp32 | 2047                  | **6268** (was 1.3e12) |
 | GPT-2 | fp32 | int8 | 2047                  | 25.363     |
@@ -346,17 +367,20 @@ quality-vs-traffic table instead of only argmax agreement.
 | GPT-2 | int8 | int8 | 2047                  | 25.651     |
 | Qwen  | fp16 | fp32 | 2047                  | 12.463     |
 | Qwen  | int8 | fp32 | 2047                  | 12.460     |
-| Qwen  | int4 | fp32 | 2047                  | 14.269     |
+| Qwen  | int4 | fp32 | 2047                  | 14.269 (Q4_0) |
+| Qwen  | int4k | fp32 | 2047                 | 13.998 (Q4_K) |
 | Qwen  | int3 | fp32 | 2047                  | 17.083 (was 27.7) |
 | Qwen  | int2 | fp32 | 2047                  | **82.4** (was 4.0e4) |
 | Qwen  | fp16 | int8 | 2047                  | 12.939     |
 | Qwen  | int8 | int8 | 2047                  | 12.953     |
 | TinyLlama | int8 | fp32 | 2047              | 5.782      |
-| TinyLlama | int4 | fp32 | 2047              | 6.043      |
+| TinyLlama | int4 | fp32 | 2047              | 6.043 (Q4_0) |
+| TinyLlama | int4k | fp32 | 2047             | 5.980 (Q4_K) |
 | TinyLlama | int3 | fp32 | 2047              | 6.686 (was 7.152) |
 | TinyLlama | int2 | fp32 | 2047              | **40.1** (was 152.3) |
 | TinyLlama | int8 | int8 | 2047              | 5.786      |
-| TinyLlama | int4 | int8 | 2047              | 6.043     |
+| TinyLlama | int4 | int8 | 2047              | 6.043 (Q4_0) |
+| TinyLlama | int4k | int8 | 2047             | 5.981 (Q4_K) |
 
 (TinyLlama rows are over its full 2048-token window — the n_ctx bump from
 1024 alone took int8 from 7.356 to 5.782, the biggest quality jump in the
@@ -366,6 +390,11 @@ project for zero weight bytes.)
 fly in 4-value absmax groups. The group size matters: 32-wide groups cost
 GPT-2 +0.7 ppl because of its activation outliers; at 4 the damage is zero
 and the speed identical.)
+
+(int4 is Q4_0 (one fp16 scale per 32 rows); int4k is the opt-in Q4_K variant
+with k-quants two-level sub-block scales — better quality, ~20-32% slower
+decode. The gap is largest exactly where Q4_0's single scale hurts most: the
+124M GPT-2 (264 → 81), tiny on the bigger models already near the 4-bit floor.)
 
 (int3/int2 are the k-quants-style two-level rows: 16-row sub-blocks fit as
 `w = d*q - m` with 4-bit sub-scales under a 128-row fp16 super-scale pair,

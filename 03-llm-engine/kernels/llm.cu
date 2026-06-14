@@ -300,24 +300,177 @@ extern "C" __global__ void gemv_int8(float *y, const float *x, const signed char
     }
 }
 
-// ---- int4 weights (Q4_0-style), dp4a math ----------------------------------
+// ---- int4 weights (--int4k): k-quants two-level scales, dp4a math ----------
 // Eight weights per int32 word packed along n_in: word (i/8)*n_out + o
 // holds rows i..i+7 of column o, byte j carrying rows i+j (low nibble) and
-// i+4+j (high nibble), nibbles store q+8 with q in [-8, 7]. That byte order
-// lines both nibble planes up with the activation dp4a words:
-// (w & 0x0F0F0F0F) pairs with x[i..i+3], (w >> 4 & ...) with x[i+4..i+7].
-// One fp16 scale per (32-row group, column): scales[(i/32)*n_out + o].
-//
-// The GEMV keeps weights packed and folds the +8 nibble bias away
-// analytically (8 * sum of dequantized activations per weight group); the
-// GEMMs unpack nibbles to signed bytes once per shared tile (__vsubss4)
-// and reuse the int8 micro-kernel shape.
+// i+4+j (high nibble). That byte order lines both nibble planes up with the
+// activation dp4a words: (w & 0x0F0F0F0F) pairs with x[i..i+3], (w >> 4 & ...)
+// with x[i+4..i+7]. Values store unsigned q in [0, 15] with the same two-level
+// w = d*q - m scheme as int3/int2: d = d_super * sd, m = m_super * sm, where
+// sub[(i/16)*n_out + o] packs sd (lo nibble) and sm (hi nibble) per 16-row
+// sub-block (= two packed words), and dm[(i/128)*n_out + o] is the
+// (d_super, m_super) half2 of the 128-row super-block. The -m term folds
+// analytically: m * (sum of dequantized activations over the sub-block).
 
+// 32-k tile granularity shared by the draft-verify (rows) GEMMs of every
+// int tier; the two-level weight scales live on 16-row sub-blocks within it.
 #define Q4_GROUP 32
 
 __device__ __forceinline__ int q4_lo8(int w) { return w & 0x0F0F0F0F; }
 __device__ __forceinline__ int q4_hi8(int w) { return (w >> 4) & 0x0F0F0F0F; }
 
+extern "C" __global__ void gemv_int4k(float *y, const float *x, const unsigned char *w,
+                                     const unsigned char *sub, const __half2 *dm,
+                                     const float *b, int n_in, int n_out, int accum) {
+    extern __shared__ char smem_raw[];
+    int nq = n_in / 4;   // activation dp4a words
+    int ns = n_in / 16;  // 16-row sub-blocks (= two packed words)
+    int *xq = (int *)smem_raw;                   // nq words
+    float *xs = (float *)(smem_raw + n_in);      // nq scales
+    int *xsum = (int *)(smem_raw + 2 * n_in);    // nq group sums
+    float *s16 = (float *)(smem_raw + 3 * n_in); // ns correction sums
+    for (int g = threadIdx.x; g < nq; g += blockDim.x) {
+        const float *xg = x + g * 4;
+        float amax = 0.0f;
+        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(xg[j]));
+        float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int packed = 0, sum = 0;
+        for (int j = 0; j < 4; ++j) {
+            int v = max(-127, min(127, __float2int_rn(xg[j] * id)));
+            sum += v;
+            packed |= (v & 0xFF) << (8 * j);
+        }
+        xq[g] = packed;
+        xs[g] = amax > 0.0f ? amax / 127.0f : 1.0f;
+        xsum[g] = sum;
+    }
+    __syncthreads();
+    for (int wr = threadIdx.x; wr < ns; wr += blockDim.x) {
+        float s = 0.0f;
+        for (int g = 4 * wr; g < 4 * wr + 4; ++g) s += xs[g] * (float)xsum[g];
+        s16[wr] = s;
+    }
+    __syncthreads();
+
+    const int *w32 = (const int *)w;
+    if (n_out % 4 == 0 && n_out >= 4096) {
+        int n4 = n_out / 4;
+        for (int o4 = blockIdx.x * blockDim.x + threadIdx.x; o4 < n4;
+             o4 += gridDim.x * blockDim.x) {
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int s = 0; s < n_in / 128; ++s) {
+                int4 dmi = *(const int4 *)(dm + (size_t)s * n_out + 4 * o4);
+                float2 dm0 = __half22float2(*(const __half2 *)&dmi.x);
+                float2 dm1 = __half22float2(*(const __half2 *)&dmi.y);
+                float2 dm2 = __half22float2(*(const __half2 *)&dmi.z);
+                float2 dm3 = __half22float2(*(const __half2 *)&dmi.w);
+                for (int sb = 0; sb < 8; ++sb) { // 8 sub-blocks per super
+                    int wri = 8 * s + sb; // sub-block index (16 rows)
+                    float i0 = 0.0f, i1 = 0.0f, i2 = 0.0f, i3 = 0.0f;
+                    for (int pw = 0; pw < 2; ++pw) { // packed word = 8 rows
+                        int wr = 2 * wri + pw;
+                        int4 wv = *(const int4 *)(w32 + (size_t)wr * n_out + 4 * o4);
+                        int xa = xq[2 * wr], xbw = xq[2 * wr + 1];
+                        float sa = xs[2 * wr], sbw = xs[2 * wr + 1];
+                        i0 += sa * (float)__dp4a(q4_lo8(wv.x), xa, 0) +
+                              sbw * (float)__dp4a(q4_hi8(wv.x), xbw, 0);
+                        i1 += sa * (float)__dp4a(q4_lo8(wv.y), xa, 0) +
+                              sbw * (float)__dp4a(q4_hi8(wv.y), xbw, 0);
+                        i2 += sa * (float)__dp4a(q4_lo8(wv.z), xa, 0) +
+                              sbw * (float)__dp4a(q4_hi8(wv.z), xbw, 0);
+                        i3 += sa * (float)__dp4a(q4_lo8(wv.w), xa, 0) +
+                              sbw * (float)__dp4a(q4_hi8(wv.w), xbw, 0);
+                    }
+                    uchar4 sbq = *(const uchar4 *)(sub + (size_t)wri * n_out + 4 * o4);
+                    float sx = s16[wri];
+                    a0 += dm0.x * (sbq.x & 15) * i0 - dm0.y * (sbq.x >> 4) * sx;
+                    a1 += dm1.x * (sbq.y & 15) * i1 - dm1.y * (sbq.y >> 4) * sx;
+                    a2 += dm2.x * (sbq.z & 15) * i2 - dm2.y * (sbq.z >> 4) * sx;
+                    a3 += dm3.x * (sbq.w & 15) * i3 - dm3.y * (sbq.w >> 4) * sx;
+                }
+            }
+            int o = 4 * o4;
+            float r0 = a0 + (b ? b[o + 0] : 0.0f);
+            float r1 = a1 + (b ? b[o + 1] : 0.0f);
+            float r2 = a2 + (b ? b[o + 2] : 0.0f);
+            float r3 = a3 + (b ? b[o + 3] : 0.0f);
+            y[o + 0] = accum ? y[o + 0] + r0 : r0;
+            y[o + 1] = accum ? y[o + 1] + r1 : r1;
+            y[o + 2] = accum ? y[o + 2] + r2 : r2;
+            y[o + 3] = accum ? y[o + 3] + r3 : r3;
+        }
+        return;
+    }
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < n_out;
+         o += gridDim.x * blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_in / 128; ++s) {
+            float2 dmv = __half22float2(dm[(size_t)s * n_out + o]);
+            for (int sb = 0; sb < 8; ++sb) {
+                int wri = 8 * s + sb;
+                float inner = 0.0f;
+                for (int pw = 0; pw < 2; ++pw) {
+                    int wr = 2 * wri + pw;
+                    int wv = w32[(size_t)wr * n_out + o];
+                    inner += xs[2 * wr] * (float)__dp4a(q4_lo8(wv), xq[2 * wr], 0) +
+                             xs[2 * wr + 1] * (float)__dp4a(q4_hi8(wv), xq[2 * wr + 1], 0);
+                }
+                unsigned char sbq = sub[(size_t)wri * n_out + o];
+                acc += dmv.x * (sbq & 15) * inner - dmv.y * (sbq >> 4) * s16[wri];
+            }
+        }
+        float r = acc + (b ? b[o] : 0.0f);
+        y[o] = accum ? y[o] + r : r;
+    }
+}
+
+__device__ __forceinline__ float embed_int4k_at(const unsigned char *wte_t,
+                                               const unsigned char *sub,
+                                               const __half2 *dm, int i, int tok,
+                                               int n_vocab) {
+    // word (i/8)*n_vocab + tok, byte i%4, low nibble for i%8 < 4
+    unsigned char c = wte_t[((size_t)(i / 8) * n_vocab + tok) * 4 + (i % 4)];
+    int q = (i & 4) ? (c >> 4) : (c & 15);
+    unsigned char sb = sub[(size_t)(i / 16) * n_vocab + tok];
+    float2 dmv = __half22float2(dm[(size_t)(i / 128) * n_vocab + tok]);
+    return dmv.x * (sb & 15) * q - dmv.y * (sb >> 4);
+}
+
+extern "C" __global__ void embed_int4k(float *out, const unsigned char *wte_t,
+                                      const unsigned char *sub, const __half2 *dm,
+                                      const float *wpe, int tok, int pos,
+                                      int n_embd, int n_vocab) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = embed_int4k_at(wte_t, sub, dm, i, tok, n_vocab) + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int4k_dyn(float *out, const unsigned char *wte_t,
+                                          const unsigned char *sub, const __half2 *dm,
+                                          const float *wpe, const int *tok_ptr,
+                                          const int *pos_ptr, int n_embd, int n_vocab) {
+    int tok = *tok_ptr;
+    int pos = *pos_ptr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_embd) {
+        out[i] = embed_int4k_at(wte_t, sub, dm, i, tok, n_vocab) + wpe[pos * n_embd + i];
+    }
+}
+
+extern "C" __global__ void embed_int4k_batch(float *out, const unsigned char *wte_t,
+                                            const unsigned char *sub, const __half2 *dm,
+                                            const float *wpe, const int *toks, int pos0,
+                                            int n_tok, int n_embd, int n_vocab) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n_tok * n_embd) {
+        int t = idx / n_embd, i = idx % n_embd;
+        out[idx] = embed_int4k_at(wte_t, sub, dm, i, toks[t], n_vocab) +
+                   wpe[(pos0 + t) * n_embd + i];
+    }
+}
+
+// ---- int4 weights (--int4, Q4_0-style, fast path), dp4a math --------------
 extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned char *w,
                                      const __half *scales, const float *b,
                                      int n_in, int n_out, int accum) {
@@ -1681,6 +1834,381 @@ extern "C" __global__ void gemm_rows_int8(float *C, const int *Aq, const float *
         for (int j = 0; j < ncols; ++j) {
             int col = wide ? 4 * o + j : o;
             C[(size_t)m * N + col] = facc[m][j] * wscale[col] + bias[col];
+        }
+    }
+}
+
+// int4 GEMM via dp4a: same shape as gemm_i8_body (A pre-quantized by
+// quantize_act), but the B tile unpacks packed nibble words into unsigned
+// dp4a planes during the shared-tile fill (q4_lo8/q4_hi8 — no bias subtract).
+// Two-level k-quants scales like the int2/int3 bodies: per 16-row sub-block,
+// C += d_sb * (q·x) - m_sb * sum(x), where the per-row activation sums come
+// from one dp4a against 0x01010101 per word. A 32-k tile holds two sub-blocks
+// (Bs[0..3] / Bs[4..7]), each two packed words wide.
+template <int BM>
+__device__ void gemm_i4k_body(float *C, const int *Aq, const float *ascale,
+                             const int *B32, const unsigned char *wsub,
+                             const __half2 *wdm, const float *bias,
+                             int M, int N, int K) {
+    constexpr int RM = BM / 16;
+    constexpr int WGq = AG / 4;
+    __shared__ int As[8][BM];
+    __shared__ int Bs[8][64];
+    __shared__ float Ss[32 / AG][BM];        // per (activation group, row) scale
+    __shared__ float Sx[2][BM];              // per (sub-block, row) act sum
+    __shared__ float Swd[2][64], Swm[2][64]; // per (sub-block, column) d/m
+    int bm = blockIdx.y * BM, bn = blockIdx.x * 64;
+    int tid = threadIdx.y * 16 + threadIdx.x;
+    int kq = K / 4, kg = K / AG, kw = K / 8; // packed-word rows of B
+    float facc[RM][4] = {};
+
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        for (int i = tid; i < BM * 8; i += 256) {
+            int m = i / 8, q = i % 8;
+            As[q][m] = (bm + m < M) ? Aq[(size_t)(bm + m) * kq + k0 / 4 + q] : 0;
+        }
+        for (int i = tid; i < 4 * 64; i += 256) {
+            int wr = i / 64, n = i % 64; // packed word wr covers k rows 8wr..8wr+7
+            int wv = (bn + n < N && k0 / 8 + wr < kw)
+                         ? B32[(size_t)(k0 / 8 + wr) * N + bn + n]
+                         : 0; // nibbles of 0 contribute nothing
+            Bs[2 * wr][n] = q4_lo8(wv);
+            Bs[2 * wr + 1][n] = q4_hi8(wv);
+        }
+        for (int i = tid; i < (32 / AG) * BM; i += 256) {
+            int gg = i / BM, m = i % BM;
+            Ss[gg][m] =
+                (bm + m < M) ? ascale[(size_t)(bm + m) * kg + k0 / AG + gg] : 0.0f;
+        }
+        if (tid < 128) {
+            int r = tid / 64, n = tid % 64;
+            bool in = bn + n < N;
+            float2 dmv = in ? __half22float2(wdm[(size_t)(k0 / 128) * N + bn + n])
+                            : make_float2(0.0f, 0.0f);
+            unsigned char sb = in ? wsub[(size_t)(k0 / 16 + r) * N + bn + n] : 0;
+            Swd[r][n] = dmv.x * (sb & 15);
+            Swm[r][n] = dmv.y * (sb >> 4);
+        }
+        __syncthreads();
+        if (tid < 2 * BM) { // per-row activation sums need As/Ss in smem
+            int r = tid / BM, m = tid % BM;
+            float sx = 0.0f;
+            for (int q = 4 * r; q < 4 * r + 4; ++q)
+                sx += Ss[q / WGq][m] * (float)__dp4a(As[q][m], 0x01010101, 0);
+            Sx[r][m] = sx;
+        }
+        __syncthreads();
+        float tacc[2][RM][4] = {};
+        for (int gg = 0; gg < 32 / AG; ++gg) {
+            int sb = gg * AG / 16;
+            int iacc[RM][4] = {};
+            for (int q = WGq * gg; q < WGq * (gg + 1); ++q) {
+                int a[RM], b[4];
+                for (int i = 0; i < RM; ++i) a[i] = As[q][threadIdx.y * RM + i];
+                for (int j = 0; j < 4; ++j) b[j] = Bs[q][threadIdx.x * 4 + j];
+                for (int i = 0; i < RM; ++i)
+                    for (int j = 0; j < 4; ++j) iacc[i][j] = __dp4a(a[i], b[j], iacc[i][j]);
+            }
+            for (int i = 0; i < RM; ++i) {
+                float sa = Ss[gg][threadIdx.y * RM + i];
+                for (int j = 0; j < 4; ++j) tacc[sb][i][j] += (float)iacc[i][j] * sa;
+            }
+        }
+        for (int i = 0; i < RM; ++i) {
+            int row = threadIdx.y * RM + i;
+            for (int j = 0; j < 4; ++j) {
+                int col = threadIdx.x * 4 + j;
+                facc[i][j] += tacc[0][i][j] * Swd[0][col] - Sx[0][row] * Swm[0][col] +
+                              tacc[1][i][j] * Swd[1][col] - Sx[1][row] * Swm[1][col];
+            }
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < RM; ++i) {
+        int row = bm + threadIdx.y * RM + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            int col = bn + threadIdx.x * 4 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = facc[i][j] + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_int4k(float *C, const int *Aq, const float *ascale,
+                                     const int *B32, const unsigned char *wsub,
+                                     const __half2 *wdm, const float *bias,
+                                     int M, int N, int K) {
+    gemm_i4k_body<64>(C, Aq, ascale, B32, wsub, wdm, bias, M, N, K);
+}
+
+// Wide int4 tier: 128x64 tile over 32 k-values, 256 threads with an 8x4
+// micro-tile. Full row height (matches the int8 wide tier), so prefill reads
+// the weight matrix M/128 times, not M/64 — the old half-height tile doubled
+// weight traffic, which dominates a memory-bound prefill. The k-quants two-
+// level scales change per 16-row sub-block (two per 32-k tile), so the micro-
+// kernel keeps one activation-scaled partial (tacc) and folds the sub-block's
+// (d, m) at its boundary — NOT a doubled tacc[2][...] (that's what spilled the
+// int3/int2 wide attempts on 3 SMs). Per-row activation sums for the -m term
+// live in 16 registers (sx[2][8]), no extra smem or sync. Packed nibbles
+// unpack to unsigned planes once per tile during the Bs fill.
+extern "C" __global__ __launch_bounds__(256, 2) void gemm_int4k_wide(
+    float *C, const int *Aq, const float *ascale, const int *B32,
+    const unsigned char *wsub, const __half2 *wdm, const float *bias,
+    int M, int N, int K) {
+    constexpr int WG = AG / 4;     // dp4a words per activation-scale group
+    constexpr int SC = 4 / WG;     // scale loads per staging thread (4 A words)
+    constexpr int GPS = 16 / AG;   // g-iterations per 16-row sub-block
+    __shared__ int As[2][8][128];
+    __shared__ float Ss[2][8 / WG][128];
+    __shared__ int Bs[2][8][64];
+    __shared__ float Swd[2][2][64], Swm[2][2][64]; // [buf][sub-block][col]
+    int bm = blockIdx.y * 128, bn = blockIdx.x * 64;
+    int tid = threadIdx.x;
+    int arow = tid >> 1, acol = (tid & 1) * 4; // A: one int4 (4 words) each
+    int bwr = tid >> 6, bcol = tid & 63;       // B: packed word bwr, column bcol
+    int trow = tid >> 4, tcol = tid & 15;
+    int kq = K / 4, kw = K / 8;
+    float facc[8][4] = {};
+    int a4[4], pb;
+    float sg[SC], swd[2], swm[2];
+
+    auto stage = [&](int k0) {
+        if (bm + arow < M) {
+            *reinterpret_cast<int4 *>(a4) = *reinterpret_cast<const int4 *>(
+                &Aq[(size_t)(bm + arow) * kq + k0 / 4 + acol]);
+#pragma unroll
+            for (int j = 0; j < SC; ++j)
+                sg[j] = ascale[(size_t)(bm + arow) * (kq / WG) + (k0 / 4 + acol) / WG + j];
+        } else {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) a4[j] = 0;
+#pragma unroll
+            for (int j = 0; j < SC; ++j) sg[j] = 0.0f;
+        }
+        // packed word bwr covers k rows 8*bwr..8*bwr+7 of this 32-k tile
+        pb = (bn + bcol < N && k0 / 8 + bwr < kw)
+                 ? B32[(size_t)(k0 / 8 + bwr) * N + bn + bcol]
+                 : 0; // nibbles of 0 contribute nothing
+        if (tid < 64) {
+            bool in = bn + tid < N;
+            float2 dmv = in ? __half22float2(wdm[(size_t)(k0 / 128) * N + bn + tid])
+                            : make_float2(0.0f, 0.0f);
+#pragma unroll
+            for (int sb = 0; sb < 2; ++sb) {
+                unsigned char s = in ? wsub[(size_t)(k0 / 16 + sb) * N + bn + tid] : 0;
+                swd[sb] = dmv.x * (s & 15);
+                swm[sb] = dmv.y * (s >> 4);
+            }
+        }
+    };
+    auto store = [&](int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) As[buf][acol + j][arow] = a4[j];
+#pragma unroll
+        for (int j = 0; j < SC; ++j) Ss[buf][acol / WG + j][arow] = sg[j];
+        Bs[buf][2 * bwr][bcol] = q4_lo8(pb);
+        Bs[buf][2 * bwr + 1][bcol] = q4_hi8(pb);
+        if (tid < 64)
+#pragma unroll
+            for (int sb = 0; sb < 2; ++sb) {
+                Swd[buf][sb][tid] = swd[sb];
+                Swm[buf][sb][tid] = swm[sb];
+            }
+    };
+
+    stage(0);
+    store(0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        if (k0 + 32 < K) stage(k0 + 32);
+        // per-row activation sums for this tile's two sub-blocks (dp4a vs 1s)
+        float sx[2][8];
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float s = 0.0f;
+#pragma unroll
+                for (int q = 4 * sb; q < 4 * sb + 4; ++q)
+                    s += Ss[buf][q / WG][trow * 8 + i] *
+                         (float)__dp4a(As[buf][q][trow * 8 + i], 0x01010101, 0);
+                sx[sb][i] = s;
+            }
+#pragma unroll
+        for (int sb = 0; sb < 2; ++sb) {
+            float tacc[8][4] = {};
+#pragma unroll
+            for (int gi = 0; gi < GPS; ++gi) {
+                int g = sb * GPS + gi;
+                int rm[WG][8], rn[WG][4];
+                float rs[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) rs[i] = Ss[buf][g][trow * 8 + i];
+#pragma unroll
+                for (int w = 0; w < WG; ++w) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) rm[w][i] = As[buf][g * WG + w][trow * 8 + i];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) rn[w][j] = Bs[buf][g * WG + w][tcol * 4 + j];
+                }
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        int acc = 0;
+#pragma unroll
+                        for (int w = 0; w < WG; ++w) acc = __dp4a(rm[w][i], rn[w][j], acc);
+                        tacc[i][j] += (float)acc * rs[i];
+                    }
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    facc[i][j] += tacc[i][j] * Swd[buf][sb][tcol * 4 + j] -
+                                  sx[sb][i] * Swm[buf][sb][tcol * 4 + j];
+        }
+        if (k0 + 32 < K) store(buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+    for (int i = 0; i < 8; ++i) {
+        int row = bm + trow * 8 + i;
+        if (row >= M) continue;
+        for (int j = 0; j < 4; ++j) {
+            int col = bn + tcol * 4 + j;
+            if (col >= N) continue;
+            C[(size_t)row * N + col] = facc[i][j] + bias[col];
+        }
+    }
+}
+
+extern "C" __global__ void gemm_int4k_skinny(float *C, const int *Aq, const float *ascale,
+                                            const int *B32, const unsigned char *wsub,
+                                            const __half2 *wdm, const float *bias,
+                                            int M, int N, int K) {
+    gemm_i4k_body<16>(C, Aq, ascale, B32, wsub, wdm, bias, M, N, K);
+}
+
+// int4 draft-verify GEMM (M <= 8) via dp4a: nibble planes unpack in-register
+// (unsigned q), two-level k-quants scales applied per 16-row sub-block (two
+// packed words wide) with per-row activation sums precomputed in shared memory.
+extern "C" __global__ void gemm_rows_int4k(float *C, const int *Aq, const float *ascale,
+                                          const int *B32, const unsigned char *wsub,
+                                          const __half2 *wdm, const float *bias,
+                                          int M, int N, int K) {
+    __shared__ int As[ROWS_M][ROWS_KT / 4];
+    __shared__ float Ss[ROWS_M][ROWS_KT / AG];
+    __shared__ float Sx[ROWS_M][ROWS_KT / 16]; // per (row, sub-block) act sum
+    int tid = threadIdx.x;
+    int o = blockIdx.x * blockDim.x + tid;
+    bool wide = gemm_rows_wide(N);
+    bool active = o < (wide ? N / 4 : N);
+    int kq = K / 4, kg = K / AG;
+    float facc[ROWS_M][4] = {};
+
+    for (int k0 = 0; k0 < K; k0 += ROWS_KT) {
+        int kt = min(ROWS_KT, K - k0); // K % 32 == 0, so kt is too
+        for (int i = tid; i < ROWS_M * ROWS_KT / 4; i += blockDim.x) {
+            int m = i / (ROWS_KT / 4), q = i % (ROWS_KT / 4);
+            As[m][q] = (m < M && 4 * q < kt) ? Aq[(size_t)m * kq + k0 / 4 + q] : 0;
+        }
+        for (int i = tid; i < ROWS_M * ROWS_KT / AG; i += blockDim.x) {
+            int m = i / (ROWS_KT / AG), g = i % (ROWS_KT / AG);
+            Ss[m][g] = (m < M && AG * g < kt) ? ascale[(size_t)m * kg + k0 / AG + g] : 0.0f;
+        }
+        __syncthreads();
+        for (int i = tid; i < ROWS_M * ROWS_KT / 16; i += blockDim.x) {
+            int m = i / (ROWS_KT / 16), t = i % (ROWS_KT / 16);
+            float sx = 0.0f;
+            for (int q = 4 * t; q < 4 * t + 4; ++q)
+                sx += Ss[m][q / (AG / 4)] * (float)__dp4a(As[m][q], 0x01010101, 0);
+            Sx[m][t] = sx;
+        }
+        __syncthreads();
+        if (active && wide) {
+            for (int wg = 0; wg < kt / Q4_GROUP; ++wg) {
+                int4 dmi = *(const int4 *)(wdm + (size_t)((k0 + wg * 32) / 128) * N + 4 * o);
+                float2 dm0 = __half22float2(*(const __half2 *)&dmi.x);
+                float2 dm1 = __half22float2(*(const __half2 *)&dmi.y);
+                float2 dm2 = __half22float2(*(const __half2 *)&dmi.z);
+                float2 dm3 = __half22float2(*(const __half2 *)&dmi.w);
+                for (int sb = 0; sb < 2; ++sb) { // 2 sub-blocks per weight group
+                    float gacc[ROWS_M][4] = {};
+                    for (int pw = 0; pw < 2; ++pw) { // 2 packed words per sub-block
+                        int wr = (k0 + wg * 32) / 8 + sb * 2 + pw;
+                        int4 wv = *(const int4 *)(B32 + (size_t)wr * N + 4 * o);
+                        int blo[4] = {q4_lo8(wv.x), q4_lo8(wv.y), q4_lo8(wv.z),
+                                      q4_lo8(wv.w)};
+                        int bhi[4] = {q4_hi8(wv.x), q4_hi8(wv.y), q4_hi8(wv.z),
+                                      q4_hi8(wv.w)};
+                        int qa = wg * 8 + sb * 4 + pw * 2, qb = qa + 1;
+#pragma unroll
+                        for (int m = 0; m < ROWS_M; ++m) {
+                            int a0 = As[m][qa], a1 = As[m][qb];
+                            float s0 = Ss[m][qa / (AG / 4)], s1 = Ss[m][qb / (AG / 4)];
+                            gacc[m][0] += s0 * (float)__dp4a(blo[0], a0, 0) +
+                                          s1 * (float)__dp4a(bhi[0], a1, 0);
+                            gacc[m][1] += s0 * (float)__dp4a(blo[1], a0, 0) +
+                                          s1 * (float)__dp4a(bhi[1], a1, 0);
+                            gacc[m][2] += s0 * (float)__dp4a(blo[2], a0, 0) +
+                                          s1 * (float)__dp4a(bhi[2], a1, 0);
+                            gacc[m][3] += s0 * (float)__dp4a(blo[3], a0, 0) +
+                                          s1 * (float)__dp4a(bhi[3], a1, 0);
+                        }
+                    }
+                    uchar4 sbq = *(const uchar4 *)(wsub +
+                                                   (size_t)((k0 + wg * 32) / 16 + sb) * N + 4 * o);
+                    float d0 = dm0.x * (sbq.x & 15), m0 = dm0.y * (sbq.x >> 4);
+                    float d1 = dm1.x * (sbq.y & 15), m1 = dm1.y * (sbq.y >> 4);
+                    float d2 = dm2.x * (sbq.z & 15), m2 = dm2.y * (sbq.z >> 4);
+                    float d3 = dm3.x * (sbq.w & 15), m3 = dm3.y * (sbq.w >> 4);
+                    int t = wg * 2 + sb;
+#pragma unroll
+                    for (int m = 0; m < ROWS_M; ++m) {
+                        float sx = Sx[m][t];
+                        facc[m][0] += gacc[m][0] * d0 - sx * m0;
+                        facc[m][1] += gacc[m][1] * d1 - sx * m1;
+                        facc[m][2] += gacc[m][2] * d2 - sx * m2;
+                        facc[m][3] += gacc[m][3] * d3 - sx * m3;
+                    }
+                }
+            }
+        } else if (active) {
+            for (int wg = 0; wg < kt / Q4_GROUP; ++wg) {
+                float2 dmv = __half22float2(wdm[(size_t)((k0 + wg * 32) / 128) * N + o]);
+                for (int sb = 0; sb < 2; ++sb) {
+                    float gacc[ROWS_M] = {};
+                    for (int pw = 0; pw < 2; ++pw) {
+                        int wr = (k0 + wg * 32) / 8 + sb * 2 + pw;
+                        int wv = B32[(size_t)wr * N + o];
+                        int blo = q4_lo8(wv), bhi = q4_hi8(wv);
+                        int qa = wg * 8 + sb * 4 + pw * 2, qb = qa + 1;
+#pragma unroll
+                        for (int m = 0; m < ROWS_M; ++m) {
+                            gacc[m] +=
+                                Ss[m][qa / (AG / 4)] * (float)__dp4a(blo, As[m][qa], 0) +
+                                Ss[m][qb / (AG / 4)] * (float)__dp4a(bhi, As[m][qb], 0);
+                        }
+                    }
+                    unsigned char sbq = wsub[(size_t)((k0 + wg * 32) / 16 + sb) * N + o];
+                    float d = dmv.x * (sbq & 15), mm = dmv.y * (sbq >> 4);
+                    int t = wg * 2 + sb;
+#pragma unroll
+                    for (int m = 0; m < ROWS_M; ++m) facc[m][0] += gacc[m] * d - Sx[m][t] * mm;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    int ncols = wide ? 4 : 1;
+    for (int m = 0; m < M; ++m) {
+        for (int j = 0; j < ncols; ++j) {
+            int col = wide ? 4 * o + j : o;
+            C[(size_t)m * N + col] = facc[m][j] + bias[col];
         }
     }
 }

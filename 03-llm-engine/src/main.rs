@@ -81,6 +81,7 @@ fn modes_for(arch: model::Arch) -> &'static [gpu::WeightMode] {
             gpu::WeightMode::Fp16,
             gpu::WeightMode::Int8,
             gpu::WeightMode::Int4,
+            gpu::WeightMode::Int4K,
             gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
         ],
@@ -88,11 +89,13 @@ fn modes_for(arch: model::Arch) -> &'static [gpu::WeightMode] {
             gpu::WeightMode::Fp16,
             gpu::WeightMode::Int8,
             gpu::WeightMode::Int4,
+            gpu::WeightMode::Int4K,
             gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
         ],
         model::Arch::Llama => &[
             gpu::WeightMode::Int4,
+            gpu::WeightMode::Int4K,
             gpu::WeightMode::Int8,
             gpu::WeightMode::Int3,
             gpu::WeightMode::Int2,
@@ -162,7 +165,7 @@ fn mode_filter(args: &[String]) -> Option<gpu::WeightMode> {
         .any(|a| {
             matches!(
                 a.as_str(),
-                "--fp32" | "--fp16" | "--int8" | "--int4" | "--int3" | "--int2"
+                "--fp32" | "--fp16" | "--int8" | "--int4" | "--int4k" | "--int3" | "--int2"
             )
         })
         .then(|| gpu::WeightMode::parse(args))
@@ -296,7 +299,10 @@ fn main() {
                 // consistency between decode and batch prefill always holds
                 if matches!(
                     mode,
-                    gpu::WeightMode::Int4 | gpu::WeightMode::Int3 | gpu::WeightMode::Int2
+                    gpu::WeightMode::Int4
+                        | gpu::WeightMode::Int4K
+                        | gpu::WeightMode::Int3
+                        | gpu::WeightMode::Int2
                 ) {
                     if cw != gw {
                         println!(
