@@ -9,13 +9,15 @@
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
-//!   cargo run -rp llm-engine -- ppl --data path [-n tokens] [--smooth]
+//!   cargo run -rp llm-engine -- ppl --data path [-n tokens] [--smooth] [--int4 --gptq]
 //!   cargo run -rp llm-engine -- calib-data              # WikiText-2 validation (calibration)
+//!   cargo run -rp llm-engine -- gptq [--calib-tokens 1024] [--gptq-damp 0.01]  # build sidecar
 
 mod calib;
 mod cpu;
 mod export;
 mod gpu;
+mod gptq;
 mod model;
 mod sample;
 mod smooth;
@@ -106,6 +108,32 @@ fn maybe_smooth(
     let smoothed = smooth::smooth(&model, &stats, alpha);
     eprintln!("SmoothQuant: done in {:.1}s", t0.elapsed().as_secs_f64());
     smoothed
+}
+
+/// `<model>.bin` -> `<model>.bin.gptq4.bin`, the GPTQ sidecar next to the model.
+fn sidecar_path(choice: &ModelChoice) -> PathBuf {
+    let mut s = choice.bin.clone().into_os_string();
+    s.push(".gptq4.bin");
+    PathBuf::from(s)
+}
+
+/// Loads the GPTQ sidecar when `--gptq` is set (mutually exclusive with
+/// `--smooth`, since the sidecar was quantized from the un-smoothed weights).
+fn load_gptq(args: &[String], choice: &ModelChoice) -> Option<gptq::Sidecar> {
+    if !flag(args, "--gptq") {
+        return None;
+    }
+    assert!(
+        !flag(args, "--smooth"),
+        "--gptq and --smooth are mutually exclusive"
+    );
+    let path = sidecar_path(choice);
+    assert!(
+        path.exists(),
+        "{} not found; build it with `cargo run -rp llm-engine -- gptq [--model ...]`",
+        path.display()
+    );
+    Some(gptq::Sidecar::load(&path).unwrap())
 }
 
 /// Weight-storage modes that fit in 2 GB VRAM for this model.
@@ -258,6 +286,41 @@ fn main() {
         Some("calib-data") => {
             export::download_wikitext2_calib(&models_dir());
         }
+        Some("gptq") => {
+            // build the GPTQ sidecar: load model -> collect Hessians on the
+            // calibration split -> Hessian-guided Q4_0 -> write <model>.gptq4.bin
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let max_tokens = opt_usize(&args, "--calib-tokens", 1024);
+            let damp = opt_f32(&args, "--gptq-damp", 0.01) as f64;
+            let calib_path = models_dir().join("wikitext-2-raw/wiki.calib.raw");
+            assert!(
+                calib_path.exists(),
+                "{} not found; run `cargo run -rp llm-engine -- calib-data`",
+                calib_path.display()
+            );
+            let text = std::fs::read_to_string(&calib_path).unwrap();
+            let ids = tok.encode(&text);
+            let n = max_tokens.min(ids.len());
+            eprintln!("GPTQ: collecting input Hessians on {n} tokens...");
+            let t0 = Instant::now();
+            let hess = calib::collect_hessians(&model, &ids, 128, max_tokens);
+            eprintln!(
+                "GPTQ: Hessians ({} positions) in {:.1}s; quantizing (damp={damp})...",
+                hess.count,
+                t0.elapsed().as_secs_f64()
+            );
+            let t1 = Instant::now();
+            let sidecar = gptq::build(&model, &hess, damp);
+            let path = sidecar_path(&choice);
+            sidecar.save(&path).unwrap();
+            eprintln!(
+                "GPTQ: quantized in {:.1}s, wrote {}",
+                t1.elapsed().as_secs_f64(),
+                path.display()
+            );
+        }
         Some("generate") => {
             let prompt = args
                 .get(1)
@@ -283,9 +346,15 @@ fn main() {
             let choice = model_choice(&args);
 
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let sidecar = load_gptq(&args, &choice);
             let model = maybe_smooth(load_model(&choice), &args, &tok);
             let ctx = CudaContext::new(0).unwrap();
-            let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+            // GPTQ's Q4_0 sidecar only substitutes in int4 mode
+            let sc = (mode == gpu::WeightMode::Int4).then_some(()).and(sidecar.as_ref());
+            if sidecar.is_some() && mode != gpu::WeightMode::Int4 {
+                eprintln!("note: --gptq only applies in --int4 mode; ignoring the sidecar");
+            }
+            let mut engine = gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc);
 
             if spec && !sampler.is_greedy() {
                 eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
@@ -587,6 +656,7 @@ fn main() {
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", data_path.display()));
             let choice = model_choice(&args);
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let sidecar = load_gptq(&args, &choice);
             let model = maybe_smooth(load_model(&choice), &args, &tok);
             let mut ids = tok.encode(&text);
             ids.truncate(max_tokens.min(ids.len()));
@@ -602,10 +672,15 @@ fn main() {
                     if only.is_some_and(|m| m != mode) {
                         continue;
                     }
-                    let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                    // GPTQ's Q4_0 sidecar only substitutes in int4 mode
+                    let sc = (mode == gpu::WeightMode::Int4)
+                        .then_some(())
+                        .and(sidecar.as_ref());
+                    let mut engine = gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc);
                     let (ppl, n) = perplexity(&mut engine, &ids);
                     println!(
-                        "| {mode} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
+                        "| {mode}{} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
+                        if sc.is_some() { "+gptq" } else { "" },
                         gpu::weight_mb(&model.config, mode),
                         if kv8 { "int8" } else { "fp32" },
                     );
@@ -614,7 +689,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|calib-data|generate|verify|bench|prefill-bench|ppl> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl> [args]"
             );
             std::process::exit(1);
         }

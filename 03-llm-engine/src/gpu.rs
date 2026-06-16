@@ -11,6 +11,7 @@ use cudarc::driver::{
 };
 use half::f16;
 
+use crate::gptq;
 use crate::model::{Arch, Config, Model};
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
@@ -1083,6 +1084,20 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode, kv8: bool) -> Self {
+        Self::new_quant(ctx, model, mode, kv8, None)
+    }
+
+    /// Like `new`, but when `gptq` is supplied the covered linears are uploaded
+    /// from the sidecar's pre-quantized Q4_0 blobs instead of round-to-nearest.
+    /// Only meaningful in `Int4` mode (the sidecar layout is Q4_0); uncovered
+    /// tensors (embeddings, norms, lm_head) take the normal path.
+    pub fn new_quant(
+        ctx: &Arc<CudaContext>,
+        model: &Model,
+        mode: WeightMode,
+        kv8: bool,
+        gptq: Option<&gptq::Sidecar>,
+    ) -> Self {
         let c = model.config;
         // The decode-attention kernels keep the per-position score row in a
         // fixed `__shared__ float s[2048]`; n_ctx beyond that silently corrupts
@@ -1233,7 +1248,24 @@ impl Engine {
                 }
             }
         };
-        let upw = |t: &[f32], n_in: usize, n_out: usize| upw_as(t, n_in, n_out, mode);
+        // GPTQ override: use the sidecar's pre-quantized Q4_0 blob for a covered
+        // (layer, role) tensor, else fall back to the normal upload at `fb_mode`.
+        let gptq_or = |li: usize,
+                       role: gptq::Role,
+                       t: &[f32],
+                       n_in: usize,
+                       n_out: usize,
+                       fb_mode: WeightMode|
+         -> Weights {
+            if let Some((q, s)) = gptq.and_then(|sc| sc.get(li, role)) {
+                Weights::Int4 {
+                    q: stream.clone_htod(q).unwrap(),
+                    scales: stream.clone_htod(s).unwrap(),
+                }
+            } else {
+                upw_as(t, n_in, n_out, fb_mode)
+            }
+        };
 
         // transpose [v, e] -> [e, v] so the lm_head GEMV is coalesced
         let transpose_ve = |w: &[f32]| {
@@ -1258,23 +1290,24 @@ impl Engine {
         let layers = model
             .layers
             .iter()
-            .map(|l| LayerG {
+            .enumerate()
+            .map(|(li, l)| LayerG {
                 ln1_g: up(&l.ln1_g),
                 ln1_b: opt(&l.ln1_b),
-                qkv_w: upw(&l.qkv_w, e, qkvd),
+                qkv_w: gptq_or(li, gptq::Role::Qkv, &l.qkv_w, e, qkvd, mode),
                 qkv_b: up(&l.qkv_b),
-                proj_w: upw(&l.proj_w, qd, e),
+                proj_w: gptq_or(li, gptq::Role::Proj, &l.proj_w, qd, e, mode),
                 proj_b: up(&l.proj_b),
                 ln2_g: up(&l.ln2_g),
                 ln2_b: opt(&l.ln2_b),
-                fc_w: upw(&l.fc_w, e, inter),
+                fc_w: gptq_or(li, gptq::Role::Fc, &l.fc_w, e, inter, mode),
                 fc_b: opt(&l.fc_b),
                 up_w: if l.up_w.is_empty() {
                     None
                 } else {
-                    Some(upw(&l.up_w, e, inter))
+                    Some(gptq_or(li, gptq::Role::Up, &l.up_w, e, inter, mode))
                 },
-                fc2_w: upw_as(&l.fc2_w, inter, e, mode.ffn_down_mode()),
+                fc2_w: gptq_or(li, gptq::Role::Fc2, &l.fc2_w, inter, e, mode.ffn_down_mode()),
                 fc2_b: opt(&l.fc2_b),
             })
             .collect();
