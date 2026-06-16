@@ -2421,10 +2421,13 @@ impl Engine {
     }
 
     /// Greedy generation; returns only the newly generated token ids.
+    /// Autoregressive decode. `sampler` selects each token from the logits;
+    /// pass `Sampler::greedy()` for argmax (bit-identical to the old behaviour).
     pub fn generate(
         &mut self,
         prompt: &[u32],
         n_new: usize,
+        sampler: &mut crate::sample::Sampler,
         mut on_token: impl FnMut(u32),
     ) -> Vec<u32> {
         assert!(!prompt.is_empty());
@@ -2432,7 +2435,7 @@ impl Engine {
         let mut out = Vec::with_capacity(n_new);
         let mut pos = prompt.len();
         for _ in 0..n_new {
-            let next = argmax(&logits);
+            let next = sampler.pick(&logits);
             out.push(next);
             on_token(next);
             logits = self.forward(next, pos);

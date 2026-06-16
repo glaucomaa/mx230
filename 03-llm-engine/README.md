@@ -13,7 +13,7 @@ pipeline (`--model gpt2|qwen|tinyllama`, default gpt2):
 ```
 cargo run -rp llm-engine -- export [--model qwen]     # download + convert weights
 cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec]
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec] [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test

@@ -4,6 +4,7 @@
 //! Every subcommand takes `--model gpt2|qwen|tinyllama` (default gpt2):
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
 //!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8|--int4] [--kv8] [--spec]
+//!       [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]   # default greedy; --spec stays greedy
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
@@ -13,6 +14,7 @@ mod cpu;
 mod export;
 mod gpu;
 mod model;
+mod sample;
 mod tokenizer;
 
 use std::path::PathBuf;
@@ -131,6 +133,15 @@ fn opt_usize(args: &[String], name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn opt_f32(args: &[String], name: &str, default: f32) -> f32 {
+    opt_value(args, name)
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("{name} expects a number"))
+        })
+        .unwrap_or(default)
+}
+
 fn logprob(logits: &[f32], target: u32) -> f64 {
     let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let sum_exp: f64 = logits.iter().map(|&x| ((x as f64) - m).exp()).sum();
@@ -218,12 +229,28 @@ fn main() {
             let kv8 = flag(&args, "--kv8");
             let spec = flag(&args, "--spec");
             let spec_k = opt_usize(&args, "--spec-k", 8);
+            // sampling knobs: temp 0 = greedy (default), top-k 0 = off,
+            // top-p 1.0 = off. Speculative decode is lossless-vs-greedy by
+            // construction, so it ignores these and always decodes greedily.
+            let temp = opt_f32(&args, "--temp", 0.0);
+            let top_k = opt_usize(&args, "--top-k", 0);
+            let top_p = opt_f32(&args, "--top-p", 1.0);
+            let seed = opt_usize(&args, "--seed", 0) as u64;
+            let mut sampler = if temp > 0.0 {
+                sample::Sampler::new(temp, top_k, top_p, seed)
+            } else {
+                sample::Sampler::greedy()
+            };
             let choice = model_choice(&args);
 
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
             let model = load_model(&choice);
             let ctx = CudaContext::new(0).unwrap();
             let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+
+            if spec && !sampler.is_greedy() {
+                eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
+            }
 
             let ids = tok.encode(prompt);
             print!("{prompt}");
@@ -235,12 +262,19 @@ fn main() {
                     std::io::stdout().flush().unwrap();
                 });
             } else {
-                engine.generate(&ids, n_new, |id| {
+                engine.generate(&ids, n_new, &mut sampler, |id| {
                     print!("{}", tok.decode(&[id]));
                     std::io::stdout().flush().unwrap();
                 });
             }
             let dt = t0.elapsed().as_secs_f64();
+            let decode_label = if spec {
+                "prompt-lookup spec".to_string()
+            } else if sampler.is_greedy() {
+                "greedy".to_string()
+            } else {
+                format!("sample(temp={temp}, top_k={top_k}, top_p={top_p}, seed={seed})")
+            };
             println!(
                 "\n\n[{} prompt + {} new tokens in {:.2}s = {:.1} tok/s, {}, {}]",
                 ids.len(),
@@ -252,7 +286,7 @@ fn main() {
                 } else {
                     mode.to_string()
                 },
-                if spec { "prompt-lookup spec" } else { "greedy" }
+                decode_label
             );
         }
         Some("verify") => {
@@ -354,7 +388,8 @@ fn main() {
                 let mode = modes_for(choice.arch)[0];
                 let n_steps = 32;
                 let mut greedy_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
-                let greedy = greedy_engine.generate(&spec_ids, n_steps, |_| {});
+                let greedy =
+                    greedy_engine.generate(&spec_ids, n_steps, &mut sample::Sampler::greedy(), |_| {});
                 drop(greedy_engine);
                 let mut spec_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 let spec = spec_engine.generate_speculative(&spec_ids, n_steps, 8, |_| {});
