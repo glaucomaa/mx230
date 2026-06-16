@@ -127,11 +127,34 @@ fn act_group(arch: Arch) -> usize {
     }
 }
 
+/// Effective storage tiers for the embedding/lm_head and ffn-down tensors:
+/// the usual `embed_mode`/`ffn_down_mode` policy, but bumped to int8 by the
+/// mixed-precision flags when the body `mode` is sub-int8 (never a downgrade).
+fn mixed_tiers(mode: WeightMode, embed_int8: bool, ffn_down_int8: bool) -> (WeightMode, WeightMode) {
+    let sub_int8 = matches!(
+        mode,
+        WeightMode::Int4 | WeightMode::Int4K | WeightMode::Int3 | WeightMode::Int2
+    );
+    let embed = if embed_int8 && sub_int8 {
+        WeightMode::Int8
+    } else {
+        mode.embed_mode()
+    };
+    let ffn = if ffn_down_int8 && sub_int8 {
+        WeightMode::Int8
+    } else {
+        mode.ffn_down_mode()
+    };
+    (embed, ffn)
+}
+
 /// Approximate weight footprint on device for a given storage mode.
 /// Embeddings/lm_head count at embed_mode and ffn_down at ffn_down_mode
-/// (the low rungs keep those tensors one tier up).
-pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
+/// (the low rungs keep those tensors one tier up), with the mixed-precision
+/// flags optionally bumping them to int8.
+pub fn weight_mb(c: &Config, mode: WeightMode, embed_int8: bool, ffn_down_int8: bool) -> f64 {
     let (e, inter) = (c.n_embd, c.n_inter);
+    let (embed_tier, ffn_tier) = mixed_tiers(mode, embed_int8, ffn_down_int8);
     let mlp_up = match c.arch {
         Arch::Gpt2 => e * inter,
         Arch::Qwen2 | Arch::Llama => 2 * e * inter,
@@ -148,8 +171,8 @@ pub fn weight_mb(c: &Config, mode: WeightMode) -> f64 {
     let embed = heads * c.n_vocab * e;
     let ffn_down = c.n_layer * inter * e;
     let body = wpe + c.n_layer * per_layer;
-    (embed as f64 * mode.embed_mode().bytes_per_param()
-        + ffn_down as f64 * mode.ffn_down_mode().bytes_per_param()
+    (embed as f64 * embed_tier.bytes_per_param()
+        + ffn_down as f64 * ffn_tier.bytes_per_param()
         + body as f64 * mode.bytes_per_param())
         / 1e6
 }
@@ -1099,21 +1122,29 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode, kv8: bool) -> Self {
-        Self::new_quant(ctx, model, mode, kv8, None)
+        Self::new_quant(ctx, model, mode, kv8, None, false, false)
     }
 
-    /// Like `new`, but when `gptq` is supplied the covered linears are uploaded
-    /// from the sidecar's pre-quantized Q4_0 blobs instead of round-to-nearest.
-    /// Only meaningful in `Int4` mode (the sidecar layout is Q4_0); uncovered
-    /// tensors (embeddings, norms, lm_head) take the normal path.
+    /// Like `new`, but with the quantization knobs:
+    /// - `gptq`: when supplied, the covered linears are uploaded from the
+    ///   sidecar's pre-quantized Q4_0 blobs instead of round-to-nearest (Int4
+    ///   mode only; uncovered tensors take the normal path).
+    /// - `embed_int8` / `ffn_down_int8`: mixed precision — keep the embedding /
+    ///   lm_head, resp. the per-layer ffn-down, at int8 while the body stays at
+    ///   a sub-int8 `mode`. The int4 logits projection through `wte_t` is where
+    ///   most of int4's perplexity damage lives, so an int8 `wte_t` recovers it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_quant(
         ctx: &Arc<CudaContext>,
         model: &Model,
         mode: WeightMode,
         kv8: bool,
         gptq: Option<&gptq::Sidecar>,
+        embed_int8: bool,
+        ffn_down_int8: bool,
     ) -> Self {
         let c = model.config;
+        let (embed_tier, ffn_tier) = mixed_tiers(mode, embed_int8, ffn_down_int8);
         // The decode-attention kernels keep the per-position score row in a
         // fixed `__shared__ float s[2048]`; n_ctx beyond that silently corrupts
         // neighbouring shared memory, so refuse it up front.
@@ -1332,7 +1363,7 @@ impl Engine {
                 } else {
                     Some(gptq_or(li, gptq::Role::Up, &l.up_w, e, inter, mode))
                 },
-                fc2_w: gptq_or(li, gptq::Role::Fc2, &l.fc2_w, inter, e, mode.ffn_down_mode()),
+                fc2_w: gptq_or(li, gptq::Role::Fc2, &l.fc2_w, inter, e, ffn_tier),
                 fc2_b: opt(&l.fc2_b),
             })
             .collect();
@@ -1343,18 +1374,13 @@ impl Engine {
             config: c,
             k,
             gptq_act_order,
-            // embeddings/lm_head stay one tier up on the low rungs — see
-            // WeightMode::embed_mode
-            wte_t: upw_as(&wte_t, e, v, mode.embed_mode()),
+            // embeddings/lm_head stay one tier up on the low rungs (embed_mode),
+            // or int8 under --embed-int8 — see embed_tier above
+            wte_t: upw_as(&wte_t, e, v, embed_tier),
             lm_head_t: if model.lm_head.is_empty() {
                 None
             } else {
-                Some(upw_as(
-                    &transpose_ve(&model.lm_head),
-                    e,
-                    v,
-                    mode.embed_mode(),
-                ))
+                Some(upw_as(&transpose_ve(&model.lm_head), e, v, embed_tier))
             },
             // RoPE models have no learned positions; a zero table keeps the
             // embed kernels uniform across archs

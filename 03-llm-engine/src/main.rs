@@ -6,6 +6,7 @@
 //!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8|--int4] [--kv8] [--spec]
 //!       [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]   # default greedy; --spec stays greedy
 //!       [--smooth [--smooth-alpha 0.5] [--calib-tokens 512]]  # SmoothQuant fold
+//!       [--embed-int8] [--ffn-down-int8] [--mixed]   # int8 embed/lm_head/ffn-down under int4
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
@@ -206,6 +207,16 @@ fn opt_f32(args: &[String], name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Mixed-precision int4 knobs: `(embed_int8, ffn_down_int8)` from
+/// `--embed-int8` / `--ffn-down-int8` / `--mixed` (the latter = both).
+fn mixed_flags(args: &[String]) -> (bool, bool) {
+    let both = flag(args, "--mixed");
+    (
+        both || flag(args, "--embed-int8"),
+        both || flag(args, "--ffn-down-int8"),
+    )
+}
+
 fn logprob(logits: &[f32], target: u32) -> f64 {
     let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let sum_exp: f64 = logits.iter().map(|&x| ((x as f64) - m).exp()).sum();
@@ -356,7 +367,9 @@ fn main() {
             if sidecar.is_some() && mode != gpu::WeightMode::Int4 {
                 eprintln!("note: --gptq only applies in --int4 mode; ignoring the sidecar");
             }
-            let mut engine = gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc);
+            let (embed_int8, ffn_down_int8) = mixed_flags(&args);
+            let mut engine =
+                gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8);
 
             if spec && !sampler.is_greedy() {
                 eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
@@ -590,7 +603,7 @@ fn main() {
                 let dt = t0.elapsed().as_secs_f64();
                 println!(
                     "| {mode} | ~{:.0} MB | {} | {} | {} | {:.1} |",
-                    gpu::weight_mb(&model.config, mode),
+                    gpu::weight_mb(&model.config, mode, false, false),
                     if kv8 { "int8" } else { "fp32" },
                     if graphs { "yes" } else { "no" },
                     if spec { "yes" } else { "no" },
@@ -666,6 +679,13 @@ fn main() {
             let ctx = CudaContext::new(0).unwrap();
 
             let only = mode_filter(&args);
+            let (embed_int8, ffn_down_int8) = mixed_flags(&args);
+            let mixed_tag = match (embed_int8, ffn_down_int8) {
+                (true, true) => "+mixed",
+                (true, false) => "+e8",
+                (false, true) => "+f8",
+                (false, false) => "",
+            };
             println!("dataset: {} ({} tokens)", data_path.display(), ids.len());
             println!("| mode | weights | kv | tokens | perplexity |");
             println!("|------|---------|----|--------|------------|");
@@ -678,12 +698,15 @@ fn main() {
                     let sc = (mode == gpu::WeightMode::Int4)
                         .then_some(())
                         .and(sidecar.as_ref());
-                    let mut engine = gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc);
+                    let mut engine = gpu::Engine::new_quant(
+                        &ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8,
+                    );
                     let (ppl, n) = perplexity(&mut engine, &ids);
                     println!(
-                        "| {mode}{} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
+                        "| {mode}{}{} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
                         if sc.is_some() { "+gptq" } else { "" },
-                        gpu::weight_mb(&model.config, mode),
+                        mixed_tag,
+                        gpu::weight_mb(&model.config, mode, embed_int8, ffn_down_int8),
                         if kv8 { "int8" } else { "fp32" },
                     );
                 }
