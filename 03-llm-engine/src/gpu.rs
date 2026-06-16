@@ -159,9 +159,10 @@ impl fmt::Display for WeightMode {
     }
 }
 
-/// Per-layer KV cache, either fp32 or int8 with one absmax scale per
-/// (position, head). Quantization happens on write (quantize_kv kernel),
-/// dequantization inside the attention kernel.
+/// Per-layer KV cache, either fp32 or int8 with a per-(position, head) affine
+/// (scale, beta) pair — `x ~ scale * q + beta`, q signed so dp4a is unchanged.
+/// Quantization happens on write (quantize_kv kernel), dequantization inside
+/// the attention kernel (K's beta via the q-sum, V's via the softmax weights).
 enum KvCache {
     F32 {
         k: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_embd]
@@ -170,8 +171,10 @@ enum KvCache {
     Q8 {
         k: Vec<CudaSlice<i8>>,
         v: Vec<CudaSlice<i8>>,
-        ks: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_head]
+        ks: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_kv_head] scales
         vs: Vec<CudaSlice<f32>>,
+        kb: Vec<CudaSlice<f32>>, // per layer: [n_ctx * n_kv_head] offsets (betas)
+        vb: Vec<CudaSlice<f32>>,
     },
 }
 
@@ -1316,6 +1319,12 @@ impl Engine {
                     vs: (0..c.n_layer)
                         .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
                         .collect(),
+                    kb: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .collect(),
+                    vb: (0..c.n_layer)
+                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .collect(),
                 }
             } else {
                 KvCache::F32 {
@@ -1616,7 +1625,7 @@ impl Engine {
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
-                KvCache::Q8 { k, v, ks, vs } => {
+                KvCache::Q8 { k, v, ks, vs, kb, vb } => {
                     let qd_i = qd as i32;
                     let q_cfg = LaunchConfig {
                         grid_dim: (nkv as u32, 1, 1),
@@ -1628,6 +1637,8 @@ impl Engine {
                         .arg(&mut v[l])
                         .arg(&mut ks[l])
                         .arg(&mut vs[l])
+                        .arg(&mut kb[l])
+                        .arg(&mut vb[l])
                         .arg(&self.qkv)
                         .arg(&t_i)
                         .arg(&qd_i)
@@ -1642,6 +1653,8 @@ impl Engine {
                         .arg(&v[l])
                         .arg(&ks[l])
                         .arg(&vs[l])
+                        .arg(&kb[l])
+                        .arg(&vb[l])
                         .arg(&t_i)
                         .arg(&nh_i)
                         .arg(&nkv_i)
@@ -1816,7 +1829,7 @@ impl Engine {
                         .arg(&hd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
-                KvCache::Q8 { k, v, ks, vs } => {
+                KvCache::Q8 { k, v, ks, vs, kb, vb } => {
                     let qd_i = qd as i32;
                     let q_cfg = LaunchConfig {
                         grid_dim: (nkv as u32, 1, 1),
@@ -1828,6 +1841,8 @@ impl Engine {
                         .arg(&mut v[l])
                         .arg(&mut ks[l])
                         .arg(&mut vs[l])
+                        .arg(&mut kb[l])
+                        .arg(&mut vb[l])
                         .arg(&self.qkv)
                         .arg(&self.graph_pos)
                         .arg(&qd_i)
@@ -1842,6 +1857,8 @@ impl Engine {
                         .arg(&v[l])
                         .arg(&ks[l])
                         .arg(&vs[l])
+                        .arg(&kb[l])
+                        .arg(&vb[l])
                         .arg(&self.graph_pos)
                         .arg(&nh_i)
                         .arg(&nkv_i)
@@ -2167,7 +2184,7 @@ impl Engine {
                         .arg(&qd_i);
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
-                KvCache::Q8 { k, v, ks, vs } => {
+                KvCache::Q8 { k, v, ks, vs, kb, vb } => {
                     let q_cfg = LaunchConfig {
                         grid_dim: (nkv as u32, n as u32, 1),
                         block_dim: (hd as u32, 1, 1),
@@ -2179,6 +2196,8 @@ impl Engine {
                         .arg(&mut v[l])
                         .arg(&mut ks[l])
                         .arg(&mut vs[l])
+                        .arg(&mut kb[l])
+                        .arg(&mut vb[l])
                         .arg(&self.batch_qkv)
                         .arg(&pos_i)
                         .arg(&qd_i)
@@ -2194,6 +2213,8 @@ impl Engine {
                         .arg(&v[l])
                         .arg(&ks[l])
                         .arg(&vs[l])
+                        .arg(&kb[l])
+                        .arg(&vb[l])
                         .arg(&pos_i)
                         .arg(&n_i)
                         .arg(&nh_i)

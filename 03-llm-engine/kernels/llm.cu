@@ -1094,10 +1094,34 @@ extern "C" __global__ void silu_mul(float *x, const float *y, int n) {
     }
 }
 
-// Quantizes the new K/V rows into int8 caches, one fp32 absmax scale per
-// (position, kv head). One block per kv head, one thread per head dim.
+// Affine-quantizes one head row (head_dim threads, one per dim) into signed
+// int8 spanning the row's actual [min, max] rather than a symmetric absmax:
+// scale = (max - min) / 255, beta = min + 128 * scale, q in [-128, 127] with
+// x ~ scale * q + beta. Two things matter versus symmetric absmax — the range
+// tightens on skewed rows, and all 256 codes are used (255-code midpoint
+// variants that keep the same scale only lose symmetric's exact-zero code and
+// measure worse). The attention kernels fold the offset back analytically
+// (K via the q-byte sum, V via the softmax weights), so q stays signed int8
+// and the dp4a score path is untouched.
+__device__ __forceinline__ void quant_affine(const float *src, signed char *dst,
+                                             float *scale_out, float *beta_out,
+                                             int d, float *red) {
+    float hi = block_max(src[d], red);
+    float lo = -block_max(-src[d], red);
+    float scale = (hi > lo) ? (hi - lo) / 255.0f : 1.0f;
+    float beta = lo + 128.0f * scale;
+    dst[d] = (signed char)max(-128, min(127, __float2int_rn((src[d] - beta) / scale)));
+    if (d == 0) {
+        *scale_out = scale;
+        *beta_out = beta;
+    }
+}
+
+// Quantizes the new K/V rows into int8 caches, one fp32 (scale, beta) affine
+// pair per (position, kv head). One block per kv head, one thread per head dim.
 __device__ void quantize_kv_impl(signed char *kq, signed char *vq,
-                                 float *ks, float *vs, const float *qkv,
+                                 float *ks, float *vs, float *kb, float *vb,
+                                 const float *qkv,
                                  int pos, int q_dim, int n_kv_head, int head_dim) {
     __shared__ float red[32];
     int h = blockIdx.x;
@@ -1106,35 +1130,30 @@ __device__ void quantize_kv_impl(signed char *kq, signed char *vq,
     const float *k = qkv + q_dim + h * head_dim;
     const float *v = qkv + q_dim + kv_dim + h * head_dim;
 
-    float kmax = block_max(fabsf(k[d]), red);
-    float kscale = kmax > 0.0f ? kmax / 127.0f : 1.0f;
-    float vmax = block_max(fabsf(v[d]), red);
-    float vscale = vmax > 0.0f ? vmax / 127.0f : 1.0f;
-
     size_t row = (size_t)pos * kv_dim + h * head_dim;
-    kq[row + d] = (signed char)lrintf(k[d] / kscale);
-    vq[row + d] = (signed char)lrintf(v[d] / vscale);
-    if (d == 0) {
-        ks[pos * n_kv_head + h] = kscale;
-        vs[pos * n_kv_head + h] = vscale;
-    }
+    int sd = pos * n_kv_head + h;
+    quant_affine(k, kq + row, &ks[sd], &kb[sd], d, red);
+    quant_affine(v, vq + row, &vs[sd], &vb[sd], d, red);
 }
 
 extern "C" __global__ void quantize_kv(signed char *kq, signed char *vq,
-                                       float *ks, float *vs, const float *qkv,
+                                       float *ks, float *vs, float *kb, float *vb,
+                                       const float *qkv,
                                        int pos, int q_dim, int n_kv_head, int head_dim) {
-    quantize_kv_impl(kq, vq, ks, vs, qkv, pos, q_dim, n_kv_head, head_dim);
+    quantize_kv_impl(kq, vq, ks, vs, kb, vb, qkv, pos, q_dim, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void quantize_kv_dyn(signed char *kq, signed char *vq,
-                                           float *ks, float *vs, const float *qkv,
+                                           float *ks, float *vs, float *kb, float *vb,
+                                           const float *qkv,
                                            const int *pos_ptr, int q_dim, int n_kv_head,
                                            int head_dim) {
-    quantize_kv_impl(kq, vq, ks, vs, qkv, *pos_ptr, q_dim, n_kv_head, head_dim);
+    quantize_kv_impl(kq, vq, ks, vs, kb, vb, qkv, *pos_ptr, q_dim, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
-                                             float *ks, float *vs, const float *qkv,
+                                             float *ks, float *vs, float *kb, float *vb,
+                                             const float *qkv,
                                              int pos0, int q_dim, int n_kv_head,
                                              int head_dim, int stride) {
     __shared__ float red[32];
@@ -1147,18 +1166,10 @@ extern "C" __global__ void quantize_kv_batch(signed char *kq, signed char *vq,
     const float *v = row + q_dim + kv_dim + h * head_dim;
     int pos = pos0 + t;
 
-    float kmax = block_max(fabsf(k[d]), red);
-    float kscale = kmax > 0.0f ? kmax / 127.0f : 1.0f;
-    float vmax = block_max(fabsf(v[d]), red);
-    float vscale = vmax > 0.0f ? vmax / 127.0f : 1.0f;
-
     size_t out = (size_t)pos * kv_dim + h * head_dim;
-    kq[out + d] = (signed char)lrintf(k[d] / kscale);
-    vq[out + d] = (signed char)lrintf(v[d] / vscale);
-    if (d == 0) {
-        ks[pos * n_kv_head + h] = kscale;
-        vs[pos * n_kv_head + h] = vscale;
-    }
+    int sd = pos * n_kv_head + h;
+    quant_affine(k, kq + out, &ks[sd], &kb[sd], d, red);
+    quant_affine(v, vq + out, &vs[sd], &vb[sd], d, red);
 }
 
 // Causal attention for one new token over the KV cache (one block per query
@@ -1227,11 +1238,14 @@ extern "C" __global__ void attn_decode_dyn(float *out, const float *qkv,
 }
 
 // Same attention over an int8 KV cache: scores and the V accumulation
-// dequantize on the fly with the per-(position, head) scales, so the cache
-// traffic — the part that grows with context length — shrinks 4x.
+// dequantize on the fly with the per-(position, head) affine (scale, beta)
+// pairs, so the cache traffic — the part that grows with context length —
+// shrinks 4x. K's beta folds into the score via the q-byte sum; V's beta is
+// the softmax-weighted mean of the betas (added uniformly to every output dim).
 __device__ void attn_decode_q8_impl(float *out, const float *qkv,
                                     const signed char *kq, const signed char *vq,
                                     const float *ks, const float *vs,
+                                    const float *kb, const float *vb,
                                     int t_cur, int n_head, int n_kv_head, int head_dim) {
     __shared__ float s[2048]; // n_ctx max (8 KB of the 48 KB block budget)
     __shared__ float red[32];
@@ -1259,6 +1273,11 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
     }
     __syncthreads();
     float qs = (qmax > 0.0f ? qmax / 127.0f : 0.0f) * scale;
+    // Σ of this head's quantized q bytes: dp4a against all-ones sums four per
+    // issue. This is the factor K's affine offset multiplies in every score.
+    int qsum_p = 0;
+    for (int d = tid; d < hd4; d += blockDim.x) qsum_p = __dp4a(qq[d], 0x01010101, qsum_p);
+    float qsum = block_sum((float)qsum_p, red);
 
     float m = -CUDART_INF_F;
     for (int t = tid; t <= t_cur; t += blockDim.x) {
@@ -1272,7 +1291,9 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
             dot = __dp4a(kw.z, qq[4 * d + 2], dot);
             dot = __dp4a(kw.w, qq[4 * d + 3], dot);
         }
-        s[t] = (float)dot * ks[t * n_kv_head + kvh] * qs;
+        // q·k = qs·(ksᵀ·dot + kβ·Σq): the dp4a handles the scale·scale term,
+        // the q-sum handles K's recovered offset.
+        s[t] = qs * (ks[t * n_kv_head + kvh] * (float)dot + kb[t * n_kv_head + kvh] * qsum);
         m = fmaxf(m, s[t]);
     }
     m = block_max(m, red);
@@ -1284,6 +1305,12 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
     }
     float inv = 1.0f / block_sum(l, red);
 
+    // V's affine offset: Σ_t s[t]·vβ_t (un-normalized; the ·inv below turns it
+    // into the softmax-weighted mean). Same scalar for every output dim.
+    float vb_p = 0.0f;
+    for (int t = tid; t <= t_cur; t += blockDim.x) vb_p += s[t] * vb[t * n_kv_head + kvh];
+    float vbsum = block_sum(vb_p, red);
+
     for (int d4 = tid; d4 < head_dim / 4; d4 += blockDim.x) {
         const signed char *vbase = vq + kvh * head_dim + 4 * d4;
         float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
@@ -1293,25 +1320,28 @@ __device__ void attn_decode_q8_impl(float *out, const float *qkv,
             ax += st * (float)v.x, ay += st * (float)v.y;
             az += st * (float)v.z, aw += st * (float)v.w;
         }
-        *(float4 *)(out + h * head_dim + 4 * d4) =
-            make_float4(ax * inv, ay * inv, az * inv, aw * inv);
+        *(float4 *)(out + h * head_dim + 4 * d4) = make_float4(
+            (ax + vbsum) * inv, (ay + vbsum) * inv,
+            (az + vbsum) * inv, (aw + vbsum) * inv);
     }
 }
 
 extern "C" __global__ void attn_decode_q8(float *out, const float *qkv,
                                           const signed char *kq, const signed char *vq,
                                           const float *ks, const float *vs,
+                                          const float *kb, const float *vb,
                                           int t_cur, int n_head, int n_kv_head,
                                           int head_dim) {
-    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, t_cur, n_head, n_kv_head, head_dim);
+    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, kb, vb, t_cur, n_head, n_kv_head, head_dim);
 }
 
 extern "C" __global__ void attn_decode_q8_dyn(float *out, const float *qkv,
                                               const signed char *kq, const signed char *vq,
                                               const float *ks, const float *vs,
+                                              const float *kb, const float *vb,
                                               const int *pos_ptr, int n_head, int n_kv_head,
                                               int head_dim) {
-    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, *pos_ptr, n_head, n_kv_head, head_dim);
+    attn_decode_q8_impl(out, qkv, kq, vq, ks, vs, kb, vb, *pos_ptr, n_head, n_kv_head, head_dim);
 }
 
 // ---- batched prefill / speculative-verify path ----------------------------
@@ -3029,11 +3059,13 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                                   const float *kcache, const float *vcache,
                                   const signed char *kq, const signed char *vq,
                                   const float *ks, const float *vs,
+                                  const float *kb, const float *vb,
                                   int pos0, int n_tok, int n_head, int n_kv_head,
                                   int qkv_stride, int out_stride) {
     __shared__ float Kt[Q8 ? 1 : 64][64];
     __shared__ int Kq[Q8 ? 64 : 1][16];
     __shared__ float Ks[Q8 ? 64 : 1];
+    __shared__ float Kb[Q8 ? 64 : 1];
     __shared__ float Vt[64][64];
     int h = blockIdx.x;
     int tile0 = blockIdx.y * 64;
@@ -3047,6 +3079,7 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
     float q[64], acc[64] = {};
     int qw[16];
     float qs = 0.0f; // dequant scale of this thread's quantized q row
+    int qsum = 0;    // Σ of this row's quantized q bytes (folds K's affine offset)
     float m = -CUDART_INF_F, l = 0.0f;
     if (active) {
         for (int d = 0; d < 64; ++d) q[d] = qkv[(size_t)qi * qkv_stride + h * 64 + d];
@@ -3059,6 +3092,7 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                 for (int j = 0; j < 4; ++j) {
                     int v = max(-127, min(127, __float2int_rn(q[4 * w + j] * id)));
                     packed |= (v & 0xFF) << (8 * j);
+                    qsum += v;
                 }
                 qw[w] = packed;
             }
@@ -3078,13 +3112,17 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
             }
             for (int r = tid; r < tile_n; r += 64) {
                 Ks[r] = ks[(kt + r) * n_kv_head + kvh];
+                Kb[r] = kb[(kt + r) * n_kv_head + kvh];
             }
         }
         for (int x = tid; x < tile_n * 64; x += 64) {
             int r = x / 64, d = x % 64;
             if (Q8) {
+                // dequant + recover V's affine offset directly into the tile:
+                // the softmax-weighted sum below then carries it for free.
                 Vt[r][d] = (float)vq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
-                           vs[(kt + r) * n_kv_head + kvh];
+                               vs[(kt + r) * n_kv_head + kvh] +
+                           vb[(kt + r) * n_kv_head + kvh];
             } else {
                 Kt[r][d] = kcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
                 Vt[r][d] = vcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
@@ -3100,7 +3138,8 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                     int dot = 0;
 #pragma unroll
                     for (int w = 0; w < 16; ++w) dot = __dp4a(qw[w], Kq[j][w], dot);
-                    s = (float)dot * qs * Ks[j] * scale;
+                    // q·k = qs·scale·(Ksᵀ·dot + Kβ·Σq): dp4a term plus K's offset
+                    s = qs * scale * ((float)dot * Ks[j] + (float)qsum * Kb[j]);
                 } else {
                     float dot = 0.0f;
                     for (int d = 0; d < 64; ++d) dot += q[d] * Kt[j][d];
@@ -3129,15 +3168,17 @@ extern "C" __global__ void attn_prefill(float *out, const float *qkv,
                                         int pos0, int n_tok, int n_head, int n_kv_head,
                                         int qkv_stride, int out_stride) {
     attn_prefill_body<false>(out, qkv, kcache, vcache, nullptr, nullptr, nullptr, nullptr,
+                             nullptr, nullptr,
                              pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
 }
 
 extern "C" __global__ void attn_prefill_q8(float *out, const float *qkv,
                                            const signed char *kq, const signed char *vq,
                                            const float *ks, const float *vs,
+                                           const float *kb, const float *vb,
                                            int pos0, int n_tok, int n_head, int n_kv_head,
                                            int qkv_stride, int out_stride) {
-    attn_prefill_body<true>(out, qkv, nullptr, nullptr, kq, vq, ks, vs,
+    attn_prefill_body<true>(out, qkv, nullptr, nullptr, kq, vq, ks, vs, kb, vb,
                             pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
 }
 
