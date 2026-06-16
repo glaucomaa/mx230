@@ -189,6 +189,9 @@ pub enum Weights {
     Int4 {
         q: CudaSlice<u8>,       // int32 words of 8 rows per column (see quantize_q4)
         scales: CudaSlice<f16>, // [(n_in/32), n_out]
+        // GPTQ act-order: original input channel per stored position; the decode
+        // GEMV gathers the activation by this before the dp4a. None => identity.
+        perm: Option<CudaSlice<i32>>,
     },
     Int4K {
         q: CudaSlice<u8>,   // same nibble layout as Int4 (see quantize_q4k)
@@ -690,7 +693,7 @@ fn gemv(
                 .arg(&acc);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int4 { q, scales } => {
+        Weights::Int4 { q, scales, perm } => {
             let mut lb = stream.launch_builder(&k.gemv_int4);
             lb.arg(y)
                 .arg(x)
@@ -700,6 +703,14 @@ fn gemv(
                 .arg(&ni)
                 .arg(&no)
                 .arg(&acc);
+            // GPTQ act-order permutation pointer, or a null pointer (a
+            // pointer-width zero scalar) when there is none — gemv_int4 guards
+            // on `perm != nullptr`.
+            let null_perm = 0u64;
+            match perm {
+                Some(p) => lb.arg(p),
+                None => lb.arg(&null_perm),
+            };
             unsafe { lb.launch(cfg) }.unwrap();
         }
         Weights::Int4K { q, sub, dm } => {
@@ -857,7 +868,7 @@ fn gemm(
                 .arg(&k_i);
             unsafe { lb.launch(cfg) }.unwrap();
         }
-        Weights::Int4 { q, scales } => {
+        Weights::Int4 { q, scales, .. } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
@@ -1080,6 +1091,10 @@ pub struct Engine {
     graph_tok: CudaSlice<i32>,
     graph_pos: CudaSlice<i32>,
     decode_graph: Option<CudaGraph>,
+    // GPTQ act-order stores weights in a permuted channel order that only the
+    // decode GEMV (gemv_int4) gathers correctly; the batch-prefill GEMM does
+    // not, so prefill falls back to the per-token decode loop when this is set.
+    gptq_act_order: bool,
 }
 
 impl Engine {
@@ -1220,6 +1235,7 @@ impl Engine {
                     Weights::Int4 {
                         q: stream.clone_htod(&q).unwrap(),
                         scales: stream.clone_htod(&s).unwrap(),
+                        perm: None,
                     }
                 }
                 WeightMode::Int4K => {
@@ -1257,10 +1273,19 @@ impl Engine {
                        n_out: usize,
                        fb_mode: WeightMode|
          -> Weights {
-            if let Some((q, s)) = gptq.and_then(|sc| sc.get(li, role)) {
+            if let Some(e) = gptq.and_then(|sc| sc.get(li, role)) {
+                // act-order perm is identity when the sidecar was built without
+                // it; upload it only when it actually reorders (Some => the
+                // gemv gathers the activation, None => plain contiguous path)
+                let is_identity = e.perm.iter().enumerate().all(|(k, &p)| p as usize == k);
                 Weights::Int4 {
-                    q: stream.clone_htod(q).unwrap(),
-                    scales: stream.clone_htod(s).unwrap(),
+                    q: stream.clone_htod(&e.q).unwrap(),
+                    scales: stream.clone_htod(&e.scales).unwrap(),
+                    perm: if is_identity {
+                        None
+                    } else {
+                        Some(stream.clone_htod(&e.perm).unwrap())
+                    },
                 }
             } else {
                 upw_as(t, n_in, n_out, fb_mode)
@@ -1312,9 +1337,12 @@ impl Engine {
             })
             .collect();
 
+        let gptq_act_order = gptq.is_some_and(|sc| sc.has_act_order());
+
         Engine {
             config: c,
             k,
+            gptq_act_order,
             // embeddings/lm_head stay one tier up on the low rungs — see
             // WeightMode::embed_mode
             wte_t: upw_as(&wte_t, e, v, mode.embed_mode()),
@@ -1438,7 +1466,7 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int4 { q, scales } => {
+            Weights::Int4 { q, scales, .. } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int4);
                 lb.arg(&mut self.x)
                     .arg(q)
@@ -1530,7 +1558,7 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(c.n_embd)) }.unwrap();
             }
-            Weights::Int4 { q, scales } => {
+            Weights::Int4 { q, scales, .. } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int4_dyn);
                 lb.arg(&mut self.x)
                     .arg(q)
@@ -2049,7 +2077,7 @@ impl Engine {
                     .arg(&v_i);
                 unsafe { lb.launch(cfg1d(n * c.n_embd)) }.unwrap();
             }
-            Weights::Int4 { q, scales } => {
+            Weights::Int4 { q, scales, .. } => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_int4_batch);
                 lb.arg(&mut self.batch_x)
                     .arg(q)
@@ -2364,6 +2392,16 @@ impl Engine {
     pub fn prefill(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
         if tokens.len() == 1 {
             return self.forward(tokens[0], pos0);
+        }
+        // GPTQ act-order weights are permuted in a way only the decode GEMV
+        // gathers correctly; the batch GEMM would mis-multiply, so prefill
+        // token-by-token through the (correct) decode path instead.
+        if self.gptq_act_order {
+            let mut logits = Vec::new();
+            for (i, &t) in tokens.iter().enumerate() {
+                logits = self.forward(t, pos0 + i);
+            }
+            return logits;
         }
         self.batch_body(tokens, pos0);
         let c = self.config;

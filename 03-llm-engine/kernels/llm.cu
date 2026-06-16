@@ -469,9 +469,13 @@ extern "C" __global__ void embed_int4k_batch(float *out, const unsigned char *wt
 }
 
 // ---- int4 weights (--int4, Q4_0-style, fast path), dp4a math --------------
+// `perm` (or null): GPTQ act-order. When non-null the activation is gathered as
+// x[perm[i]] before quantizing, so it lines up with weights stored in the same
+// descending-Hessian channel order (scales stay per contiguous 32-group). The
+// dot is permutation-invariant, so the result equals the unpermuted GEMV.
 extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned char *w,
                                      const __half *scales, const float *b,
-                                     int n_in, int n_out, int accum) {
+                                     int n_in, int n_out, int accum, const int *perm) {
     extern __shared__ char smem_raw[];
     int nq = n_in / 4;        // activation dp4a words
     int nw = n_in / Q4_GROUP; // 32-row weight groups
@@ -480,13 +484,14 @@ extern "C" __global__ void gemv_int4(float *y, const float *x, const unsigned ch
     int *xsum = (int *)(smem_raw + 2 * n_in);    // nq group sums
     float *s32 = (float *)(smem_raw + 3 * n_in); // nw correction sums
     for (int g = threadIdx.x; g < nq; g += blockDim.x) {
-        const float *xg = x + g * 4;
+        float xv[4];
+        for (int j = 0; j < 4; ++j) xv[j] = perm ? x[perm[g * 4 + j]] : x[g * 4 + j];
         float amax = 0.0f;
-        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(xg[j]));
+        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(xv[j]));
         float id = amax > 0.0f ? 127.0f / amax : 0.0f;
         int packed = 0, sum = 0;
         for (int j = 0; j < 4; ++j) {
-            int v = max(-127, min(127, __float2int_rn(xg[j] * id)));
+            int v = max(-127, min(127, __float2int_rn(xv[j] * id)));
             sum += v;
             packed |= (v & 0xFF) << (8 * j);
         }

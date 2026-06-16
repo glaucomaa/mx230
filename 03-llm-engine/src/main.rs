@@ -312,7 +312,9 @@ fn main() {
                 t0.elapsed().as_secs_f64()
             );
             let t1 = Instant::now();
-            let sidecar = gptq::build(&model, &hess, damp);
+            let act_order = !flag(&args, "--no-act-order");
+            eprintln!("GPTQ: act-order {}", if act_order { "on" } else { "off" });
+            let sidecar = gptq::build(&model, &hess, damp, act_order);
             let path = sidecar_path(&choice);
             sidecar.save(&path).unwrap();
             eprintln!(

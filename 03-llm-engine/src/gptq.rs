@@ -27,7 +27,7 @@ use crate::calib::Hessians;
 use crate::model::Model;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"MXGQ");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // v2 adds the per-linear act-order permutation
 const GROUP: usize = 32; // must match Q4_GROUP in gpu.rs
 
 /// Which linear inside a block. Mirrors the four `cpu::Site`s plus `Up` (the
@@ -63,16 +63,37 @@ impl Role {
     }
 }
 
+/// Pre-quantized Q4_0 blob for one linear: nibbles + per-group scales in the
+/// `quantize_q4` layout, plus the act-order permutation. `perm[k]` is the
+/// original input channel stored at permuted position `k`; weights are stored
+/// in permuted order so the contiguous-32-group scales line up with GPTQ's
+/// descending-Hessian quantization order, and the GEMV gathers the activation
+/// by `perm` (the dot product is permutation-invariant). Identity perm when
+/// act-order is off.
+pub struct Entry {
+    pub q: Vec<u8>,
+    pub scales: Vec<f16>,
+    pub perm: Vec<i32>,
+}
+
 /// Pre-quantized Q4_0 blobs for the GPTQ-covered linears, keyed by (layer,
 /// role). Tensors not present (embeddings, norms, lm_head) fall back to the
 /// normal upload path in `Engine::new`.
 pub struct Sidecar {
-    entries: HashMap<(usize, Role), (Vec<u8>, Vec<f16>)>,
+    entries: HashMap<(usize, Role), Entry>,
 }
 
 impl Sidecar {
-    pub fn get(&self, layer: usize, role: Role) -> Option<&(Vec<u8>, Vec<f16>)> {
+    pub fn get(&self, layer: usize, role: Role) -> Option<&Entry> {
         self.entries.get(&(layer, role))
+    }
+
+    /// True if any entry actually reorders channels (non-identity perm) — the
+    /// engine then routes prefill through the perm-aware decode GEMV.
+    pub fn has_act_order(&self) -> bool {
+        self.entries
+            .values()
+            .any(|e| e.perm.iter().enumerate().any(|(k, &p)| p as usize != k))
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -85,14 +106,19 @@ impl Sidecar {
         let mut keys: Vec<_> = self.entries.keys().copied().collect();
         keys.sort_by_key(|(l, r)| (*l, r.tag()));
         for key @ (l, r) in keys {
-            let (q, s) = &self.entries[&key];
+            let e = &self.entries[&key];
             out.write_all(&(l as u32).to_le_bytes())?;
             out.write_all(&r.tag().to_le_bytes())?;
-            out.write_all(&(q.len() as u32).to_le_bytes())?;
-            out.write_all(q)?;
-            out.write_all(&(s.len() as u32).to_le_bytes())?;
-            let sb = unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+            out.write_all(&(e.q.len() as u32).to_le_bytes())?;
+            out.write_all(&e.q)?;
+            out.write_all(&(e.scales.len() as u32).to_le_bytes())?;
+            let sb =
+                unsafe { std::slice::from_raw_parts(e.scales.as_ptr() as *const u8, e.scales.len() * 2) };
             out.write_all(sb)?;
+            out.write_all(&(e.perm.len() as u32).to_le_bytes())?;
+            let pb =
+                unsafe { std::slice::from_raw_parts(e.perm.as_ptr() as *const u8, e.perm.len() * 4) };
+            out.write_all(pb)?;
         }
         Ok(())
     }
@@ -116,12 +142,18 @@ impl Sidecar {
             let q = buf[pos..pos + qlen].to_vec();
             pos += qlen;
             let slen = rd(&mut pos) as usize;
-            let s: Vec<f16> = buf[pos..pos + slen * 2]
+            let scales: Vec<f16> = buf[pos..pos + slen * 2]
                 .chunks_exact(2)
                 .map(|c| f16::from_le_bytes(c.try_into().unwrap()))
                 .collect();
             pos += slen * 2;
-            entries.insert((l, r), (q, s));
+            let plen = rd(&mut pos) as usize;
+            let perm: Vec<i32> = buf[pos..pos + plen * 4]
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            pos += plen * 4;
+            entries.insert((l, r), Entry { q, scales, perm });
         }
         Ok(Sidecar { entries })
     }
@@ -138,14 +170,17 @@ struct Job<'a> {
 
 /// Build a GPTQ sidecar for `model` from calibration `hess`. Layers are
 /// quantized in parallel (capped to keep the f64 work matrices in RAM).
-pub fn build(model: &Model, hess: &Hessians, damp: f64) -> Sidecar {
+/// `act_order` quantizes input channels in descending-Hessian order (the
+/// standard fix for the error-feedback instability — essential here, see the
+/// GPTQ commit message); off => identity perm == plain order.
+pub fn build(model: &Model, hess: &Hessians, damp: f64, act_order: bool) -> Sidecar {
     let c = model.config;
     let (e, qd, qkvd, inter) = (c.n_embd, c.q_dim(), c.qkv_dim(), c.n_inter);
     // the Hessians' per-site input widths must match the linears we feed them
     assert_eq!(hess.n_in, [e, qd, e, inter], "Hessian/model dim mismatch");
 
     let next = AtomicUsize::new(0);
-    let out: Vec<Mutex<Vec<((usize, Role), (Vec<u8>, Vec<f16>))>>> =
+    let out: Vec<Mutex<Vec<((usize, Role), Entry)>>> =
         (0..c.n_layer).map(|_| Mutex::new(Vec::new())).collect();
     // Each worker holds up to two n×n f64 matrices for the widest linear it
     // touches; cap concurrency so peak RAM stays bounded (~0.4 GB/thread at
@@ -179,8 +214,8 @@ pub fn build(model: &Model, hess: &Hessians, damp: f64) -> Sidecar {
                 }
                 let mut done = Vec::with_capacity(jobs.len());
                 for j in jobs {
-                    let (q, s) = quantize_linear(j.w, j.h, j.n_in, j.n_out, damp);
-                    done.push(((l, j.role), (q, s)));
+                    let entry = quantize_linear(j.w, j.h, j.n_in, j.n_out, damp, act_order);
+                    done.push(((l, j.role), entry));
                 }
                 *out[l].lock().unwrap() = done;
                 eprintln!("GPTQ: layer {l} done");
@@ -198,11 +233,36 @@ pub fn build(model: &Model, hess: &Hessians, damp: f64) -> Sidecar {
 }
 
 /// GPTQ-quantize one `[n_in, n_out]` linear (row-major) given its input
-/// Hessian `h` (`[n_in, n_in]`). Returns `(q, scales)` byte-identical in layout
-/// to `quantize_q4`. Group scales are recomputed from the running
-/// (error-corrected) weights at each group boundary.
-fn quantize_linear(w: &[f32], h: &[f32], n_in: usize, n_out: usize, damp: f64) -> (Vec<u8>, Vec<f16>) {
+/// Hessian `h` (`[n_in, n_in]`). Produces `(q, scales)` byte-identical in
+/// layout to `quantize_q4`, plus the act-order permutation. With `act_order`
+/// the input channels are processed (and stored) in descending-Hessian order,
+/// so the contiguous-32-group scales align with GPTQ's quantization order; the
+/// GEMV later gathers the activation by `perm` (the dot is permutation-
+/// invariant). Group scales are static (from the original weights).
+fn quantize_linear(
+    w: &[f32],
+    h: &[f32],
+    n_in: usize,
+    n_out: usize,
+    damp: f64,
+    act_order: bool,
+) -> Entry {
     assert!(n_in.is_multiple_of(GROUP), "GPTQ needs n_in % {GROUP} == 0");
+
+    // perm[k] = original input channel placed at permuted position k
+    let mut perm: Vec<i32> = (0..n_in as i32).collect();
+    if act_order {
+        perm.sort_by(|&a, &b| {
+            let (da, db) = (h[a as usize * n_in + a as usize], h[b as usize * n_in + b as usize]);
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    // permute the Hessian (rows+cols) and weight rows into that order; when the
+    // perm is identity these are plain copies, so the body below is oblivious
+    let hp = permute_sym(h, n_in, &perm);
+    let wp = permute_rows(w, n_in, n_out, &perm);
+    let (w, h) = (wp.as_slice(), hp.as_slice());
+
     let u = hinv_upper(h, n_in, damp);
 
     // working weights, column-major [n_out][n_in] so the trailing-channel
@@ -262,7 +322,31 @@ fn quantize_linear(w: &[f32], h: &[f32], n_in: usize, n_out: usize, damp: f64) -
             }
         }
     }
-    (q, scales)
+    Entry { q, scales, perm }
+}
+
+/// Symmetric permutation `hp[a][b] = h[perm[a]][perm[b]]`.
+fn permute_sym(h: &[f32], n: usize, perm: &[i32]) -> Vec<f32> {
+    let mut hp = vec![0.0f32; n * n];
+    for a in 0..n {
+        let pa = perm[a] as usize * n;
+        let dst = &mut hp[a * n..a * n + n];
+        for b in 0..n {
+            dst[b] = h[pa + perm[b] as usize];
+        }
+    }
+    hp
+}
+
+/// Row permutation of a `[n_in, n_out]` matrix: row `k` of the result is row
+/// `perm[k]` of the input.
+fn permute_rows(w: &[f32], n_in: usize, n_out: usize, perm: &[i32]) -> Vec<f32> {
+    let mut wp = vec![0.0f32; n_in * n_out];
+    for k in 0..n_in {
+        let src = perm[k] as usize * n_out;
+        wp[k * n_out..k * n_out + n_out].copy_from_slice(&w[src..src + n_out]);
+    }
+    wp
 }
 
 /// Upper-triangular Cholesky factor `U` of the inverse of the damped Hessian:
@@ -458,14 +542,32 @@ mod tests {
                 h[i * n_in + j] = s + if i == j { 0.1 } else { 0.0 };
             }
         }
-        let (q, s) = quantize_linear(&w, &h, n_in, n_out, DEFAULT_DAMP);
-        let wq_gptq = dequant(&q, &s, n_in, n_out);
+        let e = quantize_linear(&w, &h, n_in, n_out, DEFAULT_DAMP, false);
+        let wq_gptq = dequant(&e.q, &e.scales, n_in, n_out);
         let wq_rtn = rtn(&w, n_in, n_out);
         let eg = h_err(&w, &wq_gptq, &h, n_in, n_out);
         let er = h_err(&w, &wq_rtn, &h, n_in, n_out);
         assert!(
             eg <= er * 1.02 + 1e-6,
             "GPTQ H-error {eg:.4} should be <= RTN {er:.4}"
+        );
+        assert_eq!(e.perm, (0..n_in as i32).collect::<Vec<_>>(), "no act-order => identity perm");
+
+        // act-order: weights come back in permuted order; un-permuting by `perm`
+        // (the GEMV gathers the activation the same way) must reconstruct a
+        // valid quantization that still beats RTN on the H-metric.
+        let ea = quantize_linear(&w, &h, n_in, n_out, DEFAULT_DAMP, true);
+        let wq_perm = dequant(&ea.q, &ea.scales, n_in, n_out);
+        let mut wq_ao = vec![0.0f32; n_in * n_out];
+        for k in 0..n_in {
+            let orig = ea.perm[k] as usize;
+            wq_ao[orig * n_out..orig * n_out + n_out]
+                .copy_from_slice(&wq_perm[k * n_out..k * n_out + n_out]);
+        }
+        let ea_err = h_err(&w, &wq_ao, &h, n_in, n_out);
+        assert!(
+            ea_err <= er * 1.02 + 1e-6,
+            "act-order GPTQ H-error {ea_err:.4} should be <= RTN {er:.4}"
         );
     }
 }
