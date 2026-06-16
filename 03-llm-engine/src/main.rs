@@ -9,7 +9,8 @@
 //!       [--embed-int8] [--ffn-down-int8] [--mixed]   # int8 embed/lm_head/ffn-down under int4
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
-//!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
+//!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8] [--prefill-dp4a]
+//!       # --prefill-dp4a: non-kv8 prefill QKᵀ scores on dp4a (opt-in; ~6-8%, int8-approximate)
 //!   cargo run -rp llm-engine -- ppl --data path [-n tokens] [--smooth] [--int4 --gptq]
 //!   cargo run -rp llm-engine -- calib-data              # WikiText-2 validation (calibration)
 //!   cargo run -rp llm-engine -- gptq [--calib-tokens 1024] [--gptq-damp 0.01]  # build sidecar
@@ -370,6 +371,7 @@ fn main() {
             let (embed_int8, ffn_down_int8) = mixed_flags(&args);
             let mut engine =
                 gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8);
+            engine.prefill_dp4a = flag(&args, "--prefill-dp4a");
 
             if spec && !sampler.is_greedy() {
                 eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
@@ -424,12 +426,18 @@ fn main() {
             let want = cpu::forward(&model, &ids);
 
             let ctx = CudaContext::new(0).unwrap();
+            // --prefill-dp4a exercises the opt-in int8-score prefill. Its scores
+            // are int8-approximate while non-kv8 decode stays fp32, so for the
+            // fragile bottom-rung int3/int2 modes the batch argmax may legitimately
+            // diverge from decode by a token — relaxed to a note below.
+            let prefill_dp4a = flag(&args, "--prefill-dp4a");
             let mut combos: Vec<(gpu::WeightMode, bool)> =
                 modes_for(choice.arch).iter().map(|&m| (m, false)).collect();
             combos.push((modes_for(choice.arch)[0], true));
             combos.push((gpu::WeightMode::Int8, true));
             for (mode, kv8) in combos {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                engine.prefill_dp4a = prefill_dp4a;
                 let mut got = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     got = engine.forward(t, pos);
@@ -470,7 +478,12 @@ fn main() {
                 } else {
                     assert_eq!(cw, gw, "{mode}{kv} argmax mismatch");
                 }
-                assert_eq!(gw, bw, "{mode}{kv} batch prefill argmax mismatch");
+                let fragile = matches!(mode, gpu::WeightMode::Int3 | gpu::WeightMode::Int2);
+                if prefill_dp4a && !kv8 && fragile && gw != bw {
+                    println!("  note: {mode} batch≠decode under --prefill-dp4a (int8 scores vs fp32-decode, fragile mode)");
+                } else {
+                    assert_eq!(gw, bw, "{mode}{kv} batch prefill argmax mismatch");
+                }
                 println!("  OK");
             }
 
@@ -495,9 +508,15 @@ fn main() {
                 let d = gpu::argmax(&logits);
                 drop(engine);
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
+                engine.prefill_dp4a = prefill_dp4a;
                 let b = gpu::argmax(&engine.prefill(&long_ids, 0));
-                assert_eq!(d, b, "{mode} wide-tier batch prefill argmax mismatch (M={})", long_ids.len());
-                println!("  {mode}: decode={d} batch={b}  OK");
+                let fragile = matches!(mode, gpu::WeightMode::Int3 | gpu::WeightMode::Int2);
+                if prefill_dp4a && fragile && d != b {
+                    println!("  {mode}: decode={d} batch={b}  note: differs under --prefill-dp4a (fragile mode)");
+                } else {
+                    assert_eq!(d, b, "{mode} wide-tier batch prefill argmax mismatch (M={})", long_ids.len());
+                    println!("  {mode}: decode={d} batch={b}  OK");
+                }
             }
 
             // a prompt with repeated n-grams guarantees prompt_lookup finds
@@ -628,7 +647,11 @@ fn main() {
             let ctx = CudaContext::new(0).unwrap();
 
             let only = mode_filter(&args);
+            let prefill_dp4a = flag(&args, "--prefill-dp4a");
             println!("prompt tokens: {}", ids.len());
+            if prefill_dp4a {
+                println!("(non-kv8 prefill QKᵀ scores on dp4a — --prefill-dp4a)");
+            }
             println!("| mode | kv | token-loop TTFT | batch TTFT | speedup |");
             println!("|------|----|-----------------|------------|---------|");
             for &mode in modes_for(choice.arch) {
@@ -644,6 +667,7 @@ fn main() {
                 drop(loop_engine);
 
                 let mut batch_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                batch_engine.prefill_dp4a = prefill_dp4a;
                 let t0 = Instant::now();
                 batch_engine.prefill(&ids, 0);
                 let batch_dt = t0.elapsed().as_secs_f64();

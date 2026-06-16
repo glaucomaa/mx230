@@ -15,7 +15,7 @@ cargo run -rp llm-engine -- export [--model qwen]     # download + convert weigh
 cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
 cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec] [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
-cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
+cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a]  # --prefill-dp4a: opt-in dp4a prefill scores (~6-8%)
 cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
@@ -287,6 +287,23 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   absolute TTFT keeps falling.) The prefill path is checked against the
   token loop in `verify`: final logits may differ at float-rounding scale,
   but the greedy argmax must match in every weight/KV mode.
+- **Prefill attention scores can run on dp4a too (`--prefill-dp4a`, opt-in).**
+  The kv8 path already scores QKᵀ with `__dp4a` (q and the int8-cache K go
+  straight in); the same trick works over an fp32 cache by quantizing each K
+  tile row to int8 on the fly (symmetric absmax, so no affine term to fold) —
+  and dropping the 16 KB fp32 K tile lifts occupancy. Worth ~6-8% on prefill
+  (GPT-2 batch TTFT fp32 0.239→0.222, int8 0.196→0.180, int4 0.223→0.208s).
+  It stays opt-in, not default, because the scores go int8-approximate while
+  non-kv8 decode stays exact fp32: the greedy argmax still matches on every
+  meaningful mode (verify green for fp32/fp16/int8/int4/int4k on all three
+  models), but the bottom-rung int3/int2 — logits already ~100x off — can flip
+  a token. So the exact fp32-score prefill remains the default and the
+  decode==prefill invariant holds untouched unless you ask for the speed;
+  `verify --prefill-dp4a` exercises the opt-in path and relaxes only int3/int2.
+  Decode is left alone deliberately — it is memory-bound (dp4a buys it nothing)
+  and its 8e-5 fp32 fidelity is the reference the rest is checked against.
+  One kernel, `attn_prefill_body<int KIND>`: 0 exact fp32, 1 kv8 int8-cache,
+  2 this dp4a-over-fp32-cache path.
 - **The GEMM dispatches on M, because a square tile wastes compute on skinny
   batches.** A 64x64 tile burns 64 rows of FMAs whether M is 512 or 8, and
   that wasted compute — not bandwidth — was the floor of the speculative

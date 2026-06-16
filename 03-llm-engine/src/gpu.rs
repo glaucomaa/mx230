@@ -597,6 +597,7 @@ struct Kernels {
     attn_decode_q8_dyn: CudaFunction,
     attn_prefill: CudaFunction,
     attn_prefill_q8: CudaFunction,
+    attn_prefill_dp4a: CudaFunction,
     layernorm_batch: CudaFunction,
     rmsnorm_batch: CudaFunction,
     add_inplace: CudaFunction,
@@ -685,6 +686,7 @@ fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
         attn_decode_q8_dyn: f("attn_decode_q8_dyn"),
         attn_prefill: f("attn_prefill"),
         attn_prefill_q8: f("attn_prefill_q8"),
+        attn_prefill_dp4a: f("attn_prefill_dp4a"),
         layernorm_batch: f("layernorm_batch"),
         rmsnorm_batch: f("rmsnorm_batch"),
         add_inplace: f("add_inplace"),
@@ -1374,6 +1376,11 @@ pub struct Engine {
     // decode GEMV (gemv_int4) gathers correctly; the batch-prefill GEMM does
     // not, so prefill falls back to the per-token decode loop when this is set.
     gptq_act_order: bool,
+    // Opt-in: run the non-kv8 prefill QKᵀ scores on dp4a (attn_prefill_dp4a)
+    // instead of the exact fp32 dot. ~6-8% faster prefill, scores go
+    // int8-approximate. Off by default so the exact path and the decode==prefill
+    // invariant are untouched; the kv8 path always uses its own int8 scores.
+    pub prefill_dp4a: bool,
 }
 
 impl Engine {
@@ -1548,6 +1555,7 @@ impl Engine {
             config: c,
             k,
             gptq_act_order,
+            prefill_dp4a: false,
             // embeddings/lm_head stay one tier up on the low rungs (embed_mode),
             // or int8 under --embed-int8 — see embed_tier above
             wte_t: upw_as(&wte_t, e, v, embed_tier),
@@ -2432,7 +2440,14 @@ impl Engine {
                     };
                     unsafe { lb.launch(copy_cfg) }.unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_prefill);
+                    // same fp32 cache either way; --prefill-dp4a only swaps how
+                    // the QKᵀ scores are computed (exact fp32 dot vs dp4a)
+                    let prefill_attn = if self.prefill_dp4a {
+                        &self.k.attn_prefill_dp4a
+                    } else {
+                        &self.k.attn_prefill
+                    };
+                    let mut lb = self.stream.launch_builder(prefill_attn);
                     lb.arg(&mut self.batch_attn)
                         .arg(&self.batch_qkv)
                         .arg(&k[l])

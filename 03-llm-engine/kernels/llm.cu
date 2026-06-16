@@ -3054,12 +3054,17 @@ extern "C" __global__ void copy_kv_batch(float *kcache, float *vcache, const flo
 // row qi sits at absolute position pos0 + qi and attends to keys 0..pos0+qi.
 // head_dim is fixed at 64 (q and acc live in registers).
 //
-// The Q8 (kv8) variant scores on dp4a like the decode kernel: K tiles stay
-// int8 in shared memory (16 words per row instead of 64 floats), q is
-// quantized in registers with one absmax scale per (row, head), and the
-// 64-dim dot is 16 dp4a. V still dequantizes to floats — the softmax-
-// weighted accumulation stays fp32.
-template <bool Q8>
+// KIND selects how QKᵀ scores are computed:
+//   0  fp32 cache, fp32 dot — the exact default (attn_prefill)
+//   1  int8 cache, dp4a     — kv8: K stays int8 with its affine (scale, β)
+//   2  fp32 cache, dp4a     — opt-in: K quantized on the fly, symmetric
+// Both dp4a variants quantize q in registers (one absmax scale per (row, head))
+// and reduce the 64-dim dot to 16 dp4a over an int8 K tile in shared memory
+// (16 words/row vs 64 floats). V always stays fp32 in the tile, so the
+// softmax-weighted accumulation is fp32 for every KIND. KIND 2 keeps the cache
+// exact (decode still reads fp32 K) and only approximates the scores, paying a
+// small per-tile K-requantization amortized over the 64 queries in the tile.
+template <int KIND>
 __device__ void attn_prefill_body(float *out, const float *qkv,
                                   const float *kcache, const float *vcache,
                                   const signed char *kq, const signed char *vq,
@@ -3067,10 +3072,12 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                                   const float *kb, const float *vb,
                                   int pos0, int n_tok, int n_head, int n_kv_head,
                                   int qkv_stride, int out_stride) {
-    __shared__ float Kt[Q8 ? 1 : 64][64];
-    __shared__ int Kq[Q8 ? 64 : 1][16];
-    __shared__ float Ks[Q8 ? 64 : 1];
-    __shared__ float Kb[Q8 ? 64 : 1];
+    constexpr bool DP4A = KIND != 0;     // QKᵀ via dp4a (else the exact fp32 dot)
+    constexpr bool I8_CACHE = KIND == 1; // K/V sourced from the int8 cache
+    __shared__ float Kt[KIND == 0 ? 64 : 1][64];
+    __shared__ int Kq[KIND == 0 ? 1 : 64][16];
+    __shared__ float Ks[KIND == 0 ? 1 : 64];
+    __shared__ float Kb[KIND == 0 ? 1 : 64];
     __shared__ float Vt[64][64];
     int h = blockIdx.x;
     int tile0 = blockIdx.y * 64;
@@ -3088,7 +3095,7 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
     float m = -CUDART_INF_F, l = 0.0f;
     if (active) {
         for (int d = 0; d < 64; ++d) q[d] = qkv[(size_t)qi * qkv_stride + h * 64 + d];
-        if (Q8) {
+        if (DP4A) {
             float amax = 0.0f;
             for (int d = 0; d < 64; ++d) amax = fmaxf(amax, fabsf(q[d]));
             float id = amax > 0.0f ? 127.0f / amax : 0.0f;
@@ -3109,7 +3116,7 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
     int max_key = pos0 + min(tile0 + 63, n_tok - 1);
     for (int kt = 0; kt <= max_key; kt += 64) {
         int tile_n = min(64, max_key - kt + 1);
-        if (Q8) {
+        if (I8_CACHE) {
             const int *k32 = (const int *)kq;
             for (int x = tid; x < tile_n * 16; x += 64) {
                 int r = x / 16, w = x % 16;
@@ -3119,17 +3126,35 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                 Ks[r] = ks[(kt + r) * n_kv_head + kvh];
                 Kb[r] = kb[(kt + r) * n_kv_head + kvh];
             }
+        } else if (DP4A && tid < tile_n) {
+            // KIND 2: quantize this K row to int8 on the fly (symmetric absmax).
+            // Two light passes over the fp32 row so we never hold all 64 values
+            // in registers next to q[]/acc[]; cost amortizes over 64 queries.
+            const float *krow = kcache + (size_t)(kt + tid) * kvd + kvh * 64;
+            float amax = 0.0f;
+            for (int d = 0; d < 64; ++d) amax = fmaxf(amax, fabsf(krow[d]));
+            float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+            for (int w = 0; w < 16; ++w) {
+                int packed = 0;
+                for (int j = 0; j < 4; ++j) {
+                    int v = max(-127, min(127, __float2int_rn(krow[4 * w + j] * id)));
+                    packed |= (v & 0xFF) << (8 * j);
+                }
+                Kq[tid][w] = packed;
+            }
+            Ks[tid] = amax > 0.0f ? amax / 127.0f : 0.0f;
+            Kb[tid] = 0.0f; // symmetric: K's affine offset is zero
         }
         for (int x = tid; x < tile_n * 64; x += 64) {
             int r = x / 64, d = x % 64;
-            if (Q8) {
+            if (I8_CACHE) {
                 // dequant + recover V's affine offset directly into the tile:
                 // the softmax-weighted sum below then carries it for free.
                 Vt[r][d] = (float)vq[(size_t)(kt + r) * kvd + kvh * 64 + d] *
                                vs[(kt + r) * n_kv_head + kvh] +
                            vb[(kt + r) * n_kv_head + kvh];
             } else {
-                Kt[r][d] = kcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
+                if (KIND == 0) Kt[r][d] = kcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
                 Vt[r][d] = vcache[(size_t)(kt + r) * kvd + kvh * 64 + d];
             }
         }
@@ -3139,11 +3164,12 @@ __device__ void attn_prefill_body(float *out, const float *qkv,
                 int kp = kt + j;
                 if (kp > pq) break;
                 float s;
-                if (Q8) {
+                if (DP4A) {
                     int dot = 0;
 #pragma unroll
                     for (int w = 0; w < 16; ++w) dot = __dp4a(qw[w], Kq[j][w], dot);
-                    // q·k = qs·scale·(Ksᵀ·dot + Kβ·Σq): dp4a term plus K's offset
+                    // q·k = qs·scale·(Ksⱼ·dot + Kβⱼ·Σq): dp4a term plus K's affine
+                    // offset (Kβ = 0 for the symmetric KIND-2 path)
                     s = qs * scale * ((float)dot * Ks[j] + (float)qsum * Kb[j]);
                 } else {
                     float dot = 0.0f;
@@ -3172,9 +3198,9 @@ extern "C" __global__ void attn_prefill(float *out, const float *qkv,
                                         const float *kcache, const float *vcache,
                                         int pos0, int n_tok, int n_head, int n_kv_head,
                                         int qkv_stride, int out_stride) {
-    attn_prefill_body<false>(out, qkv, kcache, vcache, nullptr, nullptr, nullptr, nullptr,
-                             nullptr, nullptr,
-                             pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
+    attn_prefill_body<0>(out, qkv, kcache, vcache, nullptr, nullptr, nullptr, nullptr,
+                         nullptr, nullptr,
+                         pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
 }
 
 extern "C" __global__ void attn_prefill_q8(float *out, const float *qkv,
@@ -3183,8 +3209,21 @@ extern "C" __global__ void attn_prefill_q8(float *out, const float *qkv,
                                            const float *kb, const float *vb,
                                            int pos0, int n_tok, int n_head, int n_kv_head,
                                            int qkv_stride, int out_stride) {
-    attn_prefill_body<true>(out, qkv, nullptr, nullptr, kq, vq, ks, vs, kb, vb,
-                            pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
+    attn_prefill_body<1>(out, qkv, nullptr, nullptr, kq, vq, ks, vs, kb, vb,
+                         pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
+}
+
+// Opt-in (--prefill-dp4a): same fp32 cache as attn_prefill, but QKᵀ scores run
+// on dp4a — q and each K tile row are quantized to int8 on the fly. ~6-8%
+// faster prefill at the cost of int8-approximate scores, so the exact default
+// stays KIND 0 (decode also keeps reading fp32 K, so the cache is untouched).
+extern "C" __global__ void attn_prefill_dp4a(float *out, const float *qkv,
+                                             const float *kcache, const float *vcache,
+                                             int pos0, int n_tok, int n_head, int n_kv_head,
+                                             int qkv_stride, int out_stride) {
+    attn_prefill_body<2>(out, qkv, kcache, vcache, nullptr, nullptr, nullptr, nullptr,
+                         nullptr, nullptr,
+                         pos0, n_tok, n_head, n_kv_head, qkv_stride, out_stride);
 }
 
 // Block-wide (value, index) argmax with ties to the lowest index: one warp
