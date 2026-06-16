@@ -5,16 +5,20 @@
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
 //!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8|--int4] [--kv8] [--spec]
 //!       [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]   # default greedy; --spec stays greedy
+//!       [--smooth [--smooth-alpha 0.5] [--calib-tokens 512]]  # SmoothQuant fold
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
 //!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8]
-//!   cargo run -rp llm-engine -- ppl --data path [-n tokens]
+//!   cargo run -rp llm-engine -- ppl --data path [-n tokens] [--smooth]
+//!   cargo run -rp llm-engine -- calib-data              # WikiText-2 validation (calibration)
 
+mod calib;
 mod cpu;
 mod export;
 mod gpu;
 mod model;
 mod sample;
+mod smooth;
 mod tokenizer;
 
 use std::path::PathBuf;
@@ -70,6 +74,38 @@ fn load_model(choice: &ModelChoice) -> model::Model {
         choice.bin.display()
     );
     model::Model::load(&choice.bin).unwrap()
+}
+
+/// If `--smooth` is set, calibrate per-channel activation magnitudes on the
+/// validation split and return the SmoothQuant-folded model (exact in fp32,
+/// only the quantized-weight error downstream changes). Otherwise the model
+/// passes through untouched.
+fn maybe_smooth(
+    model: model::Model,
+    args: &[String],
+    tok: &tokenizer::Tokenizer,
+) -> model::Model {
+    if !flag(args, "--smooth") {
+        return model;
+    }
+    let alpha = opt_f32(args, "--smooth-alpha", 0.5);
+    let max_tokens = opt_usize(args, "--calib-tokens", 512);
+    let calib_path = models_dir().join("wikitext-2-raw/wiki.calib.raw");
+    assert!(
+        calib_path.exists(),
+        "{} not found; run `cargo run -rp llm-engine -- calib-data`",
+        calib_path.display()
+    );
+    let text = std::fs::read_to_string(&calib_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", calib_path.display()));
+    let ids = tok.encode(&text);
+    let n = max_tokens.min(ids.len());
+    eprintln!("SmoothQuant: calibrating on {n} tokens (alpha={alpha})...");
+    let t0 = Instant::now();
+    let stats = calib::collect(&model, &ids, 128, max_tokens);
+    let smoothed = smooth::smooth(&model, &stats, alpha);
+    eprintln!("SmoothQuant: done in {:.1}s", t0.elapsed().as_secs_f64());
+    smoothed
 }
 
 /// Weight-storage modes that fit in 2 GB VRAM for this model.
@@ -219,6 +255,9 @@ fn main() {
         Some("ppl-data") => {
             export::download_wikitext2(&models_dir());
         }
+        Some("calib-data") => {
+            export::download_wikitext2_calib(&models_dir());
+        }
         Some("generate") => {
             let prompt = args
                 .get(1)
@@ -244,7 +283,7 @@ fn main() {
             let choice = model_choice(&args);
 
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
-            let model = load_model(&choice);
+            let model = maybe_smooth(load_model(&choice), &args, &tok);
             let ctx = CudaContext::new(0).unwrap();
             let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
 
@@ -548,7 +587,7 @@ fn main() {
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", data_path.display()));
             let choice = model_choice(&args);
             let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
-            let model = load_model(&choice);
+            let model = maybe_smooth(load_model(&choice), &args, &tok);
             let mut ids = tok.encode(&text);
             ids.truncate(max_tokens.min(ids.len()));
             assert!(ids.len() > 1, "need at least two tokens for perplexity");
@@ -575,7 +614,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|generate|verify|bench|prefill-bench|ppl> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|generate|verify|bench|prefill-bench|ppl> [args]"
             );
             std::process::exit(1);
         }
@@ -632,5 +671,36 @@ mod tests {
         assert!(batch_err < 1.0, "fp32 batch prefill mismatch vs decode: {batch_err}");
         assert_eq!(gpu::argmax(&want), gpu::argmax(&got), "fp32 argmax mismatch vs CPU");
         assert_eq!(gpu::argmax(&got), gpu::argmax(&batch), "fp32 batch argmax mismatch");
+    }
+
+    /// SmoothQuant's fold is exactly weight-preserving in fp32: the smoothed
+    /// model's CPU logits must match the original's (up to fp rounding). If the
+    /// gamma/beta-vs-weight channel indexing is wrong, this diverges. CPU-only,
+    /// so it runs without a GPU; skips green if gpt2.bin is missing.
+    #[test]
+    fn smooth_preserves_cpu_logits() {
+        let dir = models_dir();
+        let bin = dir.join("gpt2.bin");
+        if !bin.exists() {
+            eprintln!("skip smooth test: {} missing (run `export` first)", bin.display());
+            return;
+        }
+        let tok = tokenizer::Tokenizer::load(&dir, model::Arch::Gpt2);
+        let model = model::Model::load(&bin).unwrap();
+        let ids = tok.encode("Alan Turing was a British mathematician");
+        let want = cpu::forward(&model, &ids);
+
+        // calibrate on the same prompt — enough to exercise the fold path
+        let stats = calib::collect(&model, &ids, ids.len(), ids.len());
+        let smoothed = smooth::smooth(&model, &stats, 0.5);
+        let got = cpu::forward(&smoothed, &ids);
+
+        let err = common::allclose_err(&got, &want, 1e-2, 5e-2);
+        assert!(err < 1.0, "smoothed CPU logits diverge from original: {err}");
+        assert_eq!(
+            gpu::argmax(&want),
+            gpu::argmax(&got),
+            "smoothed argmax changed (fold should be exact in fp32)"
+        );
     }
 }

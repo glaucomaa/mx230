@@ -106,6 +106,7 @@ impl Config {
 /// Per-layer weights, all fp32, linear weights as [n_in, n_out].
 /// GPT-2 uses every field; Qwen2 leaves the norm biases and MLP biases empty
 /// (`fc_w`/`fc2_w` are reused as SwiGLU gate/down, `up_w` is Qwen2-only).
+#[derive(Clone)]
 pub struct Layer {
     pub ln1_g: Vec<f32>,
     pub ln1_b: Vec<f32>,
@@ -122,6 +123,7 @@ pub struct Layer {
     pub fc2_b: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub struct Model {
     pub config: Config,
     pub wte: Vec<f32>, // [vocab, embd]; also the lm_head when tied

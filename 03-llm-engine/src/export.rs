@@ -16,7 +16,6 @@ const HF_TINYLLAMA_BASE: &str =
 const FILES: &[&str] = &["model.safetensors", "vocab.json", "merges.txt"];
 // SentencePiece-family checkpoint: vocab+merges live inside tokenizer.json
 const FILES_SP: &[&str] = &["model.safetensors", "tokenizer.json"];
-const WIKITEXT2_ROWS: &str = "https://datasets-server.huggingface.co/rows?dataset=Salesforce/wikitext&config=wikitext-2-raw-v1&split=test";
 
 fn fetch(base: &str, dir: &Path, files: &[&str]) {
     std::fs::create_dir_all(dir).unwrap();
@@ -49,31 +48,47 @@ pub fn download_tinyllama(dir: &Path) {
     fetch(HF_TINYLLAMA_BASE, dir, FILES_SP);
 }
 
+/// The WikiText-2 `test` split — the perplexity eval corpus.
 pub fn download_wikitext2(dir: &Path) {
+    download_wikitext2_split(dir, "test", "wiki.test.raw");
+}
+
+/// The WikiText-2 `validation` split — a *separate* corpus for SmoothQuant /
+/// GPTQ calibration (never the test split used for ppl, to avoid measuring on
+/// data the quantizer was tuned to).
+pub fn download_wikitext2_calib(dir: &Path) {
+    download_wikitext2_split(dir, "validation", "wiki.calib.raw");
+}
+
+fn download_wikitext2_split(dir: &Path, split: &str, filename: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let out_dir = dir.join("wikitext-2-raw");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let test = out_dir.join("wiki.test.raw");
-    if test.exists() {
-        println!("{} already present", test.display());
+    let out_file = out_dir.join(filename);
+    if out_file.exists() {
+        println!("{} already present", out_file.display());
         return;
     }
 
-    println!("downloading WikiText-2 raw test split...");
+    let base = format!(
+        "https://datasets-server.huggingface.co/rows\
+         ?dataset=Salesforce/wikitext&config=wikitext-2-raw-v1&split={split}"
+    );
+    println!("downloading WikiText-2 raw {split} split...");
     let mut out = String::new();
     let mut offset = 0usize;
     let page = 100usize;
     loop {
-        let json_path = out_dir.join(format!("page-{offset}.json"));
+        let json_path = out_dir.join(format!("page-{split}-{offset}.json"));
         let status = Command::new("curl")
             .args(["-L", "--fail", "--silent", "--show-error", "-o"])
             .arg(&json_path)
-            .arg(format!("{WIKITEXT2_ROWS}&offset={offset}&length={page}"))
+            .arg(format!("{base}&offset={offset}&length={page}"))
             .status()
             .expect("failed to run curl");
         assert!(
             status.success(),
-            "download of WikiText-2 page {offset} failed"
+            "download of WikiText-2 {split} page {offset} failed"
         );
 
         let bytes = std::fs::read(&json_path).unwrap();
@@ -101,8 +116,8 @@ pub fn download_wikitext2(dir: &Path) {
         }
     }
 
-    std::fs::write(&test, out).unwrap();
-    println!("wrote {}", test.display());
+    std::fs::write(&out_file, out).unwrap();
+    println!("wrote {}", out_file.display());
 }
 
 fn tensor(st: &SafeTensors, name: &str) -> Vec<f32> {

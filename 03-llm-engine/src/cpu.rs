@@ -59,18 +59,43 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// The two linears a norm feeds in each block: ln1 → qkv (`Attn`), ln2 → MLP
+/// gate/fc (`Mlp`). SmoothQuant calibration keys per-channel activation stats
+/// on these sites (see `calib.rs`).
+#[derive(Clone, Copy)]
+pub(crate) enum Site {
+    Attn,
+    Mlp,
+}
+
 /// Runs the full prompt and returns the logits for the last position.
 /// KV "cache" here is just keeping all K/V rows per layer in memory.
 pub fn forward(model: &Model, tokens: &[u32]) -> Vec<f32> {
+    forward_obs(model, tokens, &mut |_, _, _| {})
+}
+
+/// Same forward, but `obs(layer, site, x)` is invoked with the normalized
+/// activation entering each norm-fed linear (so callers can observe the exact
+/// values that hit the quantizer). Used by calibration; `forward` passes a
+/// no-op closure.
+pub(crate) fn forward_obs(
+    model: &Model,
+    tokens: &[u32],
+    obs: &mut impl FnMut(usize, Site, &[f32]),
+) -> Vec<f32> {
     match model.config.arch {
-        Arch::Gpt2 => forward_gpt2(model, tokens),
+        Arch::Gpt2 => forward_gpt2(model, tokens, obs),
         // Llama differs from Qwen2 only by zero qkv bias (stored as zeros)
         // and an untied lm_head (handled at the final projection)
-        Arch::Qwen2 | Arch::Llama => forward_qwen2(model, tokens),
+        Arch::Qwen2 | Arch::Llama => forward_qwen2(model, tokens, obs),
     }
 }
 
-fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
+fn forward_gpt2(
+    model: &Model,
+    tokens: &[u32],
+    obs: &mut impl FnMut(usize, Site, &[f32]),
+) -> Vec<f32> {
     let c = &model.config;
     let (e, nh, hd) = (c.n_embd, c.n_head, c.head_dim);
     let scale = 1.0 / (hd as f32).sqrt();
@@ -93,6 +118,7 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
 
         for (l, layer) in model.layers.iter().enumerate() {
             layernorm(&x, &layer.ln1_g, &layer.ln1_b, c.norm_eps, &mut xb);
+            obs(l, Site::Attn, &xb);
             linear(&xb, &layer.qkv_w, &layer.qkv_b, e, 3 * e, &mut qkv);
             kcache[l][t * e..(t + 1) * e].copy_from_slice(&qkv[e..2 * e]);
             vcache[l][t * e..(t + 1) * e].copy_from_slice(&qkv[2 * e..3 * e]);
@@ -129,6 +155,7 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
             }
 
             layernorm(&x, &layer.ln2_g, &layer.ln2_b, c.norm_eps, &mut xb);
+            obs(l, Site::Mlp, &xb);
             linear(&xb, &layer.fc_w, &layer.fc_b, e, 4 * e, &mut h);
             gelu(&mut h);
             linear(&h, &layer.fc2_w, &layer.fc2_b, 4 * e, e, &mut proj);
@@ -150,7 +177,11 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
     logits
 }
 
-fn forward_qwen2(model: &Model, tokens: &[u32]) -> Vec<f32> {
+fn forward_qwen2(
+    model: &Model,
+    tokens: &[u32],
+    obs: &mut impl FnMut(usize, Site, &[f32]),
+) -> Vec<f32> {
     let c = &model.config;
     let (e, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv_head, c.head_dim);
     let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
@@ -175,6 +206,7 @@ fn forward_qwen2(model: &Model, tokens: &[u32]) -> Vec<f32> {
 
         for (l, layer) in model.layers.iter().enumerate() {
             rmsnorm(&x, &layer.ln1_g, c.norm_eps, &mut xb);
+            obs(l, Site::Attn, &xb);
             linear(&xb, &layer.qkv_w, &layer.qkv_b, e, qkvd, &mut qkv);
             rope(&mut qkv[..qd], nh, hd, t, c.rope_theta);
             rope(&mut qkv[qd..qd + kvd], nkv, hd, t, c.rope_theta);
@@ -214,6 +246,7 @@ fn forward_qwen2(model: &Model, tokens: &[u32]) -> Vec<f32> {
             }
 
             rmsnorm(&x, &layer.ln2_g, c.norm_eps, &mut xb);
+            obs(l, Site::Mlp, &xb);
             linear(&xb, &layer.fc_w, &zero_e[..inter], e, inter, &mut gate);
             linear(&xb, &layer.up_w, &zero_e[..inter], e, inter, &mut up);
             for i in 0..inter {
