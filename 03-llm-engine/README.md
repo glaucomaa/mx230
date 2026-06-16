@@ -291,9 +291,21 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   The kv8 path already scores QKᵀ with `__dp4a` (q and the int8-cache K go
   straight in); the same trick works over an fp32 cache by quantizing each K
   tile row to int8 on the fly (symmetric absmax, so no affine term to fold) —
-  and dropping the 16 KB fp32 K tile lifts occupancy. The win shrinks as the
-  model grows, because attention is a smaller slice of prefill once the FFN
-  GEMMs and KV-head count dominate (batch TTFT, int8 weights):
+  and dropping the 16 KB fp32 K tile lifts occupancy. Full GPT-2 sweep
+  (batch TTFT, 512-token prompt, default → --prefill-dp4a):
+
+  | mode | default | --prefill-dp4a | Δ |
+  |------|---------|----------------|---|
+  | fp32 | 0.239s | 0.222s | −7.1% |
+  | fp16 | 0.272s | 0.256s | −5.9% |
+  | int8 | 0.196s | 0.180s | −8.2% |
+  | int4 | 0.223s | 0.208s | −6.7% |
+  | int4k | 0.259s | 0.244s | −5.8% |
+  | int3 | 0.974s | 0.962s | −1.2% |
+  | int2 | 0.844s | 0.832s | −1.4% |
+
+  The win shrinks as the model grows — attention is a smaller slice of prefill
+  once the FFN GEMMs and KV-head count dominate (int8 batch TTFT):
 
   | model | KV heads | default | --prefill-dp4a | Δ |
   |-------|----------|---------|----------------|---|
@@ -301,9 +313,9 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   | Qwen2.5-0.5B | 2 | 0.521s | 0.482s | −7.5% |
   | TinyLlama-1.1B | 4 | 1.186s | 1.120s | −5.6% |
 
-  (other modes track it: GPT-2 −6–8%, Qwen −5–7.5%, TinyLlama −4–6% across
-  fp16/int4/int4k; the int3/int2 rungs gain only 1.5–3% because their prefill
-  is bottlenecked on the slow non-wide GEMM tiers, not attention.)
+  (Qwen −5–7.5% and TinyLlama −4–6% across fp16/int4/int4k; the int3/int2
+  rungs gain only 1.5–3% everywhere — their prefill is bottlenecked on the
+  slow non-wide GEMM tiers, not attention.)
   It stays opt-in, not default, because the scores go int8-approximate while
   non-kv8 decode stays exact fp32: the greedy argmax still matches on every
   meaningful mode (verify green for fp32/fp16/int8/int4/int4k on all three
