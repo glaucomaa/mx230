@@ -19,9 +19,10 @@ up in the numbers:
   371 int4** vs 45 tok/s PyTorch CPU; Qwen2.5: **74 int8, 104 int4**;
   TinyLlama-1.1B: **62 tok/s int4 / 72 int3** (k-quants-style two-level
   scales keep int3 at +0.65 ppl) over its full 2048 window
-  on a card its fp16 weights alone wouldn't fit into (and PyTorch GPU has
-  no sm_61 kernels at all). Prefill beats llama.cpp on Qwen/TinyLlama
-  Q8_0, decode beats it everywhere
+  on a card its fp16 weights alone wouldn't fit into — PyTorch's cu126
+  wheels *do* run on this Pascal GPU, but TinyLlama fp16 OOMs there and even
+  GPT-2/Qwen fp16 run slower than this engine. Prefill beats llama.cpp on
+  Qwen/TinyLlama Q8_0, decode beats it everywhere
 
 Kernels: CUDA C → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks: Rust.
 Each stage's README has tables and the how/why.

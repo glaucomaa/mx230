@@ -34,7 +34,8 @@ GPT-2 124M:
 | **ours, int4 (dp4a)**   | 70 MB   | **371.1** (quality collapses — see ppl) |
 | **ours, int4 + graph + kv8** | 70 MB | **388.0** |
 | **ours, int3 / int2**   | 62 / 57 MB | **429.4 / 424.0** (k-quants rungs — see ppl) |
-| HF transformers (torch CPU) | 497 MB | 45.1   |
+| PyTorch 2.7.1+cu126, GPU fp16 (sm_61) | 249 MB | 42.5 |
+| PyTorch 2.7.1+cu126, CPU fp32         | 497 MB | 22.5 |
 
 Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
 
@@ -46,6 +47,7 @@ Qwen2.5-0.5B (24 layers, GQA 14q/2kv, SwiGLU, RoPE, 152k vocab):
 | **ours, int4 + graph**  | 278 MB  | **108.6**  |
 | **ours, int4 + spec**   | 278 MB  | **129.4**  |
 | **ours, int3 / int2**   | 244 / 222 MB | **125.2 / 125.4** (see ppl) |
+| PyTorch 2.7.1+cu126, GPU fp16 (sm_61) | 988 MB | 20.4 |
 
 TinyLlama-1.1B (22 layers, GQA 32q/4kv, SwiGLU, RoPE, untied lm_head,
 n_ctx 2048 — the full trained window):
@@ -57,20 +59,33 @@ n_ctx 2048 — the full trained window):
 | **ours, int4 + spec**   | 619 MB  | **74.0**   |
 | **ours, int3 (dp4a)**   | 528 MB  | **71.7** (+0.65 ppl — usable) |
 | **ours, int2 (dp4a)**   | 462 MB  | **79.2** (ppl 40 — bottom rung) |
+| PyTorch 2.7.1+cu126, GPU fp16 (sm_61) | 2.2 GB | **OOM (2 GB)** |
 
 Qwen2.5-0.5B in fp32 is ~1.9 GB of weights — it does not fit in 2 GB VRAM,
 so fp16/int8 storage is not an optimization here but the only way the model
 runs at all. TinyLlama-1.1B pushes that one step further: even fp16 is
 2.2 GB, so the model exists on this card only as int8 (1.1 GB, barely) or
-int4 (619 MB, comfortably) or int3 (528 MB, +0.65 ppl). And PyTorch still
-can't touch this GPU (no sm_61 kernels), so a 1.1B-parameter model
+int4 (619 MB, comfortably) or int3 (528 MB, +0.65 ppl). PyTorch on this GPU
+(cu126 wheels) only has fp16, which OOMs here — so a 1.1B-parameter model
 generating coherent text at 62–72 tok/s over its full 2048-token window
 on a 2019 laptop card is the engine's closing argument.
 
-PyTorch GPU is not in the table for a reason worth stating: current torch
-wheels ship no sm_61 kernels (`cudaErrorNoKernelImageForDevice`) — Pascal is
-simply unsupported, so the hand-written engine is the only way this GPU runs
-an LLM at all (`scripts/hf_baseline.py`).
+A word on the PyTorch baseline, because it is easy to get wrong. Pascal
+(sm_61) is *not* unsupported by PyTorch in general — it was dropped only from
+the CUDA 12.8/12.9/13.0 wheels (torch 2.8+); the **cu126** wheel line still
+ships sm_61 kernels. (Installing CUDA 12.9 here, then running a default
+`pip install torch`, lands you on a Pascal-less line and the
+`cudaErrorNoKernelImageForDevice` that makes it *look* impossible — it isn't.)
+With `torch==2.7.1+cu126` a real GPU baseline runs on this card
+(`scripts/hf_baseline.py`): GPT-2 fp16 **42.5 tok/s**, Qwen2.5-0.5B fp16
+**20.4** — both *slower* than this engine (GPT-2 fp16 117 / int8 266; Qwen
+int8 74), because Pascal's fp16 throughput is poor (this engine stores fp16
+but does the math in fp32 for exactly that reason) and HF `generate` carries
+per-token host overhead. TinyLlama-1.1B fp16 (~2.2 GB) simply **OOMs** on the
+2 GB card under torch, which has no sub-fp16 path here — so the model that runs
+at 62 tok/s int4 on this engine does not run under PyTorch at all. The honest
+claim is therefore not "PyTorch can't use this GPU" (it can) but "even when it
+can, it needs ≥2× the memory and loses on speed."
 
 ## llama.cpp baseline
 
