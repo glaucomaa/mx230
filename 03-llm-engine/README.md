@@ -118,6 +118,9 @@ Benchmark command (build `1593d56`):
   -p 512 -n 128 -r 5 -ngl 999 -fa off -o md
 ```
 
+The CPU baselines below use a CPU-only build (`-DGGML_CUDA=OFF`) of the same
+sources and `-ngl 0` (`build-cpu`, commit `7dad2f1`).
+
 | model | engine | model storage | prefill / prompt processing | greedy decode |
 |-------|--------|---------------|-----------------------------|---------------|
 | GPT-2 | llama.cpp CUDA | Q8_0 GGUF, 167.75 MiB | **2756.7 tok/s** (`pp512`) | 144.0 tok/s (`tg128`) |
@@ -128,6 +131,25 @@ Benchmark command (build `1593d56`):
 | TinyLlama-1.1B | ours | int8 weights, ~1.1 GB | **431 tok/s** (`512 / 1.188s`) | **38.9 tok/s** |
 | TinyLlama-1.1B | llama.cpp CUDA | Q4_0 GGUF, 606.53 MiB | **430.5 tok/s** (`pp512`) | 30.8 tok/s (`tg128`) |
 | TinyLlama-1.1B | ours | int4 weights, ~619 MB | 329 tok/s (`512 / 1.556s`) | **61.8 tok/s** |
+
+CPU baselines put the GPU numbers in context — the same llama.cpp build run
+with `-ngl 0` (CPU-only build `7dad2f1`, 4 threads on an i5-10210U), plus
+PyTorch 2.7.1+cu126 on CPU:
+
+| model | engine | prefill (`pp512`) | decode (`tg128`) |
+|-------|--------|-------------------|------------------|
+| GPT-2 | llama.cpp CPU, Q8_0 | 913.2 tok/s | 120.3 tok/s |
+| GPT-2 | PyTorch CPU, fp32 | — | 22.5 tok/s |
+| Qwen2.5-0.5B | llama.cpp CPU, Q8_0 | 139.9 tok/s | 34.3 tok/s |
+| Qwen2.5-0.5B | PyTorch CPU, fp32 | — | 6.0 tok/s |
+| TinyLlama-1.1B | llama.cpp CPU, Q8_0 | 55.3 tok/s | 17.2 tok/s |
+| TinyLlama-1.1B | llama.cpp CPU, Q4_0 | 62.4 tok/s | 26.1 tok/s |
+| TinyLlama-1.1B | PyTorch CPU, fp32 | — | 3.6 tok/s |
+
+GPT-2 is small enough that CPU decode (120 tok/s, llama.cpp) rivals llama.cpp
+on the GPU (144) — the GPU edge only opens up on the bigger models (Qwen decode
+34 CPU vs 74 ours, TinyLlama Q4_0 26 CPU vs 62 ours). PyTorch eager on CPU is
+much slower than llama.cpp's quantized CPU kernels throughout.
 
 Before the dp4a rewrite this table read very differently: llama.cpp won
 GPT-2 decode (144 vs 130), tied TinyLlama Q4_0 (31.2 vs 31.3), and its
