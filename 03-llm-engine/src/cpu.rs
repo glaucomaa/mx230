@@ -3,13 +3,11 @@
 
 use crate::model::{Arch, Model};
 
-const LN_EPS: f32 = 1e-5;
-
-fn layernorm(x: &[f32], g: &[f32], b: &[f32], out: &mut [f32]) {
+fn layernorm(x: &[f32], g: &[f32], b: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len() as f32;
     let mean = x.iter().sum::<f32>() / n;
     let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    let inv = 1.0 / (var + LN_EPS).sqrt();
+    let inv = 1.0 / (var + eps).sqrt();
     for i in 0..x.len() {
         out[i] = (x[i] - mean) * inv * g[i] + b[i];
     }
@@ -94,7 +92,7 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
         }
 
         for (l, layer) in model.layers.iter().enumerate() {
-            layernorm(&x, &layer.ln1_g, &layer.ln1_b, &mut xb);
+            layernorm(&x, &layer.ln1_g, &layer.ln1_b, c.norm_eps, &mut xb);
             linear(&xb, &layer.qkv_w, &layer.qkv_b, e, 3 * e, &mut qkv);
             kcache[l][t * e..(t + 1) * e].copy_from_slice(&qkv[e..2 * e]);
             vcache[l][t * e..(t + 1) * e].copy_from_slice(&qkv[2 * e..3 * e]);
@@ -130,7 +128,7 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
                 x[i] += proj[i];
             }
 
-            layernorm(&x, &layer.ln2_g, &layer.ln2_b, &mut xb);
+            layernorm(&x, &layer.ln2_g, &layer.ln2_b, c.norm_eps, &mut xb);
             linear(&xb, &layer.fc_w, &layer.fc_b, e, 4 * e, &mut h);
             gelu(&mut h);
             linear(&h, &layer.fc2_w, &layer.fc2_b, 4 * e, e, &mut proj);
@@ -140,7 +138,7 @@ fn forward_gpt2(model: &Model, tokens: &[u32]) -> Vec<f32> {
         }
     }
 
-    layernorm(&x, &model.lnf_g, &model.lnf_b, &mut xb);
+    layernorm(&x, &model.lnf_g, &model.lnf_b, c.norm_eps, &mut xb);
     // tied lm_head: logits[v] = dot(x_final, wte[v])
     for v in 0..c.n_vocab {
         logits[v] = model.wte[v * e..(v + 1) * e]

@@ -9,8 +9,6 @@
 #include <math_constants.h>
 #include <cuda_fp16.h>
 
-#define LN_EPS 1e-5f
-
 // out = wte_t[:, tok] (+ scale if int8 path uses it) + wpe[pos]
 // wte_t is the token embedding stored transposed: [n_embd, n_vocab].
 extern "C" __global__ void embed(float *out, const float *wte_t, const float *wpe,
@@ -120,7 +118,7 @@ __device__ __forceinline__ float block_max(float v, float *red) {
 }
 
 extern "C" __global__ void layernorm(float *out, const float *x, const float *g,
-                                     const float *b, int n) {
+                                     const float *b, int n, float eps) {
     __shared__ float red[32];
     int tid = threadIdx.x;
 
@@ -133,7 +131,7 @@ extern "C" __global__ void layernorm(float *out, const float *x, const float *g,
         float d = x[i] - mean;
         s += d * d;
     }
-    float inv = rsqrtf(block_sum(s, red) / n + LN_EPS);
+    float inv = rsqrtf(block_sum(s, red) / n + eps);
 
     for (int i = tid; i < n; i += blockDim.x) {
         out[i] = (x[i] - mean) * inv * g[i] + b[i];
@@ -974,7 +972,7 @@ extern "C" __global__ void rmsnorm(float *out, const float *x, const float *g,
 // summation order the batch==decode argmax gate was calibrated against
 // (int4/kv8 logits sit close enough that reordering flips near-ties).
 extern "C" __global__ void layernorm_batch(float *out, const float *x, const float *g,
-                                           const float *b, int rows, int n) {
+                                           const float *b, int rows, int n, float eps) {
     __shared__ float red[256];
     int row = blockIdx.x;
     if (row >= rows) return;
@@ -1004,7 +1002,7 @@ extern "C" __global__ void layernorm_batch(float *out, const float *x, const flo
         if (tid < k) red[tid] += red[tid + k];
         __syncthreads();
     }
-    float inv = rsqrtf(red[0] / n + LN_EPS);
+    float inv = rsqrtf(red[0] / n + eps);
     __syncthreads();
 
     for (int i = tid; i < n; i += blockDim.x) {

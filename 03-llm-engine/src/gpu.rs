@@ -620,7 +620,7 @@ fn norm(
     match b {
         Some(b) => {
             let mut lb = stream.launch_builder(&k.layernorm);
-            lb.arg(out).arg(x).arg(g).arg(b).arg(&n_i);
+            lb.arg(out).arg(x).arg(g).arg(b).arg(&n_i).arg(&eps);
             unsafe { lb.launch(cfg) }.unwrap();
         }
         None => {
@@ -1019,7 +1019,7 @@ fn norm_batch(
     match b {
         Some(b) => {
             let mut lb = stream.launch_builder(&k.layernorm_batch);
-            lb.arg(out).arg(x).arg(g).arg(b).arg(&rows_i).arg(&n_i);
+            lb.arg(out).arg(x).arg(g).arg(b).arg(&rows_i).arg(&n_i).arg(&eps);
             unsafe { lb.launch(cfg) }.unwrap();
         }
         None => {
@@ -1081,6 +1081,14 @@ pub struct Engine {
 impl Engine {
     pub fn new(ctx: &Arc<CudaContext>, model: &Model, mode: WeightMode, kv8: bool) -> Self {
         let c = model.config;
+        // The decode-attention kernels keep the per-position score row in a
+        // fixed `__shared__ float s[2048]`; n_ctx beyond that silently corrupts
+        // neighbouring shared memory, so refuse it up front.
+        assert!(
+            c.n_ctx <= 2048,
+            "decode-attn scratch s[2048] overflow: n_ctx={}",
+            c.n_ctx
+        );
         let (e, v) = (c.n_embd, c.n_vocab);
         // This engine schedules all work on one stream. Disabling cudarc's
         // cross-stream event tracking keeps CUDA stream capture free of
