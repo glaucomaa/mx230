@@ -76,3 +76,39 @@ pub fn pseudo_rand(n: usize, mut seed: u64) -> Vec<f32> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_rel_err_basics() {
+        let a = [1.0, 2.0, 3.0];
+        assert_eq!(max_rel_err(&a, &a), 0.0);
+        // 2.2 vs 2.0 -> 0.1 relative; the worst element of the slice
+        let got = [1.0, 2.2, 3.0];
+        assert!((max_rel_err(&got, &a) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn allclose_err_threshold() {
+        let want = [0.0, 100.0];
+        // |0.05 - 0| = 0.05 == atol, |101 - 100| = 1 == rtol*100; both ratios == 1
+        let got = [0.05, 101.0];
+        assert!(allclose_err(&got, &want, 1e-2, 5e-2) <= 1.0 + 1e-6);
+        // double the deviations -> ratio 2.0, fails allclose
+        let bad = [0.10, 102.0];
+        assert!(allclose_err(&bad, &want, 1e-2, 5e-2) > 1.0);
+    }
+
+    #[test]
+    fn pseudo_rand_is_deterministic_and_bounded() {
+        let a = pseudo_rand(1000, 42);
+        let b = pseudo_rand(1000, 42);
+        assert_eq!(a, b, "same seed must reproduce the same sequence");
+        assert_eq!(a.len(), 1000);
+        assert!(a.iter().all(|&x| (-1.0..1.0).contains(&x)), "values in [-1, 1)");
+        // a different seed must produce a different sequence
+        assert_ne!(pseudo_rand(1000, 43), a);
+    }
+}

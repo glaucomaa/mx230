@@ -17,6 +17,13 @@ const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
 const LLM_AG8_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm_ag8.ptx"));
 const MAX_SPEC_TOKENS: usize = 32;
 
+/// True when the kernels were compiled (nvcc present at build time). Lets tests
+/// skip gracefully instead of panicking inside `Engine::new` -> `load_ptx`.
+#[allow(dead_code)] // used only by the integration test in main.rs
+pub fn ptx_available() -> bool {
+    !LLM_PTX.trim().is_empty() && !LLM_AG8_PTX.trim().is_empty()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightMode {
     Fp32,

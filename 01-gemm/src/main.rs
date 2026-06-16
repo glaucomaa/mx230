@@ -138,40 +138,51 @@ fn launch(
     unsafe { lb.launch(cfg) }.expect("launch");
 }
 
+fn load_funcs(ctx: &Arc<CudaContext>) -> Vec<CudaFunction> {
+    KERNELS
+        .iter()
+        .map(|k| {
+            common::load_ptx(ctx, k.fname, k.ptx)
+                .and_then(|m| m.load_function(k.fname))
+                .unwrap_or_else(|e| panic!("{}: {e:?}", k.fname))
+        })
+        .collect()
+}
+
+/// Correctness at VERIFY_SIZE against cuBLAS (max_rel_err < TOL for every kernel).
+/// Shared by `main` and the `#[test]` below.
+fn run_verify(
+    stream: &Arc<CudaStream>,
+    blas: &CudaBlas,
+    funcs: &[CudaFunction],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = VERIFY_SIZE;
+    let a = stream.clone_htod(&common::pseudo_rand(n * n, 1))?;
+    let b = stream.clone_htod(&common::pseudo_rand(n * n, 2))?;
+    let mut c_ref = stream.alloc_zeros::<f32>(n * n)?;
+    cublas_gemm(blas, n, &a, &b, &mut c_ref);
+    let want = stream.clone_dtoh(&c_ref)?;
+
+    for (k, f) in KERNELS.iter().zip(funcs) {
+        let mut c = stream.alloc_zeros::<f32>(n * n)?;
+        launch(stream, f, (k.cfg)(n as u32), &a, &b, &mut c, n as i32);
+        let got = stream.clone_dtoh(&c)?;
+        let err = common::max_rel_err(&got, &want);
+        assert!(err < TOL, "{}: max_rel_err = {err}", k.name);
+        println!("verify {:<14} max_rel_err = {err:.2e}  OK", k.name);
+    }
+    println!();
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let blas = CudaBlas::new(stream.clone())?;
     println!("device: {}\n", ctx.name()?);
 
-    let funcs: Vec<CudaFunction> = KERNELS
-        .iter()
-        .map(|k| {
-            common::load_ptx(&ctx, k.fname, k.ptx)
-                .and_then(|m| m.load_function(k.fname))
-                .unwrap_or_else(|e| panic!("{}: {e:?}", k.fname))
-        })
-        .collect();
-
-    // --- correctness at VERIFY_SIZE against cuBLAS ---
-    {
-        let n = VERIFY_SIZE;
-        let a = stream.clone_htod(&common::pseudo_rand(n * n, 1))?;
-        let b = stream.clone_htod(&common::pseudo_rand(n * n, 2))?;
-        let mut c_ref = stream.alloc_zeros::<f32>(n * n)?;
-        cublas_gemm(&blas, n, &a, &b, &mut c_ref);
-        let want = stream.clone_dtoh(&c_ref)?;
-
-        for (k, f) in KERNELS.iter().zip(&funcs) {
-            let mut c = stream.alloc_zeros::<f32>(n * n)?;
-            launch(&stream, f, (k.cfg)(n as u32), &a, &b, &mut c, n as i32);
-            let got = stream.clone_dtoh(&c)?;
-            let err = common::max_rel_err(&got, &want);
-            assert!(err < TOL, "{}: max_rel_err = {err}", k.name);
-            println!("verify {:<14} max_rel_err = {err:.2e}  OK", k.name);
-        }
-        println!();
-    }
+    let funcs = load_funcs(&ctx);
+    run_verify(&stream, &blas, &funcs)?;
 
     // --- benchmark ---
     let mut rows: Vec<(String, Vec<f32>)> = Vec::new();
@@ -229,4 +240,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kernel matches cuBLAS at VERIFY_SIZE. Skips gracefully (green) when
+    /// no CUDA device is present or the PTX is an empty stub (nvcc was missing
+    /// at build time); really runs the kernels on the GPU when one exists.
+    #[test]
+    fn gemm_matches_cublas() {
+        let ctx = match CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip gemm test: no CUDA device ({e:?})");
+                return;
+            }
+        };
+        if KERNELS[0].ptx.trim().is_empty() {
+            eprintln!("skip gemm test: PTX is an empty stub (nvcc missing at build time)");
+            return;
+        }
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone()).unwrap();
+        let funcs = load_funcs(&ctx);
+        run_verify(&stream, &blas, &funcs).unwrap();
+    }
 }

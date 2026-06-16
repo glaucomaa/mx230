@@ -581,3 +581,56 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cudarc::driver::CudaContext;
+
+    /// fp32 GPU forward (decode loop) and batch prefill match the CPU reference
+    /// on GPT-2 — the cheap fp32 path of the `verify` subcommand, as a test.
+    /// Skips gracefully (green) without a CUDA device, without compiled kernels,
+    /// or before `export` has produced gpt2.bin (so CI without the model passes).
+    #[test]
+    fn verify_fp32_matches_cpu() {
+        let ctx = match CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip llm verify test: no CUDA device ({e:?})");
+                return;
+            }
+        };
+        if !gpu::ptx_available() {
+            eprintln!("skip llm verify test: kernels not compiled (nvcc missing at build time)");
+            return;
+        }
+        let dir = models_dir();
+        let bin = dir.join("gpt2.bin");
+        if !bin.exists() {
+            eprintln!(
+                "skip llm verify test: {} missing (run `export` first)",
+                bin.display()
+            );
+            return;
+        }
+
+        let tok = tokenizer::Tokenizer::load(&dir, model::Arch::Gpt2);
+        let model = model::Model::load(&bin).unwrap();
+        let ids = tok.encode("Alan Turing was a British mathematician");
+        let want = cpu::forward(&model, &ids);
+
+        let mut engine = gpu::Engine::new(&ctx, &model, gpu::WeightMode::Fp32, false);
+        let mut got = Vec::new();
+        for (pos, &t) in ids.iter().enumerate() {
+            got = engine.forward(t, pos);
+        }
+        let batch = engine.prefill(&ids, 0);
+
+        let err = common::allclose_err(&got, &want, 1e-2, 5e-2);
+        let batch_err = common::allclose_err(&batch, &got, 1e-2, 5e-2);
+        assert!(err < 1.0, "fp32 logits mismatch vs CPU: {err}");
+        assert!(batch_err < 1.0, "fp32 batch prefill mismatch vs decode: {batch_err}");
+        assert_eq!(gpu::argmax(&want), gpu::argmax(&got), "fp32 argmax mismatch vs CPU");
+        assert_eq!(gpu::argmax(&got), gpu::argmax(&batch), "fp32 batch argmax mismatch");
+    }
+}
