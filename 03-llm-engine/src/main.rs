@@ -656,6 +656,68 @@ fn main() {
                 );
             }
         }
+        Some("kbench") => {
+            // Per-matmul kernel timing in isolation (no tokenizer / sampling /
+            // host loop / fusion) — the unit a kernel-vs-llama.cpp comparison
+            // lives on. int8/int4 only: those are the dp4a paths with a direct
+            // Q8_0/Q4_0 MMVQ/MMQ analogue in llama.cpp. Shapes come straight
+            // from Config, so no weights are loaded.
+            let choice = model_choice(&args);
+            let cfg = match choice.arch {
+                model::Arch::Gpt2 => model::Config::gpt2_small(),
+                model::Arch::Qwen2 => model::Config::qwen25_05b(),
+                model::Arch::Llama => model::Config::tinyllama_11b(),
+            };
+            let m_prefill = opt_n(&args, 512);
+            let only = mode_filter(&args);
+            let ctx = CudaContext::new(0).unwrap();
+
+            println!(
+                "## {:?} — isolated matmul kernels (decode M=1, prefill M={})\n",
+                choice.arch, m_prefill
+            );
+            println!("| matmul | n_in→n_out | mode | decode µs | decode GB/s | prefill µs | prefill GFLOP/s |");
+            println!("|--------|-----------|------|-----------|-------------|------------|-----------------|");
+            for &mode in &[gpu::WeightMode::Int8, gpu::WeightMode::Int4] {
+                if only.is_some_and(|m| m != mode) {
+                    continue;
+                }
+                for r in gpu::kbench(&ctx, &cfg, mode, m_prefill) {
+                    let (pus, pgf) = match (r.prefill_us, r.prefill_gflops) {
+                        (Some(u), Some(g)) => (format!("{u:.1}"), format!("{g:.0}")),
+                        _ => ("—".into(), "—".into()),
+                    };
+                    println!(
+                        "| {} | {}→{} | {mode} | {:.1} | {:.1} | {} | {} |",
+                        r.label, r.k, r.n, r.decode_us, r.decode_gbps, pus, pgf
+                    );
+                }
+            }
+
+            // The matching llama.cpp side: paste these into
+            // `make_test_cases_perf` in tests/test-backend-ops.cpp, then
+            // `test-backend-ops perf -o MUL_MAT`. ggml convention is
+            // (type_a, type_b=F32, m=n_out, n=tokens, k=n_in).
+            if flag(&args, "--emit-llama") {
+                println!("\n// llama.cpp test_mul_mat perf cases for {:?}:", choice.arch);
+                for &(ty, mode) in &[("GGML_TYPE_Q8_0", gpu::WeightMode::Int8), ("GGML_TYPE_Q4_0", gpu::WeightMode::Int4)] {
+                    if only.is_some_and(|m| m != mode) {
+                        continue;
+                    }
+                    for r in gpu::kbench_shapes(&cfg) {
+                        let (label, ki, ni, do_prefill) = r;
+                        println!(
+                            "    test_cases.emplace_back(new test_mul_mat({ty}, GGML_TYPE_F32, {ni}, 1, {ki}, {{1, 1}}, {{1, 1}})); // {label} decode",
+                        );
+                        if do_prefill {
+                            println!(
+                                "    test_cases.emplace_back(new test_mul_mat({ty}, GGML_TYPE_F32, {ni}, {m_prefill}, {ki}, {{1, 1}}, {{1, 1}})); // {label} prefill",
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Some("ppl") => {
             let default_data = models_dir().join("wikitext-2-raw/wiki.test.raw");
             let data_path = opt_value(&args, "--data")

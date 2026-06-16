@@ -7,7 +7,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    sys, CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, LaunchConfig,
+    PushKernelArg,
 };
 use half::f16;
 
@@ -605,6 +606,95 @@ struct Kernels {
     copy_row: CudaFunction,
 }
 
+/// Load every kernel from a compiled module into a `Kernels` table. `ag` is
+/// the module's activation-group width (must match `act_group` for the arch
+/// whose PTX was loaded). Shared by `Engine::new_quant` and `kbench`.
+fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
+    let f = |name: &str| module.load_function(name).unwrap();
+    Kernels {
+        ag,
+        embed: f("embed"),
+        embed_half: f("embed_half"),
+        embed_int8: f("embed_int8"),
+        embed_dyn: f("embed_dyn"),
+        embed_half_dyn: f("embed_half_dyn"),
+        embed_int8_dyn: f("embed_int8_dyn"),
+        embed_int4: f("embed_int4"),
+        embed_int4_dyn: f("embed_int4_dyn"),
+        embed_batch: f("embed_batch"),
+        embed_half_batch: f("embed_half_batch"),
+        embed_int8_batch: f("embed_int8_batch"),
+        embed_int4_batch: f("embed_int4_batch"),
+        embed_int2: f("embed_int2"),
+        embed_int2_dyn: f("embed_int2_dyn"),
+        embed_int2_batch: f("embed_int2_batch"),
+        embed_int3: f("embed_int3"),
+        embed_int3_dyn: f("embed_int3_dyn"),
+        embed_int3_batch: f("embed_int3_batch"),
+        layernorm: f("layernorm"),
+        rmsnorm: f("rmsnorm"),
+        rope: f("rope"),
+        rope_dyn: f("rope_dyn"),
+        rope_batch: f("rope_batch"),
+        silu_mul: f("silu_mul"),
+        gemv: f("gemv"),
+        gemv_half: f("gemv_half"),
+        gemv_int8: f("gemv_int8"),
+        gemv_int4: f("gemv_int4"),
+        gemv_int2: f("gemv_int2"),
+        gemv_int3: f("gemv_int3"),
+        gemm_f32: f("gemm_f32"),
+        gemm_half: f("gemm_half"),
+        gemm_f32_wide: f("gemm_f32_wide"),
+        gemm_half_wide: f("gemm_half_wide"),
+        gemm_int8_wide: f("gemm_int8_wide"),
+        gemm_int4_wide: f("gemm_int4_wide"),
+        gemm_int8: f("gemm_int8"),
+        gemm_int4: f("gemm_int4"),
+        gemm_f32_skinny: f("gemm_f32_skinny"),
+        gemm_half_skinny: f("gemm_half_skinny"),
+        gemm_int8_skinny: f("gemm_int8_skinny"),
+        gemm_int4_skinny: f("gemm_int4_skinny"),
+        gemm_rows_f32: f("gemm_rows_f32"),
+        gemm_rows_half: f("gemm_rows_half"),
+        gemm_rows_int8: f("gemm_rows_int8"),
+        gemm_rows_int4: f("gemm_rows_int4"),
+        gemm_int2: f("gemm_int2"),
+        gemm_int2_skinny: f("gemm_int2_skinny"),
+        gemm_rows_int2: f("gemm_rows_int2"),
+        gemm_int3: f("gemm_int3"),
+        gemm_int3_skinny: f("gemm_int3_skinny"),
+        gemm_rows_int3: f("gemm_rows_int3"),
+        embed_int4k: f("embed_int4k"),
+        embed_int4k_dyn: f("embed_int4k_dyn"),
+        embed_int4k_batch: f("embed_int4k_batch"),
+        gemv_int4k: f("gemv_int4k"),
+        gemm_int4k_wide: f("gemm_int4k_wide"),
+        gemm_int4k: f("gemm_int4k"),
+        gemm_int4k_skinny: f("gemm_int4k_skinny"),
+        gemm_rows_int4k: f("gemm_rows_int4k"),
+        quantize_act: f("quantize_act"),
+        copy_kv_dyn: f("copy_kv_dyn"),
+        copy_kv_batch: f("copy_kv_batch"),
+        quantize_kv: f("quantize_kv"),
+        quantize_kv_dyn: f("quantize_kv_dyn"),
+        quantize_kv_batch: f("quantize_kv_batch"),
+        attn_decode: f("attn_decode"),
+        attn_decode_dyn: f("attn_decode_dyn"),
+        attn_decode_q8: f("attn_decode_q8"),
+        attn_decode_q8_dyn: f("attn_decode_q8_dyn"),
+        attn_prefill: f("attn_prefill"),
+        attn_prefill_q8: f("attn_prefill_q8"),
+        layernorm_batch: f("layernorm_batch"),
+        rmsnorm_batch: f("rmsnorm_batch"),
+        add_inplace: f("add_inplace"),
+        gelu_inplace: f("gelu_inplace"),
+        argmax_advance: f("argmax_advance"),
+        argmax_rows: f("argmax_rows"),
+        copy_row: f("copy_row"),
+    }
+}
+
 fn cfg1d(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
@@ -1081,6 +1171,172 @@ fn add(
     unsafe { lb.launch(cfg1d(n)) }.unwrap();
 }
 
+/// One matmul shape benchmarked in isolation: decode is a one-token GEMV,
+/// prefill a GEMM over `m_prefill` tokens. Each row mirrors a single `ggml`
+/// `mul_mat`, so the numbers line up with llama.cpp
+/// `test-backend-ops perf -o MUL_MAT` (their convention: m = n_out, n = tokens,
+/// k = n_in). Decode is memory-bound (report GB/s of weight traffic); prefill
+/// is compute-bound (report GFLOP/s).
+pub struct KbenchRow {
+    pub label: &'static str,
+    pub k: usize, // n_in
+    pub n: usize, // n_out
+    pub decode_us: f32,
+    pub decode_gbps: f32,
+    pub prefill_us: Option<f32>,
+    pub prefill_gflops: Option<f32>,
+}
+
+/// The distinct per-matmul shapes of `cfg`, labelled `(name, n_in, n_out,
+/// bench_prefill)`. SwiGLU gate and up share a shape so they appear once;
+/// `lm_head` is decode-only (real prefill projects logits for one position,
+/// not the whole prompt, so a 512-row lm_head GEMM is not representative).
+fn matmul_shapes(cfg: &Config) -> Vec<(&'static str, usize, usize, bool)> {
+    let e = cfg.n_embd;
+    let mut v = vec![
+        ("qkv", e, cfg.qkv_dim(), true),
+        ("attn_proj", cfg.q_dim(), e, true),
+    ];
+    let ffn_label = if cfg.arch == Arch::Gpt2 {
+        "ffn_up"
+    } else {
+        "ffn_gate/up"
+    };
+    v.push((ffn_label, e, cfg.n_inter, true));
+    v.push(("ffn_down", cfg.n_inter, e, true));
+    v.push(("lm_head", e, cfg.n_vocab, false));
+    v
+}
+
+/// Public view of `matmul_shapes` so callers can emit the matching llama.cpp
+/// `test_mul_mat` perf cases for the same `(n_in, n_out)` set.
+pub fn kbench_shapes(cfg: &Config) -> Vec<(&'static str, usize, usize, bool)> {
+    matmul_shapes(cfg)
+}
+
+/// Bytes of weight storage one decode GEMV streams over a [n_in, n_out] matrix
+/// — the memory-bound decode metric. int8: i8 weight + one f32 scale/column;
+/// int4: packed nibbles + one f16 scale per 32-row group.
+fn decode_weight_bytes(mode: WeightMode, n_in: usize, n_out: usize) -> usize {
+    match mode {
+        WeightMode::Int8 => n_in * n_out + n_out * 4,
+        WeightMode::Int4 => n_in * n_out / 2 + (n_in / Q4_GROUP) * n_out * 2,
+        _ => unreachable!("kbench is int8/int4 only"),
+    }
+}
+
+/// A synthetic `Weights` of shape [n_in, n_out] in `mode`, quantized from
+/// random fp32 with the production quantizers. dp4a timing is data-independent,
+/// so random weights time identically to a real layer — and we avoid loading
+/// (and quantizing) a whole multi-GB checkpoint just to bench one matmul.
+fn synth_weights(
+    stream: &Arc<CudaStream>,
+    mode: WeightMode,
+    n_in: usize,
+    n_out: usize,
+    seed: u64,
+) -> Weights {
+    let w = common::pseudo_rand(n_in * n_out, seed);
+    match mode {
+        WeightMode::Int8 => {
+            let (q, s) = quantize(&w, n_in, n_out);
+            Weights::Int8 {
+                q: stream.clone_htod(&q).unwrap(),
+                scales: stream.clone_htod(&s).unwrap(),
+            }
+        }
+        WeightMode::Int4 => {
+            let (q, s) = quantize_q4(&w, n_in, n_out);
+            Weights::Int4 {
+                q: stream.clone_htod(&q).unwrap(),
+                scales: stream.clone_htod(&s).unwrap(),
+                perm: None,
+            }
+        }
+        _ => panic!("kbench supports --int8 and --int4 only"),
+    }
+}
+
+/// Time each weight matmul of `cfg` in isolation (no tokenizer, sampling, host
+/// loop, or kernel fusion) for one weight `mode` — the unit a kernel-vs-MMVQ/MMQ
+/// comparison against llama.cpp lives on.
+pub fn kbench(
+    ctx: &Arc<CudaContext>,
+    cfg: &Config,
+    mode: WeightMode,
+    m_prefill: usize,
+) -> Vec<KbenchRow> {
+    unsafe { ctx.disable_event_tracking() };
+    let stream = ctx.new_stream().unwrap();
+    let ag = act_group(cfg.arch);
+    let module = if ag == 8 {
+        common::load_ptx(ctx, "llm_ag8", LLM_AG8_PTX).unwrap()
+    } else {
+        common::load_ptx(ctx, "llm", LLM_PTX).unwrap()
+    };
+    let k = load_kernels(&module, ag);
+
+    let shapes = matmul_shapes(cfg);
+    // activation-quant scratch sized for the widest prefill K (one int32 word
+    // per 4 activations, one scale/sum per AG-value group)
+    let max_k = shapes
+        .iter()
+        .filter(|s| s.3)
+        .map(|s| s.1)
+        .max()
+        .unwrap_or(cfg.n_embd);
+    let mut act = ActQuant {
+        q: stream.alloc_zeros(m_prefill * max_k / 4).unwrap(),
+        scale: stream.alloc_zeros(m_prefill * max_k / ag).unwrap(),
+        sum: stream.alloc_zeros(m_prefill * max_k / ag).unwrap(),
+    };
+
+    type R = Result<(), cudarc::driver::DriverError>;
+    let mut rows = Vec::new();
+    for (label, ki, ni, do_prefill) in shapes {
+        let w = synth_weights(&stream, mode, ki, ni, 0x9E37_79B9 ^ ni as u64);
+        let bias = stream.alloc_zeros::<f32>(ni).unwrap();
+
+        // decode: M = 1 GEMV
+        let x = stream.clone_htod(&common::pseudo_rand(ki, 7)).unwrap();
+        let mut y = stream.alloc_zeros::<f32>(ni).unwrap();
+        let ms = common::time_median_ms(&stream, 20, 100, || {
+            gemv(&stream, &k, &mut y, &x, &w, &bias, ki, ni, false);
+            R::Ok(())
+        })
+        .unwrap();
+        let bytes = decode_weight_bytes(mode, ki, ni);
+        let decode_us = ms * 1e3_f32;
+        let decode_gbps = bytes as f32 / (ms * 1e-3_f32) / 1e9_f32;
+
+        let (mut prefill_us, mut prefill_gflops) = (None, None);
+        if do_prefill {
+            let a = stream
+                .clone_htod(&common::pseudo_rand(m_prefill * ki, 9))
+                .unwrap();
+            let mut c = stream.alloc_zeros::<f32>(m_prefill * ni).unwrap();
+            let ms = common::time_median_ms(&stream, 5, 30, || {
+                gemm(&stream, &k, &mut c, &a, &w, &bias, m_prefill, ni, ki, &mut act);
+                R::Ok(())
+            })
+            .unwrap();
+            prefill_us = Some(ms * 1e3_f32);
+            let flop = 2.0 * m_prefill as f32 * ni as f32 * ki as f32;
+            prefill_gflops = Some(flop / (ms * 1e-3_f32) / 1e9_f32);
+        }
+        rows.push(KbenchRow {
+            label,
+            k: ki,
+            n: ni,
+            decode_us,
+            decode_gbps,
+            prefill_us,
+            prefill_gflops,
+        });
+    }
+    rows
+}
+
 pub struct Engine {
     pub config: Config,
     stream: Arc<CudaStream>,
@@ -1165,89 +1421,7 @@ impl Engine {
         } else {
             common::load_ptx(ctx, "llm", LLM_PTX).unwrap()
         };
-        let f = |name: &str| module.load_function(name).unwrap();
-        let k = Kernels {
-            ag,
-            embed: f("embed"),
-            embed_half: f("embed_half"),
-            embed_int8: f("embed_int8"),
-            embed_dyn: f("embed_dyn"),
-            embed_half_dyn: f("embed_half_dyn"),
-            embed_int8_dyn: f("embed_int8_dyn"),
-            embed_int4: f("embed_int4"),
-            embed_int4_dyn: f("embed_int4_dyn"),
-            embed_batch: f("embed_batch"),
-            embed_half_batch: f("embed_half_batch"),
-            embed_int8_batch: f("embed_int8_batch"),
-            embed_int4_batch: f("embed_int4_batch"),
-            embed_int2: f("embed_int2"),
-            embed_int2_dyn: f("embed_int2_dyn"),
-            embed_int2_batch: f("embed_int2_batch"),
-            embed_int3: f("embed_int3"),
-            embed_int3_dyn: f("embed_int3_dyn"),
-            embed_int3_batch: f("embed_int3_batch"),
-            layernorm: f("layernorm"),
-            rmsnorm: f("rmsnorm"),
-            rope: f("rope"),
-            rope_dyn: f("rope_dyn"),
-            rope_batch: f("rope_batch"),
-            silu_mul: f("silu_mul"),
-            gemv: f("gemv"),
-            gemv_half: f("gemv_half"),
-            gemv_int8: f("gemv_int8"),
-            gemv_int4: f("gemv_int4"),
-            gemv_int2: f("gemv_int2"),
-            gemv_int3: f("gemv_int3"),
-            gemm_f32: f("gemm_f32"),
-            gemm_half: f("gemm_half"),
-            gemm_f32_wide: f("gemm_f32_wide"),
-            gemm_half_wide: f("gemm_half_wide"),
-            gemm_int8_wide: f("gemm_int8_wide"),
-            gemm_int4_wide: f("gemm_int4_wide"),
-            gemm_int8: f("gemm_int8"),
-            gemm_int4: f("gemm_int4"),
-            gemm_f32_skinny: f("gemm_f32_skinny"),
-            gemm_half_skinny: f("gemm_half_skinny"),
-            gemm_int8_skinny: f("gemm_int8_skinny"),
-            gemm_int4_skinny: f("gemm_int4_skinny"),
-            gemm_rows_f32: f("gemm_rows_f32"),
-            gemm_rows_half: f("gemm_rows_half"),
-            gemm_rows_int8: f("gemm_rows_int8"),
-            gemm_rows_int4: f("gemm_rows_int4"),
-            gemm_int2: f("gemm_int2"),
-            gemm_int2_skinny: f("gemm_int2_skinny"),
-            gemm_rows_int2: f("gemm_rows_int2"),
-            gemm_int3: f("gemm_int3"),
-            gemm_int3_skinny: f("gemm_int3_skinny"),
-            gemm_rows_int3: f("gemm_rows_int3"),
-            embed_int4k: f("embed_int4k"),
-            embed_int4k_dyn: f("embed_int4k_dyn"),
-            embed_int4k_batch: f("embed_int4k_batch"),
-            gemv_int4k: f("gemv_int4k"),
-            gemm_int4k_wide: f("gemm_int4k_wide"),
-            gemm_int4k: f("gemm_int4k"),
-            gemm_int4k_skinny: f("gemm_int4k_skinny"),
-            gemm_rows_int4k: f("gemm_rows_int4k"),
-            quantize_act: f("quantize_act"),
-            copy_kv_dyn: f("copy_kv_dyn"),
-            copy_kv_batch: f("copy_kv_batch"),
-            quantize_kv: f("quantize_kv"),
-            quantize_kv_dyn: f("quantize_kv_dyn"),
-            quantize_kv_batch: f("quantize_kv_batch"),
-            attn_decode: f("attn_decode"),
-            attn_decode_dyn: f("attn_decode_dyn"),
-            attn_decode_q8: f("attn_decode_q8"),
-            attn_decode_q8_dyn: f("attn_decode_q8_dyn"),
-            attn_prefill: f("attn_prefill"),
-            attn_prefill_q8: f("attn_prefill_q8"),
-            layernorm_batch: f("layernorm_batch"),
-            rmsnorm_batch: f("rmsnorm_batch"),
-            add_inplace: f("add_inplace"),
-            gelu_inplace: f("gelu_inplace"),
-            argmax_advance: f("argmax_advance"),
-            argmax_rows: f("argmax_rows"),
-            copy_row: f("copy_row"),
-        };
+        let k = load_kernels(&module, ag);
 
         let up = |t: &[f32]| stream.clone_htod(t).unwrap();
         let upw_as = |t: &[f32], n_in: usize, n_out: usize, mode: WeightMode| -> Weights {

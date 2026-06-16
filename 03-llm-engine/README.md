@@ -16,6 +16,7 @@ cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU refere
 cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec] [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8]
+cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
 cargo run -rp llm-engine -- encode "text" [--model qwen]  # tokenizer debug
@@ -171,6 +172,64 @@ llama.cpp too** (977 vs 866, 431 vs 384 tok/s). What's left of the table
 is GPT-2 prefill at 1.09x (2535 vs 2756.7) and TinyLlama Q4_0 at 1.31x
 (329 vs 430.5) — MMQ's per-quant-format shape tuning and int4's
 per-tile weight-scale fold, no longer a design gap.
+
+### Kernel-level comparison (MMVQ / MMQ)
+
+End-to-end `tok/s` conflates the matmul kernels with everything around them —
+tokenizer, sampler, host loop, residual/norm/attention kernels, and kernel
+fusion. To attribute the win or loss to the quantized matmul *itself*, time
+each weight matmul in isolation and put it next to llama.cpp's quantized
+`MUL_MAT` on the same shape. `llm-engine kbench` does our side; llama.cpp's
+side is `test-backend-ops perf -o MUL_MAT`, which dispatches `n=1` (one token,
+decode) to **MMVQ** and `n=512` (a 512-token batch, prefill) to **MMQ** —
+the same two kernels our `gemv_int8/int4` and `gemm_int8/int4_wide` stand in
+for. int8↔`Q8_0`, int4↔`Q4_0`.
+
+```
+# our kernels, per matmul shape (no weights loaded — dp4a timing is
+# data-independent, so synthetic quantized weights time identically):
+llm-engine kbench --model gpt2 > kbench_gpt2.md          # qwen / tinyllama too
+llm-engine kbench --model gpt2 --emit-llama              # the test_mul_mat cases to patch in
+
+# llama.cpp side (shapes patched into make_test_cases_perf), stderr split out
+# so the one-time "disabling CUDA graphs" warning can't interleave a timing:
+test-backend-ops perf -o MUL_MAT > tbo.txt 2>tbo.err
+
+scripts/compare_llama.py tbo.txt kbench_gpt2.md kbench_qwen.md kbench_tinyllama.md
+```
+
+Decode is one GEMV per weight per token, so the fair unit is latency
+(`us/run`); prefill is compute-bound, so it's `GFLOP/s`. Shapes are the real
+qkv / attn_proj / ffn / lm_head matmuls of GPT-2 124M, Qwen2.5-0.5B and
+TinyLlama-1.1B (lm_head is decode-only — real prefill projects logits for one
+position, not the whole prompt). 15 decode shapes and 12 prefill shapes per
+weight mode; speedup is ours ÷ llama.cpp, so >1 means we win:
+
+| category | wins | geomean speedup |
+|----------|------|-----------------|
+| int8 decode | 15/15 | 1.51x |
+| int4 decode | 15/15 | 1.69x |
+| int8 prefill | 8/12 | 1.00x |
+| int4 prefill | 0/12 | 0.70x |
+
+**Decode goes to this engine on every shape, and the lead widens with the
+model.** GPT-2's small matmuls win 1.2–1.4x (int8) and 1.2–2.1x (int4);
+TinyLlama's larger ones reach 2.0–2.1x (int8) and 2.1–2.4x (int4, e.g.
+lm_head 867 vs 2059 us). MMVQ is general — one kernel for every quant
+format and arch; our GEMV is one arch, one layout, activations quantized
+straight into shared memory, so it keeps more of the dp4a ceiling. This is
+exactly why our `tg128` beats llama.cpp CUDA on *every* model in the table
+above. The decode/MMVQ path is the clean PR target for Pascal sm_61.
+
+**Prefill is the other story.** int8 is a wash overall (1.00x geomean):
+GPT-2's four small qkv/proj/FFN shapes lose ~0.75x, but Qwen and TinyLlama
+win 1.1–1.25x on all eight of theirs — which is why their end-to-end int8
+`pp512` already beats llama.cpp. int4 prefill, though, loses on all 12 shapes (0.70x geomean,
+0.5x on GPT-2): MMQ never leaves its per-format integer tile and folds the
+`Q4_0` weight scale once per tile, work our 64x128 int4 tile pays for in the
+epilogue. That single kernel is what the end-to-end TinyLlama Q4_0 `pp512`
+gap (1.31x) traces back to. Prefill/MMQ — int4 especially — is not a PR
+target here.
 
 ## What the numbers say
 
