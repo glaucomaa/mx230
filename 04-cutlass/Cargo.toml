@@ -1,0 +1,15 @@
+[package]
+name = "cutlass"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cutlass"
+path = "src/main.rs"
+
+[dependencies]
+cudarc = { workspace = true }
+common = { workspace = true }
+
+[build-dependencies]
+kernel-build = { workspace = true }

@@ -39,6 +39,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cutlass"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "cudarc",
+ "kernel-build",
+]
+
+[[package]]
 name = "flash-attention"
 version = "0.1.0"
 dependencies = [

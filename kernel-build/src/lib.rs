@@ -62,6 +62,30 @@ pub fn compile_kernel_variant(cu: &str, out_name: &str, defines: &[&str]) {
     run_nvcc(&find_nvcc(), Path::new(cu), &ptx, defines);
 }
 
+/// Like `compile_kernels`, but threads extra nvcc args (include dirs, `-std`,
+/// ...) through to every kernel — for crates whose `.cu` pull in external
+/// headers such as CUTLASS/CuTe. Args are harmless for plain kernels, so a
+/// crate can mix header-heavy and plain `.cu` in the same `kernels/` dir.
+pub fn compile_kernels_with_args(extra: &[&str]) {
+    println!("cargo:rerun-if-changed=kernels");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let nvcc = find_nvcc();
+    if nvcc.is_none() {
+        println!("cargo:warning=nvcc not found (CUDA_HOME / /opt/cuda / PATH) — writing empty PTX stubs");
+    }
+
+    for entry in fs::read_dir("kernels").expect("no kernels/ directory") {
+        let cu = entry.unwrap().path();
+        if cu.extension().map(|e| e != "cu").unwrap_or(true) {
+            continue;
+        }
+        let ptx = out_dir.join(cu.file_stem().unwrap()).with_extension("ptx");
+        run_nvcc(&nvcc, &cu, &ptx, extra);
+    }
+}
+
 fn run_nvcc(nvcc: &Option<PathBuf>, cu: &Path, ptx: &Path, defines: &[&str]) {
     let Some(nvcc) = nvcc else {
         fs::write(ptx, "").unwrap();

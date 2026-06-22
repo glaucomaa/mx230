@@ -6,8 +6,10 @@ up in the numbers:
 
 - **`01-gemm/`** — SGEMM ladder, naive → double-buffered: **11.5 → 509 GFLOPS**
   (48x, up to **82% of cuBLAS**)
-- **`02-flash-attention/`** — Flash Attention forward from scratch: **12–19x**
-  over naive, zero extra memory, runs where naive OOMs (N=32k needs 4.3 GB)
+- **`02-flash-attention/`** — Flash Attention from scratch, forward **and**
+  backward: forward **12–19x** over naive (zero extra memory, runs where naive
+  OOMs at N=32k/4.3 GB); FA-2-style backward (dQ/dK/dV), atomic-free + shared-
+  memory tiled, **11.8x** over a naive atomic backward
 - **`03-llm-engine/`** — GPT-2 124M, Qwen2.5-0.5B and TinyLlama-1.1B
   inference in plain CUDA: own weight format, two from-scratch tokenizers
   (byte-level BPE and SentencePiece BPE), KV cache (fp32 or int8,
@@ -24,5 +26,11 @@ up in the numbers:
   GPT-2/Qwen fp16 run slower than this engine. Prefill beats llama.cpp on
   Qwen/TinyLlama Q8_0, decode beats it everywhere
 
-Kernels: CUDA C → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks: Rust.
-Each stage's README has tables and the how/why.
+- **`04-cutlass/`** — a fused **`GELU(x·W + b)`** kernel written with **CuTe**
+  (CUTLASS 3.x) on the SIMT path (no tensor cores on Pascal): **beats the
+  hand-rolled `gemm_06`** (≈554 vs 502 GFLOPS, ~80% of cuBLAS), plus an honest
+  fusion study — fusing a `tanh`-GELU on a compute-bound GEMM is ~neutral
+  because the epilogue's memory was already hidden under its SFU cost
+
+Kernels: CUDA C / CuTe → PTX (`build.rs`, sm_61). Host, tokenizer, benchmarks:
+Rust. Each stage's README has tables and the how/why.
