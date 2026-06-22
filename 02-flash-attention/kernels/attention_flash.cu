@@ -11,8 +11,11 @@
 #define BR 64 // query rows per block = threads per block
 #define BC 32 // key/value columns per shared-memory tile
 
-extern "C" __global__ void attn_flash(const float *Q, const float *K, const float *V,
-                                      float *O, int N, int causal) {
+// Shared forward body. When L != nullptr it also writes the per-row log-sum-exp
+// L[row] = m + log(l): the single scalar the backward pass needs to recompute
+// the softmax probabilities p_ij = exp(s_ij - L_i) without storing S.
+__device__ __forceinline__ void flash_fwd(const float *Q, const float *K, const float *V,
+                                          float *O, float *L, int N, int causal) {
     __shared__ float Ks[BC][D]; // 8 KB
     __shared__ float Vs[BC][D]; // 8 KB
 
@@ -79,5 +82,19 @@ extern "C" __global__ void attn_flash(const float *Q, const float *K, const floa
         for (int x = 0; x < D; ++x) {
             O[row * D + x] = acc[x] * inv;
         }
+        if (L) {
+            L[row] = m + __logf(l);
+        }
     }
+}
+
+extern "C" __global__ void attn_flash(const float *Q, const float *K, const float *V,
+                                      float *O, int N, int causal) {
+    flash_fwd(Q, K, V, O, nullptr, N, causal);
+}
+
+// Same forward, but also emits the log-sum-exp L[N] consumed by attn_bwd.
+extern "C" __global__ void attn_flash_lse(const float *Q, const float *K, const float *V,
+                                          float *O, float *L, int N, int causal) {
+    flash_fwd(Q, K, V, O, L, N, causal);
 }
