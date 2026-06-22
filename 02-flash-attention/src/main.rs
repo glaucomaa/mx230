@@ -87,11 +87,14 @@ fn run_flash(
     unsafe { lb.launch(cfg) }.expect("attn_flash");
 }
 
-/// Backward kernels: the LSE-emitting forward plus the two backward passes.
+/// Backward kernels: the LSE-emitting forward, the shared preprocess, the naive
+/// atomic baseline, and the tiled atomic-free dQ / dK,dV passes.
 struct Bwd {
     flash_lse: CudaFunction,
     preprocess: CudaFunction,
-    bwd: CudaFunction,
+    naive: CudaFunction,
+    dq: CudaFunction,
+    dkv: CudaFunction,
 }
 
 /// Forward that also writes the per-row log-sum-exp `l` (consumed by the bwd).
@@ -119,28 +122,16 @@ fn run_flash_lse(
     unsafe { lb.launch(cfg) }.expect("attn_flash_lse");
 }
 
-/// Backward pass: `Delta = rowsum(dO * O)` then dQ/dK/dV. dq/dk/dv must be
-/// zeroed by the caller (dK/dV accumulate with atomics).
-#[allow(clippy::too_many_arguments)]
-fn run_bwd(
+/// `Delta = rowsum(dO * O)`: shared first step of both backward layouts.
+fn run_preprocess(
     stream: &Arc<CudaStream>,
     b: &Bwd,
-    q: &CudaSlice<f32>,
-    k: &CudaSlice<f32>,
-    v: &CudaSlice<f32>,
     do_: &CudaSlice<f32>,
     o: &CudaSlice<f32>,
-    l: &CudaSlice<f32>,
     delta: &mut CudaSlice<f32>,
-    dq: &mut CudaSlice<f32>,
-    dk: &mut CudaSlice<f32>,
-    dv: &mut CudaSlice<f32>,
     n: usize,
-    causal: bool,
 ) {
     let n_i = n as i32;
-    let causal_i = causal as i32;
-
     let mut lb = stream.launch_builder(&b.preprocess);
     lb.arg(do_).arg(o).arg(&mut *delta).arg(&n_i);
     let cfg = LaunchConfig {
@@ -149,16 +140,73 @@ fn run_bwd(
         shared_mem_bytes: 0,
     };
     unsafe { lb.launch(cfg) }.expect("attn_bwd_preprocess");
+}
 
-    let mut lb = stream.launch_builder(&b.bwd);
-    lb.arg(q).arg(k).arg(v).arg(do_).arg(l).arg(&*delta)
+/// Naive baseline backward (atomics). dq/dk/dv must be zeroed by the caller.
+#[allow(clippy::too_many_arguments)]
+fn run_bwd_naive(
+    stream: &Arc<CudaStream>,
+    b: &Bwd,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    do_: &CudaSlice<f32>,
+    l: &CudaSlice<f32>,
+    delta: &CudaSlice<f32>,
+    dq: &mut CudaSlice<f32>,
+    dk: &mut CudaSlice<f32>,
+    dv: &mut CudaSlice<f32>,
+    n: usize,
+    causal: bool,
+) {
+    let n_i = n as i32;
+    let causal_i = causal as i32;
+    let mut lb = stream.launch_builder(&b.naive);
+    lb.arg(q).arg(k).arg(v).arg(do_).arg(l).arg(delta)
         .arg(&mut *dq).arg(&mut *dk).arg(&mut *dv).arg(&n_i).arg(&causal_i);
     let cfg = LaunchConfig {
         grid_dim: (n.div_ceil(256) as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { lb.launch(cfg) }.expect("attn_bwd");
+    unsafe { lb.launch(cfg) }.expect("attn_bwd_naive");
+}
+
+/// Tiled atomic-free backward: the dQ pass (query-row threads, K/V in shared)
+/// and the dK,dV pass (key-row threads, Q/dO in shared). No output zeroing
+/// needed — every element is written by exactly one thread.
+#[allow(clippy::too_many_arguments)]
+fn run_bwd_flash(
+    stream: &Arc<CudaStream>,
+    b: &Bwd,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    do_: &CudaSlice<f32>,
+    l: &CudaSlice<f32>,
+    delta: &CudaSlice<f32>,
+    dq: &mut CudaSlice<f32>,
+    dk: &mut CudaSlice<f32>,
+    dv: &mut CudaSlice<f32>,
+    n: usize,
+    causal: bool,
+) {
+    let n_i = n as i32;
+    let causal_i = causal as i32;
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(64) as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut lb = stream.launch_builder(&b.dq);
+    lb.arg(q).arg(k).arg(v).arg(do_).arg(l).arg(delta).arg(&mut *dq).arg(&n_i).arg(&causal_i);
+    unsafe { lb.launch(cfg) }.expect("attn_bwd_dq");
+
+    let mut lb = stream.launch_builder(&b.dkv);
+    lb.arg(q).arg(k).arg(v).arg(do_).arg(l).arg(delta)
+        .arg(&mut *dk).arg(&mut *dv).arg(&n_i).arg(&causal_i);
+    unsafe { lb.launch(cfg) }.expect("attn_bwd_dkv");
 }
 
 /// CPU reference: O = softmax(Q K^T / sqrt(d)) V, row by row.
@@ -360,7 +408,9 @@ fn load_bwd(ctx: &Arc<CudaContext>) -> Result<Bwd, Box<dyn std::error::Error>> {
     Ok(Bwd {
         flash_lse: flash_mod.load_function("attn_flash_lse")?,
         preprocess: bwd_mod.load_function("attn_bwd_preprocess")?,
-        bwd: bwd_mod.load_function("attn_bwd")?,
+        naive: bwd_mod.load_function("attn_bwd_naive")?,
+        dq: bwd_mod.load_function("attn_bwd_dq")?,
+        dkv: bwd_mod.load_function("attn_bwd_dkv")?,
     })
 }
 
@@ -422,22 +472,30 @@ fn run_verify_bwd(stream: &Arc<CudaStream>, b: &Bwd) -> Result<(), Box<dyn std::
         run_flash_lse(stream, &b.flash_lse, &q, &k, &v, &mut o, &mut lse, n, causal);
 
         let mut delta = stream.alloc_zeros::<f32>(n)?;
-        let mut dq = stream.alloc_zeros::<f32>(n * D)?;
-        let mut dk = stream.alloc_zeros::<f32>(n * D)?;
-        let mut dv = stream.alloc_zeros::<f32>(n * D)?;
-        run_bwd(
-            stream, b, &q, &k, &v, &do_, &o, &lse, &mut delta, &mut dq, &mut dk, &mut dv, n, causal,
-        );
+        run_preprocess(stream, b, &do_, &o, &mut delta, n);
 
         let (wq, wk, wv) = cpu_attention_bwd(&q_h, &k_h, &v_h, &do_h, n, causal);
-        for (name, got, want) in [
-            ("dQ", stream.clone_dtoh(&dq)?, wq),
-            ("dK", stream.clone_dtoh(&dk)?, wk),
-            ("dV", stream.clone_dtoh(&dv)?, wv),
-        ] {
-            let err = common::allclose_err(&got, &want, RTOL, ATOL);
-            assert!(err < 1.0, "bwd {name} causal={causal}: allclose_err = {err}");
-            println!("verify bwd {name} causal={causal:<5} allclose_err = {err:.2e}  OK");
+
+        // both layouts must match the CPU reference; outputs start zeroed so the
+        // naive atomic accumulation is correct (the tiled path overwrites anyway)
+        for impl_name in ["flash", "naive"] {
+            let mut dq = stream.alloc_zeros::<f32>(n * D)?;
+            let mut dk = stream.alloc_zeros::<f32>(n * D)?;
+            let mut dv = stream.alloc_zeros::<f32>(n * D)?;
+            if impl_name == "flash" {
+                run_bwd_flash(stream, b, &q, &k, &v, &do_, &lse, &delta, &mut dq, &mut dk, &mut dv, n, causal);
+            } else {
+                run_bwd_naive(stream, b, &q, &k, &v, &do_, &lse, &delta, &mut dq, &mut dk, &mut dv, n, causal);
+            }
+            for (name, got, want) in [
+                ("dQ", stream.clone_dtoh(&dq)?, &wq),
+                ("dK", stream.clone_dtoh(&dk)?, &wk),
+                ("dV", stream.clone_dtoh(&dv)?, &wv),
+            ] {
+                let err = common::allclose_err(&got, want, RTOL, ATOL);
+                assert!(err < 1.0, "bwd {impl_name} {name} causal={causal}: allclose_err = {err}");
+                println!("verify bwd {impl_name:<5} {name} causal={causal:<5} allclose_err = {err:.2e}  OK");
+            }
         }
     }
 
@@ -513,9 +571,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- backward benchmark (causal): forward vs backward time ---
-    println!("\n| {:>6} | {:>10} | {:>10} | {:>9} |", "N", "fwd", "bwd", "bwd/fwd");
-    println!("|{}|{}|{}|{}|", "-".repeat(8), "-".repeat(12), "-".repeat(12), "-".repeat(11));
+    // --- backward benchmark (causal): naive (atomics) vs flash (tiled) ---
+    println!(
+        "\n| {:>6} | {:>8} | {:>11} | {:>11} | {:>11} |",
+        "N", "fwd", "bwd naive", "bwd flash", "speedup"
+    );
+    println!(
+        "|{}|{}|{}|{}|{}|",
+        "-".repeat(8), "-".repeat(10), "-".repeat(13), "-".repeat(13), "-".repeat(13)
+    );
     for &n in &[1024usize, 2048, 4096] {
         let q = stream.clone_htod(&common::pseudo_rand(n * D, 1))?;
         let k = stream.clone_htod(&common::pseudo_rand(n * D, 2))?;
@@ -532,22 +596,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_flash(&stream, &flash, &q, &k, &v, &mut o, n, true);
             Ok::<(), ()>(())
         })?;
-        // forward once for O + log-sum-exp; the backward then reads them. dK/dV
-        // accumulate via atomics — harmless for timing, so no per-iter zeroing.
+        // forward once for O + log-sum-exp + Delta; the backward then reads them.
+        // dK/dV accumulate via atomics in the naive path — harmless for timing
+        // (work is identical regardless of accumulator values), so no zeroing.
         run_flash_lse(&stream, &bwd.flash_lse, &q, &k, &v, &mut o, &mut lse, n, true);
-        let bwd_ms = common::time_median_ms(&stream, WARMUP, ITERS, || {
-            run_bwd(
-                &stream, &bwd, &q, &k, &v, &do_, &o, &lse, &mut delta, &mut dq, &mut dk, &mut dv, n,
-                true,
-            );
+        run_preprocess(&stream, &bwd, &do_, &o, &mut delta, n);
+        let naive_ms = common::time_median_ms(&stream, WARMUP, ITERS, || {
+            run_bwd_naive(&stream, &bwd, &q, &k, &v, &do_, &lse, &delta, &mut dq, &mut dk, &mut dv, n, true);
+            Ok::<(), ()>(())
+        })?;
+        let flash_ms = common::time_median_ms(&stream, WARMUP, ITERS, || {
+            run_bwd_flash(&stream, &bwd, &q, &k, &v, &do_, &lse, &delta, &mut dq, &mut dk, &mut dv, n, true);
             Ok::<(), ()>(())
         })?;
         println!(
-            "| {:>6} | {:>7.2} ms | {:>7.2} ms | {:>8.2}x |",
+            "| {:>6} | {:>5.2} ms | {:>8.2} ms | {:>8.2} ms | {:>10.2}x |",
             n,
             fwd_ms,
-            bwd_ms,
-            bwd_ms / fwd_ms
+            naive_ms,
+            flash_ms,
+            naive_ms / flash_ms
         );
     }
     Ok(())
