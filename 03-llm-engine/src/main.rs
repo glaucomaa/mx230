@@ -817,9 +817,79 @@ fn main() {
                 }
             }
         }
+        // Stage 5b gate: a prefix-sharing request must yield logits identical to
+        // a cold prefill, while only computing the divergent suffix.
+        Some("prefix") => {
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let ctx = CudaContext::new(0).unwrap();
+
+            // A and B share a long prefix (several KV_BLOCK-sized chunks) and then
+            // diverge — so B reuses the prefix blocks A populated and only the
+            // suffix is recomputed.
+            let shared = "Alan Turing was a British mathematician, logician and computer \
+                scientist who was highly influential in the development of theoretical \
+                computer science, providing a formalisation of the concepts of algorithm \
+                and computation with the Turing machine, and who is widely considered ";
+            let a_ids = tok.encode(&format!(
+                "{shared}to be the father of theoretical computer science and artificial intelligence."
+            ));
+            let b_ids = tok.encode(&format!(
+                "{shared}a highly influential figure in the early history of computing machines."
+            ));
+            println!(
+                "prompt A: {} tokens, prompt B: {} tokens (block = {} tokens)",
+                a_ids.len(),
+                b_ids.len(),
+                16
+            );
+
+            // fp32 OOMs for the RoPE models on 2 GB, so use fp16 there.
+            let base = if choice.arch == model::Arch::Gpt2 {
+                gpu::WeightMode::Fp32
+            } else {
+                gpu::WeightMode::Fp16
+            };
+            let combos = [(base, false), (gpu::WeightMode::Int8, false), (gpu::WeightMode::Int8, true)];
+            for (mode, kv8) in combos {
+                // cold: B prefilled into a fresh cache (no reuse).
+                let mut cold = gpu::Engine::new(&ctx, &model, mode, kv8);
+                cold.set_prefix_cache(true);
+                let (cold_logits, cold_stats) = cold.prefill_cached(&b_ids);
+                drop(cold);
+
+                // warm: A populates the cache, then B reuses the shared prefix.
+                let mut warm = gpu::Engine::new(&ctx, &model, mode, kv8);
+                warm.set_prefix_cache(true);
+                let _ = warm.prefill_cached(&a_ids);
+                let (warm_logits, warm_stats) = warm.prefill_cached(&b_ids);
+
+                let max_d = warm_logits
+                    .iter()
+                    .zip(&cold_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let (cw, ww) = (gpu::argmax(&cold_logits), gpu::argmax(&warm_logits));
+                let kv = if kv8 { "/kv8" } else { "" };
+                println!(
+                    "{mode}{kv}: reused {}/{} tokens ({} blocks); cold reuse {}; argmax cold={cw} warm={ww}; max|Δlogit|={max_d:.2e}  {}",
+                    warm_stats.reused_tokens,
+                    warm_stats.total_tokens,
+                    warm_stats.reused_blocks,
+                    cold_stats.reused_tokens,
+                    if max_d == 0.0 { "IDENTICAL" } else { "OK" },
+                );
+                assert_eq!(cold_stats.reused_tokens, 0, "cold prefill must not reuse");
+                assert!(warm_stats.reused_blocks > 0, "{mode}{kv}: no prefix reuse happened");
+                assert_eq!(cw, ww, "{mode}{kv}: prefix-cached argmax differs from cold");
+                assert!(max_d < 1e-3, "{mode}{kv}: prefix-cached logits differ from cold (max={max_d:.3e})");
+            }
+            println!("prefix cache: cached == cold on all modes  OK");
+        }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix> [args]"
             );
             std::process::exit(1);
         }

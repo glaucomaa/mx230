@@ -207,31 +207,115 @@ enum KvCache {
 /// `t % B` lower to a shift and a mask.
 const KV_BLOCK: usize = 16;
 
-/// PagedAttention state for a single sequence (Stage 5a). The KV cache (the
-/// `KvCache` buffers above) is treated as a pool of fixed-size blocks; the
-/// block table indirects every cache access — `block_table[t / B]` gives the
-/// physical block holding logical position `t` — so logically contiguous
-/// positions can live in scattered physical blocks. That indirection is the
-/// groundwork for the radix prefix cache (5b); here it is exercised on one
-/// sequence. A real allocator with a LIFO free list hands out the blocks, which
-/// makes the logical→physical map a non-identity permutation, so the gather is
-/// genuinely tested rather than collapsing to an identity pass-through.
+/// Block-level radix (prefix) tree for shared-prefix KV reuse (Stage 5b). Each
+/// node owns the physical KV block holding one `KV_BLOCK`-token chunk; the path
+/// from the root spells out the token prefix that produced those blocks. A
+/// lookup walks chunk-by-chunk and returns the physical blocks of the longest
+/// matching prefix, so a new request reuses that KV instead of recomputing it.
+/// Sharing is *block-granular* (only whole, identical chunks reuse), which makes
+/// per-token copy-on-write unnecessary: divergence always lands on a fresh block
+/// at the first non-matching chunk — the block-level equivalent of COW.
+struct RadixNode {
+    // chunk tokens -> child node. Keyed by the exact tokens (not a hash) so a
+    // match is verbatim, never a collision.
+    children: std::collections::HashMap<Vec<u32>, usize>,
+    phys_block: i32, // -1 for the root (holds no block)
+}
+
+struct RadixCache {
+    block_size: usize,
+    nodes: Vec<RadixNode>, // nodes[0] is the root
+}
+
+impl RadixCache {
+    fn new(block_size: usize) -> Self {
+        Self {
+            block_size,
+            nodes: vec![RadixNode {
+                children: std::collections::HashMap::new(),
+                phys_block: -1,
+            }],
+        }
+    }
+
+    /// Physical blocks of the longest cached prefix that is a whole-chunk prefix
+    /// of `tokens` (one block per matched `KV_BLOCK`-token chunk).
+    fn lookup(&self, tokens: &[u32]) -> Vec<i32> {
+        let mut node = 0usize;
+        let mut blocks = Vec::new();
+        for chunk in tokens.chunks_exact(self.block_size) {
+            match self.nodes[node].children.get(chunk) {
+                Some(&child) => {
+                    node = child;
+                    blocks.push(self.nodes[child].phys_block);
+                }
+                None => break,
+            }
+        }
+        blocks
+    }
+
+    /// Cache `blocks[i]` under chunk `i` of `tokens` (full chunks only). Returns
+    /// the logical chunk indices that were *newly* inserted — their blocks are
+    /// now tree-owned; the caller frees the rest. Chunks already present keep
+    /// their existing block (the freshly supplied one is redundant).
+    fn insert(&mut self, tokens: &[u32], blocks: &[i32]) -> Vec<usize> {
+        let mut node = 0usize;
+        let mut created = Vec::new();
+        for (i, chunk) in tokens.chunks_exact(self.block_size).enumerate() {
+            if i >= blocks.len() {
+                break;
+            }
+            if let Some(&child) = self.nodes[node].children.get(chunk) {
+                node = child;
+            } else {
+                let id = self.nodes.len();
+                self.nodes.push(RadixNode {
+                    children: std::collections::HashMap::new(),
+                    phys_block: blocks[i],
+                });
+                self.nodes[node].children.insert(chunk.to_vec(), id);
+                node = id;
+                created.push(i);
+            }
+        }
+        created
+    }
+}
+
+/// Savings from a prefix-cached prefill: how much of the prompt was served from
+/// already-resident KV blocks instead of being recomputed.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefixStats {
+    pub total_tokens: usize,
+    pub reused_tokens: usize,
+    pub reused_blocks: usize,
+}
+
+/// PagedAttention state (Stage 5a/5b). The KV cache (the `KvCache` buffers
+/// above) is a pool of fixed-size blocks; the block table indirects every cache
+/// access — `block_table[t / B]` gives the physical block holding logical
+/// position `t` — so logically contiguous positions can live in scattered
+/// physical blocks. Two modes share this struct:
+///   * 5a (`new`): one sequence pre-claims every block (a non-identity map, so
+///     the gather is genuinely exercised); no prefix cache.
+///   * 5b (`new_pool`): blocks start free and are allocated/ref-counted per
+///     request, with a `RadixCache` so a shared token prefix reuses its blocks.
 struct Paging {
     block_size: usize,
-    // n_blocks and the free list back a real block allocator; in 5a one sequence
-    // claims every block up front, so they are written but not yet read — the
-    // radix prefix cache (5b) allocates/frees against them.
-    #[allow(dead_code)]
-    n_blocks: usize,
     block_size_i: i32,
-    // logical block -> physical block. Mirrored on the host so the non-graph
-    // decode write can resolve a physical row without a device round-trip; the
-    // device copy feeds the paged kernels' gather.
+    // logical block -> physical block for the current sequence. Mirrored on the
+    // host so the non-graph decode write can resolve a physical row without a
+    // device round-trip; the device copy feeds the paged kernels' gather.
     table_host: Vec<i32>,
     table_dev: CudaSlice<i32>,
-    // physical blocks not yet handed out (LIFO: pop from the back).
-    #[allow(dead_code)]
+    // free physical blocks (LIFO: pop from the back).
     free: Vec<i32>,
+    // per physical block reference count (0 = free). A block is referenced while
+    // it backs the current table or is held by the radix cache.
+    refcount: Vec<u32>,
+    // Some in prefix-cache mode (5b); None in single-sequence mode (5a).
+    cache: Option<RadixCache>,
 }
 
 impl Paging {
@@ -250,11 +334,56 @@ impl Paging {
         let table_dev = stream.clone_htod(&table_host).unwrap();
         Self {
             block_size,
-            n_blocks,
             block_size_i: block_size as i32,
             table_host,
             table_dev,
             free,
+            refcount: vec![1; n_blocks], // every block belongs to the one sequence
+            cache: None,
+        }
+    }
+
+    /// Prefix-cache pool over `n_slots` positions: all blocks free, an empty
+    /// per-request table, and a radix cache. One sequence's table can span up to
+    /// the whole pool; short requests share it through cached prefixes.
+    fn new_pool(stream: &Arc<CudaStream>, n_slots: usize) -> Self {
+        let block_size = KV_BLOCK;
+        let n_blocks = n_slots / block_size;
+        let table_host = vec![-1i32; n_blocks];
+        let table_dev = stream.clone_htod(&table_host).unwrap();
+        Self {
+            block_size,
+            block_size_i: block_size as i32,
+            table_host,
+            table_dev,
+            free: (0..n_blocks as i32).collect(),
+            refcount: vec![0; n_blocks],
+            cache: Some(RadixCache::new(block_size)),
+        }
+    }
+
+    /// Claim a free physical block (refcount 1). Returns None when the pool is
+    /// exhausted (5b leaves eviction to a future step; the gate sizes the pool to
+    /// fit, so this never fires there).
+    fn alloc(&mut self) -> Option<i32> {
+        let b = self.free.pop()?;
+        self.refcount[b as usize] = 1;
+        Some(b)
+    }
+
+    // Paired with decref for when a reused block is referenced by both the tree
+    // and a live sequence; 5b borrows reused blocks transiently (no eviction
+    // mid-request), so the increment only matters once eviction lands.
+    #[allow(dead_code)]
+    fn incref(&mut self, b: i32) {
+        self.refcount[b as usize] += 1;
+    }
+
+    fn decref(&mut self, b: i32) {
+        let rc = &mut self.refcount[b as usize];
+        *rc -= 1;
+        if *rc == 0 {
+            self.free.push(b);
         }
     }
 
@@ -1746,6 +1875,92 @@ impl Engine {
         // The captured decode graph hard-codes the linear-vs-paged kernel choice,
         // so a paging change invalidates it; it is re-captured on next use.
         self.decode_graph = None;
+    }
+
+    /// Enable/disable the radix prefix cache (Stage 5b): a pooled, ref-counted
+    /// block allocator plus a token-prefix trie, so a new request reuses the KV
+    /// blocks of any previously cached request it shares a prefix with. Implies
+    /// paging. The pool spans the cache's n_slots positions (shared across cached
+    /// sequences); short requests reuse freely. Eviction when the pool fills is
+    /// left to a later step — the gate sizes the workload to fit.
+    pub fn set_prefix_cache(&mut self, on: bool) {
+        self.paging = if on {
+            let n_slots = self.config.n_ctx.div_ceil(KV_BLOCK) * KV_BLOCK;
+            Some(Paging::new_pool(&self.stream, n_slots))
+        } else {
+            None
+        };
+        self.decode_graph = None;
+    }
+
+    /// Prefill `tokens`, reusing the KV blocks of the longest cached token prefix
+    /// and computing only the remaining suffix. Returns the last token's logits —
+    /// bit-identical to a cold prefill, since the KV of a causal prefix depends
+    /// only on that prefix, not on the suffix — plus the savings. Requires
+    /// `set_prefix_cache(true)`.
+    pub fn prefill_cached(&mut self, tokens: &[u32]) -> (Vec<f32>, PrefixStats) {
+        let stream = self.stream.clone();
+        let b = KV_BLOCK;
+        let n = tokens.len();
+        assert!(n >= 1, "prefill_cached needs at least one token");
+        let n_log = n.div_ceil(b); // logical blocks this request spans
+        let n_full = n / b; // complete (cacheable) chunks
+
+        // 1-2. Match the longest cached whole-chunk prefix (capped so at least
+        // the final token is still computed — we always need a forward for the
+        // logits), then build the block table: reuse the matched blocks, allocate
+        // fresh ones from the first divergence on.
+        let (k, m) = {
+            let pg = self
+                .paging
+                .as_mut()
+                .expect("prefill_cached needs set_prefix_cache(true)");
+            let matched = pg
+                .cache
+                .as_ref()
+                .expect("prefix-cache mode")
+                .lookup(tokens);
+            let m = matched.len().min((n - 1) / b);
+            for (j, &blk) in matched.iter().take(m).enumerate() {
+                pg.table_host[j] = blk;
+            }
+            for j in m..n_log {
+                let blk = pg.alloc().expect("prefix-cache pool exhausted");
+                pg.table_host[j] = blk;
+            }
+            pg.table_dev = stream.clone_htod(&pg.table_host[..]).unwrap();
+            (m * b, m)
+        };
+
+        // 3. Run only the suffix [k..n] at pos0=k; its attention reads the reused
+        // prefix KV through the block table.
+        let logits = self.prefill(&tokens[k..], k);
+
+        // 4. Cache the freshly computed full chunks; release every fresh block
+        // that did not become a tree node (the transient trailing partial block,
+        // and — in the rare reuse-cap case — chunks the tree already held).
+        {
+            let pg = self.paging.as_mut().unwrap();
+            let full_blocks: Vec<i32> = (0..n_full).map(|j| pg.table_host[j]).collect();
+            let created = {
+                let cache = pg.cache.as_mut().unwrap();
+                cache.insert(&tokens[..n_full * b], &full_blocks)
+            };
+            let created: std::collections::HashSet<usize> = created.into_iter().collect();
+            for j in m..n_log {
+                if j >= n_full || !created.contains(&j) {
+                    let blk = pg.table_host[j];
+                    pg.decref(blk);
+                }
+            }
+        }
+
+        let stats = PrefixStats {
+            total_tokens: n,
+            reused_tokens: k,
+            reused_blocks: m,
+        };
+        (logits, stats)
     }
 
     fn launch_embed(&mut self, tok: i32, pos: i32) {
