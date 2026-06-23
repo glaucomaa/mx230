@@ -12,10 +12,11 @@ pipeline (`--model gpt2|qwen|tinyllama`, default gpt2):
 
 ```
 cargo run -rp llm-engine -- export [--model qwen]     # download + convert weights
-cargo run -rp llm-engine -- verify [--model qwen]     # GPU logits vs CPU reference
-cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec] [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]
-cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec]
-cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a]  # --prefill-dp4a: opt-in dp4a prefill scores (~6-8%)
+cargo run -rp llm-engine -- verify [--model qwen] [--paged]   # GPU logits vs CPU reference (--paged: route KV through the block table)
+cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--int4|--int4k|--int3|--int2] [--kv8] [--spec] [--paged] [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]
+cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec] [--paged]
+cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a] [--paged]  # --prefill-dp4a: opt-in dp4a prefill scores (~6-8%)
+cargo run -rp llm-engine -- prefix [--model qwen]     # radix prefix cache: cached prefill == cold prefill (bit-identical) + TTFT saved
 cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
@@ -556,6 +557,46 @@ TinyLlama-1.1B at 7.4 — seven years of model progress measured on the same
 harness, the biggest model only runnable here because of the quantization
 it tolerates best.
 
+## Engine v2 — PagedAttention + radix prefix cache
+
+KV is no longer one contiguous buffer per layer. It is a pool of fixed-size
+**blocks** (16 positions) reached through a per-sequence **block table**: logical
+position `t` lives at physical row `block_table[t/16]*16 + t%16`. Two features
+build on that indirection; both are opt-in and leave the default path untouched.
+
+**PagedAttention** (`--paged`). The block table lets a sequence's attention read
+KV it didn't compute — the prerequisite for sharing. It is pure address
+translation (same values, same accumulation order, only the address changes), so
+it is **bit-identical** to the contiguous cache: `ppl` matches to the last
+printed digit across all 7 weight modes × fp32/int8 KV, and `verify --paged`
+stays green (decode==CPU, decode==batch, wide-tier, speculative, graph) on GPT-2,
+Qwen2.5-0.5B and TinyLlama-1.1B. The kernels template the translation on
+`<bool PAGED>` so the linear path keeps identical codegen. int8 paged KV is the
+Pascal-correct stand-in for **FP8 KV** (FP8 is Hopper/Ada only). Cost of the
+gather is small: decode ~1% (273→270 tok/s, GPT-2 int8), prefill batch ~7%
+(0.195→0.209 s @512).
+
+**Radix prefix cache** (`prefix`). A block-level trie over 16-token chunks maps a
+token prefix to the physical blocks already holding its KV. A new request reuses
+the longest cached prefix and prefills **only the divergent suffix** — the prefix
+KV of a causal model depends solely on the prefix, so the reuse is exact. Sharing
+is block-granular, which makes per-token copy-on-write unnecessary: divergence
+always lands on a fresh block at the first non-matching chunk (the block-level
+equivalent of COW). A ref-counted allocator hands blocks out of the pool.
+
+Two prompts sharing a 208-token prefix, second request (the `prefix` gate):
+
+| mode | reused | cold TTFT | warm TTFT | speedup | logits vs cold |
+|------|--------|-----------|-----------|---------|----------------|
+| fp32     | 208/215 (13 blk) | 109.7 ms | 22.9 ms | 4.8x | bit-identical |
+| int8     | 208/215 (13 blk) |  88.8 ms | 14.1 ms | 6.3x | bit-identical |
+| int8/kv8 | 208/215 (13 blk) |  80.7 ms | 11.2 ms | 7.2x | bit-identical |
+
+Only the 7-token suffix is recomputed; `max|Δlogit| = 0` versus a cold prefill,
+on GPT-2 (fp32/int8/kv8) and Qwen2.5-0.5B (fp16/int8/kv8). Eviction when the pool
+fills and cross-sequence batching (continuous batching) are the next steps — the
+ref-counted allocator and the block table are already shaped for them.
+
 ## Pieces
 
 - `src/export.rs` — pulls `openai-community/gpt2` / `Qwen/Qwen2.5-0.5B` /
@@ -591,6 +632,13 @@ it tolerates best.
   cache (fp32 or int8 + scales); standard host-greedy decode, batch
   prefill, prompt-lookup speculative decode (device-side verify, only
   token ids cross the bus) and a CUDA-graph benchmark path.
+- `src/gpu.rs` (Engine v2) — `Paging` (block table + host mirror + ref-counted
+  LIFO block allocator) and `RadixCache` (block-level prefix trie);
+  `set_paged` / `set_prefix_cache` / `prefill_cached`. In `kernels/llm.cu`, a
+  `kv_row<PAGED>` helper threads the block-table gather through every KV
+  write/read (decode fp32/int8 + graph `_dyn`, prefill fp32/int8/dp4a) as
+  `_paged` entry points; `PAGED=false` collapses to the contiguous addressing,
+  so the default path is unchanged.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked

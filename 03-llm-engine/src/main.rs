@@ -825,24 +825,23 @@ fn main() {
             let model = load_model(&choice);
             let ctx = CudaContext::new(0).unwrap();
 
-            // A and B share a long prefix (several KV_BLOCK-sized chunks) and then
+            // A and B share a long prefix (many KV_BLOCK-sized chunks) and then
             // diverge — so B reuses the prefix blocks A populated and only the
-            // suffix is recomputed.
-            let shared = "Alan Turing was a British mathematician, logician and computer \
-                scientist who was highly influential in the development of theoretical \
-                computer science, providing a formalisation of the concepts of algorithm \
-                and computation with the Turing machine, and who is widely considered ";
-            let a_ids = tok.encode(&format!(
-                "{shared}to be the father of theoretical computer science and artificial intelligence."
-            ));
-            let b_ids = tok.encode(&format!(
-                "{shared}a highly influential figure in the early history of computing machines."
-            ));
+            // short suffix is recomputed. A long prefix makes the reuse visible in
+            // wall-clock TTFT as well as in the block count.
+            let mut shared = String::new();
+            while tok.encode(&shared).len() < 192 {
+                shared.push_str(
+                    "Alan Turing was a British mathematician and computer scientist whose \
+                     work founded theoretical computer science and modern computing. ",
+                );
+            }
+            let a_ids = tok.encode(&format!("{shared}He is widely called its founding father."));
+            let b_ids = tok.encode(&format!("{shared}His abstract machine defined computation."));
             println!(
-                "prompt A: {} tokens, prompt B: {} tokens (block = {} tokens)",
+                "prompt A: {} tokens, prompt B: {} tokens (block = 16 tokens)",
                 a_ids.len(),
                 b_ids.len(),
-                16
             );
 
             // fp32 OOMs for the RoPE models on 2 GB, so use fp16 there.
@@ -852,18 +851,27 @@ fn main() {
                 gpu::WeightMode::Fp16
             };
             let combos = [(base, false), (gpu::WeightMode::Int8, false), (gpu::WeightMode::Int8, true)];
+            println!("| mode | reused | cold TTFT | warm TTFT | speedup | max|Δlogit| |");
+            println!("|------|--------|-----------|-----------|---------|-------------|");
             for (mode, kv8) in combos {
-                // cold: B prefilled into a fresh cache (no reuse).
+                // cold: B prefilled with no shared prefix cached. Prime the engine
+                // with an unrelated prompt first so kernel/cuBLAS load isn't billed
+                // to the cold TTFT (B keeps a 0-token match).
                 let mut cold = gpu::Engine::new(&ctx, &model, mode, kv8);
                 cold.set_prefix_cache(true);
+                let _ = cold.prefill_cached(&tok.encode("Priming run for kernel load."));
+                let t0 = Instant::now();
                 let (cold_logits, cold_stats) = cold.prefill_cached(&b_ids);
+                let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
                 drop(cold);
 
                 // warm: A populates the cache, then B reuses the shared prefix.
                 let mut warm = gpu::Engine::new(&ctx, &model, mode, kv8);
                 warm.set_prefix_cache(true);
                 let _ = warm.prefill_cached(&a_ids);
+                let t0 = Instant::now();
                 let (warm_logits, warm_stats) = warm.prefill_cached(&b_ids);
+                let warm_ms = t0.elapsed().as_secs_f64() * 1e3;
 
                 let max_d = warm_logits
                     .iter()
@@ -873,19 +881,19 @@ fn main() {
                 let (cw, ww) = (gpu::argmax(&cold_logits), gpu::argmax(&warm_logits));
                 let kv = if kv8 { "/kv8" } else { "" };
                 println!(
-                    "{mode}{kv}: reused {}/{} tokens ({} blocks); cold reuse {}; argmax cold={cw} warm={ww}; max|Δlogit|={max_d:.2e}  {}",
+                    "| {mode}{kv} | {}/{} ({} blk) | {cold_ms:.1} ms | {warm_ms:.1} ms | {:.2}x | {max_d:.1e} {} |",
                     warm_stats.reused_tokens,
                     warm_stats.total_tokens,
                     warm_stats.reused_blocks,
-                    cold_stats.reused_tokens,
-                    if max_d == 0.0 { "IDENTICAL" } else { "OK" },
+                    cold_ms / warm_ms,
+                    if max_d == 0.0 { "(==)" } else { "" },
                 );
                 assert_eq!(cold_stats.reused_tokens, 0, "cold prefill must not reuse");
                 assert!(warm_stats.reused_blocks > 0, "{mode}{kv}: no prefix reuse happened");
                 assert_eq!(cw, ww, "{mode}{kv}: prefix-cached argmax differs from cold");
                 assert!(max_d < 1e-3, "{mode}{kv}: prefix-cached logits differ from cold (max={max_d:.3e})");
             }
-            println!("prefix cache: cached == cold on all modes  OK");
+            println!("prefix cache: cached == cold on all modes (bit-identical)  OK");
         }
         _ => {
             eprintln!(
