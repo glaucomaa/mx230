@@ -203,6 +203,68 @@ enum KvCache {
     },
 }
 
+/// Positions per physical KV block. Power of two so the in-kernel `t / B` and
+/// `t % B` lower to a shift and a mask.
+const KV_BLOCK: usize = 16;
+
+/// PagedAttention state for a single sequence (Stage 5a). The KV cache (the
+/// `KvCache` buffers above) is treated as a pool of fixed-size blocks; the
+/// block table indirects every cache access — `block_table[t / B]` gives the
+/// physical block holding logical position `t` — so logically contiguous
+/// positions can live in scattered physical blocks. That indirection is the
+/// groundwork for the radix prefix cache (5b); here it is exercised on one
+/// sequence. A real allocator with a LIFO free list hands out the blocks, which
+/// makes the logical→physical map a non-identity permutation, so the gather is
+/// genuinely tested rather than collapsing to an identity pass-through.
+struct Paging {
+    block_size: usize,
+    // n_blocks and the free list back a real block allocator; in 5a one sequence
+    // claims every block up front, so they are written but not yet read — the
+    // radix prefix cache (5b) allocates/frees against them.
+    #[allow(dead_code)]
+    n_blocks: usize,
+    block_size_i: i32,
+    // logical block -> physical block. Mirrored on the host so the non-graph
+    // decode write can resolve a physical row without a device round-trip; the
+    // device copy feeds the paged kernels' gather.
+    table_host: Vec<i32>,
+    table_dev: CudaSlice<i32>,
+    // physical blocks not yet handed out (LIFO: pop from the back).
+    #[allow(dead_code)]
+    free: Vec<i32>,
+}
+
+impl Paging {
+    /// Fresh single-sequence paging over `n_slots` cache positions (a multiple
+    /// of `KV_BLOCK`). Every logical block is pre-allocated up front: a single
+    /// sequence may use the full context, and the graph decode path resolves its
+    /// device-resident `pos` in-kernel, so the table must already be populated.
+    fn new(stream: &Arc<CudaStream>, n_slots: usize) -> Self {
+        let block_size = KV_BLOCK;
+        let n_blocks = n_slots / block_size;
+        let mut free: Vec<i32> = (0..n_blocks as i32).collect();
+        // Pop from the back: logical 0 -> physical n_blocks-1, logical 1 ->
+        // n_blocks-2, … — a non-identity permutation, so a wrong gather surfaces
+        // immediately as a verify divergence or a perplexity change.
+        let table_host: Vec<i32> = (0..n_blocks).map(|_| free.pop().unwrap()).collect();
+        let table_dev = stream.clone_htod(&table_host).unwrap();
+        Self {
+            block_size,
+            n_blocks,
+            block_size_i: block_size as i32,
+            table_host,
+            table_dev,
+            free,
+        }
+    }
+
+    /// Physical cache row for a logical position — the host mirror of the kernel
+    /// `kv_row` helper.
+    fn phys_row(&self, t: usize) -> usize {
+        self.table_host[t / self.block_size] as usize * self.block_size + t % self.block_size
+    }
+}
+
 pub enum Weights {
     F32(CudaSlice<f32>),
     F16(CudaSlice<f16>),
@@ -598,6 +660,18 @@ struct Kernels {
     attn_prefill: CudaFunction,
     attn_prefill_q8: CudaFunction,
     attn_prefill_dp4a: CudaFunction,
+    // PagedAttention: block-table-indirected KV write/read (Stage 5a)
+    copy_kv_paged_dyn: CudaFunction,
+    quantize_kv_paged_dyn: CudaFunction,
+    copy_kv_batch_paged: CudaFunction,
+    quantize_kv_batch_paged: CudaFunction,
+    attn_decode_paged: CudaFunction,
+    attn_decode_paged_dyn: CudaFunction,
+    attn_decode_q8_paged: CudaFunction,
+    attn_decode_q8_paged_dyn: CudaFunction,
+    attn_prefill_paged: CudaFunction,
+    attn_prefill_q8_paged: CudaFunction,
+    attn_prefill_dp4a_paged: CudaFunction,
     layernorm_batch: CudaFunction,
     rmsnorm_batch: CudaFunction,
     add_inplace: CudaFunction,
@@ -687,6 +761,17 @@ fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
         attn_prefill: f("attn_prefill"),
         attn_prefill_q8: f("attn_prefill_q8"),
         attn_prefill_dp4a: f("attn_prefill_dp4a"),
+        copy_kv_paged_dyn: f("copy_kv_paged_dyn"),
+        quantize_kv_paged_dyn: f("quantize_kv_paged_dyn"),
+        copy_kv_batch_paged: f("copy_kv_batch_paged"),
+        quantize_kv_batch_paged: f("quantize_kv_batch_paged"),
+        attn_decode_paged: f("attn_decode_paged"),
+        attn_decode_paged_dyn: f("attn_decode_paged_dyn"),
+        attn_decode_q8_paged: f("attn_decode_q8_paged"),
+        attn_decode_q8_paged_dyn: f("attn_decode_q8_paged_dyn"),
+        attn_prefill_paged: f("attn_prefill_paged"),
+        attn_prefill_q8_paged: f("attn_prefill_q8_paged"),
+        attn_prefill_dp4a_paged: f("attn_prefill_dp4a_paged"),
         layernorm_batch: f("layernorm_batch"),
         rmsnorm_batch: f("rmsnorm_batch"),
         add_inplace: f("add_inplace"),
@@ -1372,6 +1457,10 @@ pub struct Engine {
     graph_tok: CudaSlice<i32>,
     graph_pos: CudaSlice<i32>,
     decode_graph: Option<CudaGraph>,
+    // PagedAttention (Stage 5a): Some when --paged routes every KV access through
+    // a block table. The cache buffers are sized to KV_BLOCK-padded slots so the
+    // block pool fits without reallocation; None keeps the exact contiguous path.
+    paging: Option<Paging>,
     // GPTQ act-order stores weights in a permuted channel order that only the
     // decode GEMV (gemv_int4) gathers correctly; the batch-prefill GEMM does
     // not, so prefill falls back to the per-token decode loop when this is set.
@@ -1416,6 +1505,11 @@ impl Engine {
             "decode-attn scratch s[2048] overflow: n_ctx={}",
             c.n_ctx
         );
+        // KV cache rows, rounded up to a whole number of paged blocks. For the
+        // models in play n_ctx is already a KV_BLOCK multiple, so this is a no-op
+        // on footprint; the padding (< KV_BLOCK rows) only matters if it isn't,
+        // and lets `set_paged` build the block pool without reallocating.
+        let n_slots = c.n_ctx.div_ceil(KV_BLOCK) * KV_BLOCK;
         let (e, v) = (c.n_embd, c.n_vocab);
         // This engine schedules all work on one stream. Disabling cudarc's
         // cross-stream event tracking keeps CUDA stream capture free of
@@ -1577,31 +1671,31 @@ impl Engine {
             kv: if kv8 {
                 KvCache::Q8 {
                     k: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.kv_dim()).unwrap())
                         .collect(),
                     v: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.kv_dim()).unwrap())
                         .collect(),
                     ks: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.n_kv_head).unwrap())
                         .collect(),
                     vs: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.n_kv_head).unwrap())
                         .collect(),
                     kb: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.n_kv_head).unwrap())
                         .collect(),
                     vb: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.n_kv_head).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.n_kv_head).unwrap())
                         .collect(),
                 }
             } else {
                 KvCache::F32 {
                     k: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.kv_dim()).unwrap())
                         .collect(),
                     v: (0..c.n_layer)
-                        .map(|_| stream.alloc_zeros(c.n_ctx * c.kv_dim()).unwrap())
+                        .map(|_| stream.alloc_zeros(n_slots * c.kv_dim()).unwrap())
                         .collect(),
                 }
             },
@@ -1632,8 +1726,26 @@ impl Engine {
             graph_tok: stream.alloc_zeros(1).unwrap(),
             graph_pos: stream.alloc_zeros(1).unwrap(),
             decode_graph: None,
+            paging: None,
             stream,
         }
+    }
+
+    /// Enable or disable PagedAttention (Stage 5a). When on, every KV write/read
+    /// is routed through a block table over the cache's `n_slots` positions, so
+    /// the cache becomes a block pool with a non-identity logical→physical map.
+    /// The arithmetic is identical to the contiguous path (only addresses change),
+    /// so perplexity stays bit-identical and decode==prefill still holds.
+    pub fn set_paged(&mut self, on: bool) {
+        self.paging = if on {
+            let n_slots = self.config.n_ctx.div_ceil(KV_BLOCK) * KV_BLOCK;
+            Some(Paging::new(&self.stream, n_slots))
+        } else {
+            None
+        };
+        // The captured decode graph hard-codes the linear-vs-paged kernel choice,
+        // so a paging change invalidates it; it is re-captured on next use.
+        self.decode_graph = None;
     }
 
     fn launch_embed(&mut self, tok: i32, pos: i32) {
@@ -1868,22 +1980,33 @@ impl Engine {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
+            // Non-graph decode resolves the physical row on the host (pos is
+            // known), so the linear write kernels cover the paged case too — only
+            // the multi-position read needs the in-kernel block-table gather.
+            let phys = self.paging.as_ref().map_or(pos, |pg| pg.phys_row(pos));
+            let phys_i = phys as i32;
             match &mut self.kv {
                 KvCache::F32 { k, v } => {
                     self.stream
                         .memcpy_dtod(
                             &self.qkv.slice(qd..qd + kvd),
-                            &mut k[l].slice_mut(pos * kvd..(pos + 1) * kvd),
+                            &mut k[l].slice_mut(phys * kvd..(phys + 1) * kvd),
                         )
                         .unwrap();
                     self.stream
                         .memcpy_dtod(
                             &self.qkv.slice(qd + kvd..qkvd),
-                            &mut v[l].slice_mut(pos * kvd..(pos + 1) * kvd),
+                            &mut v[l].slice_mut(phys * kvd..(phys + 1) * kvd),
                         )
                         .unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_decode);
+                    let paged = self.paging.as_ref();
+                    let f = if paged.is_some() {
+                        &self.k.attn_decode_paged
+                    } else {
+                        &self.k.attn_decode
+                    };
+                    let mut lb = self.stream.launch_builder(f);
                     lb.arg(&mut self.attn)
                         .arg(&self.qkv)
                         .arg(&k[l])
@@ -1892,6 +2015,9 @@ impl Engine {
                         .arg(&nh_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
                 KvCache::Q8 { k, v, ks, vs, kb, vb } => {
@@ -1909,13 +2035,19 @@ impl Engine {
                         .arg(&mut kb[l])
                         .arg(&mut vb[l])
                         .arg(&self.qkv)
-                        .arg(&t_i)
+                        .arg(&phys_i)
                         .arg(&qd_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
                     unsafe { lb.launch(q_cfg) }.unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_q8);
+                    let paged = self.paging.as_ref();
+                    let f = if paged.is_some() {
+                        &self.k.attn_decode_q8_paged
+                    } else {
+                        &self.k.attn_decode_q8
+                    };
+                    let mut lb = self.stream.launch_builder(f);
                     lb.arg(&mut self.attn)
                         .arg(&self.qkv)
                         .arg(&k[l])
@@ -1928,6 +2060,9 @@ impl Engine {
                         .arg(&nh_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
             }
@@ -2078,16 +2213,30 @@ impl Engine {
             match &mut self.kv {
                 KvCache::F32 { k, v } => {
                     let (qd_i, kvd_i) = (qd as i32, kvd as i32);
-                    let mut lb = self.stream.launch_builder(&self.k.copy_kv_dyn);
+                    let paged = self.paging.as_ref();
+                    let wf = if paged.is_some() {
+                        &self.k.copy_kv_paged_dyn
+                    } else {
+                        &self.k.copy_kv_dyn
+                    };
+                    let mut lb = self.stream.launch_builder(wf);
                     lb.arg(&mut k[l])
                         .arg(&mut v[l])
                         .arg(&self.qkv)
                         .arg(&self.graph_pos)
                         .arg(&qd_i)
                         .arg(&kvd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(cfg1d(kvd)) }.unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_dyn);
+                    let rf = if paged.is_some() {
+                        &self.k.attn_decode_paged_dyn
+                    } else {
+                        &self.k.attn_decode_dyn
+                    };
+                    let mut lb = self.stream.launch_builder(rf);
                     lb.arg(&mut self.attn)
                         .arg(&self.qkv)
                         .arg(&k[l])
@@ -2096,6 +2245,9 @@ impl Engine {
                         .arg(&nh_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
                 KvCache::Q8 { k, v, ks, vs, kb, vb } => {
@@ -2105,7 +2257,13 @@ impl Engine {
                         block_dim: (hd as u32, 1, 1),
                         shared_mem_bytes: 0,
                     };
-                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv_dyn);
+                    let paged = self.paging.as_ref();
+                    let wf = if paged.is_some() {
+                        &self.k.quantize_kv_paged_dyn
+                    } else {
+                        &self.k.quantize_kv_dyn
+                    };
+                    let mut lb = self.stream.launch_builder(wf);
                     lb.arg(&mut k[l])
                         .arg(&mut v[l])
                         .arg(&mut ks[l])
@@ -2117,9 +2275,17 @@ impl Engine {
                         .arg(&qd_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(q_cfg) }.unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_q8_dyn);
+                    let rf = if paged.is_some() {
+                        &self.k.attn_decode_q8_paged_dyn
+                    } else {
+                        &self.k.attn_decode_q8_dyn
+                    };
+                    let mut lb = self.stream.launch_builder(rf);
                     lb.arg(&mut self.attn)
                         .arg(&self.qkv)
                         .arg(&k[l])
@@ -2132,6 +2298,9 @@ impl Engine {
                         .arg(&nh_i)
                         .arg(&nkv_i)
                         .arg(&hd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
             }
@@ -2425,7 +2594,13 @@ impl Engine {
             };
             match &mut self.kv {
                 KvCache::F32 { k, v } => {
-                    let mut lb = self.stream.launch_builder(&self.k.copy_kv_batch);
+                    let paged = self.paging.as_ref();
+                    let wf = if paged.is_some() {
+                        &self.k.copy_kv_batch_paged
+                    } else {
+                        &self.k.copy_kv_batch
+                    };
+                    let mut lb = self.stream.launch_builder(wf);
                     lb.arg(&mut k[l])
                         .arg(&mut v[l])
                         .arg(&self.batch_qkv)
@@ -2433,6 +2608,9 @@ impl Engine {
                         .arg(&qd_i)
                         .arg(&kvd_i)
                         .arg(&qkvd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     let copy_cfg = LaunchConfig {
                         grid_dim: (kvd.div_ceil(256) as u32, n as u32, 1),
                         block_dim: (256, 1, 1),
@@ -2441,11 +2619,13 @@ impl Engine {
                     unsafe { lb.launch(copy_cfg) }.unwrap();
 
                     // same fp32 cache either way; --prefill-dp4a only swaps how
-                    // the QKᵀ scores are computed (exact fp32 dot vs dp4a)
-                    let prefill_attn = if self.prefill_dp4a {
-                        &self.k.attn_prefill_dp4a
-                    } else {
-                        &self.k.attn_prefill
+                    // the QKᵀ scores are computed (exact fp32 dot vs dp4a), and
+                    // paging only swaps the cache addressing (block-table gather)
+                    let prefill_attn = match (paged.is_some(), self.prefill_dp4a) {
+                        (false, false) => &self.k.attn_prefill,
+                        (false, true) => &self.k.attn_prefill_dp4a,
+                        (true, false) => &self.k.attn_prefill_paged,
+                        (true, true) => &self.k.attn_prefill_dp4a_paged,
                     };
                     let mut lb = self.stream.launch_builder(prefill_attn);
                     lb.arg(&mut self.batch_attn)
@@ -2458,6 +2638,9 @@ impl Engine {
                         .arg(&nkv_i)
                         .arg(&qkvd_i)
                         .arg(&qd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
                 KvCache::Q8 { k, v, ks, vs, kb, vb } => {
@@ -2467,7 +2650,13 @@ impl Engine {
                         shared_mem_bytes: 0,
                     };
                     let hd_i = hd as i32;
-                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv_batch);
+                    let paged = self.paging.as_ref();
+                    let wf = if paged.is_some() {
+                        &self.k.quantize_kv_batch_paged
+                    } else {
+                        &self.k.quantize_kv_batch
+                    };
+                    let mut lb = self.stream.launch_builder(wf);
                     lb.arg(&mut k[l])
                         .arg(&mut v[l])
                         .arg(&mut ks[l])
@@ -2480,9 +2669,17 @@ impl Engine {
                         .arg(&nkv_i)
                         .arg(&hd_i)
                         .arg(&qkvd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(q_cfg) }.unwrap();
 
-                    let mut lb = self.stream.launch_builder(&self.k.attn_prefill_q8);
+                    let rf = if paged.is_some() {
+                        &self.k.attn_prefill_q8_paged
+                    } else {
+                        &self.k.attn_prefill_q8
+                    };
+                    let mut lb = self.stream.launch_builder(rf);
                     lb.arg(&mut self.batch_attn)
                         .arg(&self.batch_qkv)
                         .arg(&k[l])
@@ -2497,6 +2694,9 @@ impl Engine {
                         .arg(&nkv_i)
                         .arg(&qkvd_i)
                         .arg(&qd_i);
+                    if let Some(pg) = paged {
+                        lb.arg(&pg.table_dev).arg(&pg.block_size_i);
+                    }
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
             }

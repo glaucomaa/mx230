@@ -372,6 +372,7 @@ fn main() {
             let mut engine =
                 gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8);
             engine.prefill_dp4a = flag(&args, "--prefill-dp4a");
+            engine.set_paged(flag(&args, "--paged"));
 
             if spec && !sampler.is_greedy() {
                 eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
@@ -431,6 +432,10 @@ fn main() {
             // fragile bottom-rung int3/int2 modes the batch argmax may legitimately
             // diverge from decode by a token — relaxed to a note below.
             let prefill_dp4a = flag(&args, "--prefill-dp4a");
+            // --paged routes every KV access through the block-table indirection.
+            // The math is identical (only addresses change), so every assertion
+            // below — decode==CPU, decode==batch, graph==host — must stay green.
+            let paged = flag(&args, "--paged");
             let mut combos: Vec<(gpu::WeightMode, bool)> =
                 modes_for(choice.arch).iter().map(|&m| (m, false)).collect();
             combos.push((modes_for(choice.arch)[0], true));
@@ -438,6 +443,7 @@ fn main() {
             for (mode, kv8) in combos {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 engine.prefill_dp4a = prefill_dp4a;
+                engine.set_paged(paged);
                 let mut got = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     got = engine.forward(t, pos);
@@ -501,6 +507,7 @@ fn main() {
             println!("wide-tier batch prefill (M={}):", long_ids.len());
             for &mode in modes_for(choice.arch) {
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
+                engine.set_paged(paged);
                 let mut logits = Vec::new();
                 for (pos, &t) in long_ids.iter().enumerate() {
                     logits = engine.forward(t, pos);
@@ -509,6 +516,7 @@ fn main() {
                 drop(engine);
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
                 engine.prefill_dp4a = prefill_dp4a;
+                engine.set_paged(paged);
                 let b = gpu::argmax(&engine.prefill(&long_ids, 0));
                 let fragile = matches!(mode, gpu::WeightMode::Int3 | gpu::WeightMode::Int2);
                 if prefill_dp4a && fragile && d != b {
@@ -530,10 +538,12 @@ fn main() {
                 let mode = modes_for(choice.arch)[0];
                 let n_steps = 32;
                 let mut greedy_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                greedy_engine.set_paged(paged);
                 let greedy =
                     greedy_engine.generate(&spec_ids, n_steps, &mut sample::Sampler::greedy(), |_| {});
                 drop(greedy_engine);
                 let mut spec_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                spec_engine.set_paged(paged);
                 let spec = spec_engine.generate_speculative(&spec_ids, n_steps, 8, |_| {});
                 assert_eq!(
                     spec, greedy,
@@ -549,6 +559,7 @@ fn main() {
                 let n_steps = 16;
                 let graph_mode = modes_for(choice.arch)[0];
                 let mut engine = gpu::Engine::new(&ctx, &model, graph_mode, kv8);
+                engine.set_paged(paged);
                 let mut logits = Vec::new();
                 for (pos, &t) in ids.iter().enumerate() {
                     logits = engine.forward(t, pos);
@@ -565,6 +576,7 @@ fn main() {
                 drop(engine);
 
                 let mut engine = gpu::Engine::new(&ctx, &model, graph_mode, kv8);
+                engine.set_paged(paged);
                 for (pos, &t) in ids.iter().enumerate() {
                     engine.forward(t, pos);
                 }
@@ -587,6 +599,7 @@ fn main() {
             let kv8 = flag(&args, "--kv8");
             let spec = flag(&args, "--spec");
             let spec_k = opt_usize(&args, "--spec-k", 8);
+            let paged = flag(&args, "--paged");
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
@@ -598,6 +611,7 @@ fn main() {
                     continue;
                 }
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                engine.set_paged(paged);
                 // warmup + prefill
                 let mut logits = engine.prefill(&ids, 0);
                 if graphs {
@@ -648,6 +662,7 @@ fn main() {
 
             let only = mode_filter(&args);
             let prefill_dp4a = flag(&args, "--prefill-dp4a");
+            let paged = flag(&args, "--paged");
             println!("prompt tokens: {}", ids.len());
             if prefill_dp4a {
                 println!("(non-kv8 prefill QKᵀ scores on dp4a — --prefill-dp4a)");
@@ -659,6 +674,7 @@ fn main() {
                     continue;
                 }
                 let mut loop_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                loop_engine.set_paged(paged);
                 let t0 = Instant::now();
                 for (pos, &t) in ids.iter().enumerate() {
                     loop_engine.forward(t, pos);
@@ -668,6 +684,7 @@ fn main() {
 
                 let mut batch_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 batch_engine.prefill_dp4a = prefill_dp4a;
+                batch_engine.set_paged(paged);
                 let t0 = Instant::now();
                 batch_engine.prefill(&ids, 0);
                 let batch_dt = t0.elapsed().as_secs_f64();
@@ -765,6 +782,7 @@ fn main() {
             let ctx = CudaContext::new(0).unwrap();
 
             let only = mode_filter(&args);
+            let paged = flag(&args, "--paged");
             let (embed_int8, ffn_down_int8) = mixed_flags(&args);
             let mixed_tag = match (embed_int8, ffn_down_int8) {
                 (true, true) => "+mixed",
@@ -787,6 +805,7 @@ fn main() {
                     let mut engine = gpu::Engine::new_quant(
                         &ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8,
                     );
+                    engine.set_paged(paged);
                     let (ppl, n) = perplexity(&mut engine, &ids);
                     println!(
                         "| {mode}{}{} | ~{:.0} MB | {} | {n} | {ppl:.3} |",
