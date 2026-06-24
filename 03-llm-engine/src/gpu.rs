@@ -219,12 +219,17 @@ struct RadixNode {
     // chunk tokens -> child node. Keyed by the exact tokens (not a hash) so a
     // match is verbatim, never a collision.
     children: std::collections::HashMap<Vec<u32>, usize>,
-    phys_block: i32, // -1 for the root (holds no block)
+    parent: usize,  // index of the parent node (0 for the root, which is its own)
+    key: Vec<u32>,  // this node's chunk key under `parent` (empty for the root)
+    phys_block: i32, // -1 for the root or a tombstoned (evicted) slot
+    last_used: u64, // logical clock of the last lookup/insert that touched it (LRU)
 }
 
 struct RadixCache {
     block_size: usize,
-    nodes: Vec<RadixNode>, // nodes[0] is the root
+    nodes: Vec<RadixNode>,   // nodes[0] is the root
+    free_nodes: Vec<usize>,  // tombstoned slots, reused on insert (bounds node growth)
+    tick: u64,               // monotonic logical clock for LRU
 }
 
 impl RadixCache {
@@ -233,20 +238,29 @@ impl RadixCache {
             block_size,
             nodes: vec![RadixNode {
                 children: std::collections::HashMap::new(),
+                parent: 0,
+                key: Vec::new(),
                 phys_block: -1,
+                last_used: 0,
             }],
+            free_nodes: Vec::new(),
+            tick: 0,
         }
     }
 
     /// Physical blocks of the longest cached prefix that is a whole-chunk prefix
-    /// of `tokens` (one block per matched `KV_BLOCK`-token chunk).
-    fn lookup(&self, tokens: &[u32]) -> Vec<i32> {
+    /// of `tokens` (one block per matched `KV_BLOCK`-token chunk). Touches every
+    /// matched node for LRU, so a reused prefix is kept warm against eviction.
+    fn lookup(&mut self, tokens: &[u32]) -> Vec<i32> {
+        self.tick += 1;
+        let t = self.tick;
         let mut node = 0usize;
         let mut blocks = Vec::new();
         for chunk in tokens.chunks_exact(self.block_size) {
             match self.nodes[node].children.get(chunk) {
                 Some(&child) => {
                     node = child;
+                    self.nodes[child].last_used = t;
                     blocks.push(self.nodes[child].phys_block);
                 }
                 None => break,
@@ -260,6 +274,8 @@ impl RadixCache {
     /// now tree-owned; the caller frees the rest. Chunks already present keep
     /// their existing block (the freshly supplied one is redundant).
     fn insert(&mut self, tokens: &[u32], blocks: &[i32]) -> Vec<usize> {
+        self.tick += 1;
+        let t = self.tick;
         let mut node = 0usize;
         let mut created = Vec::new();
         for (i, chunk) in tokens.chunks_exact(self.block_size).enumerate() {
@@ -268,18 +284,59 @@ impl RadixCache {
             }
             if let Some(&child) = self.nodes[node].children.get(chunk) {
                 node = child;
+                self.nodes[child].last_used = t;
             } else {
-                let id = self.nodes.len();
-                self.nodes.push(RadixNode {
-                    children: std::collections::HashMap::new(),
-                    phys_block: blocks[i],
-                });
+                let id = self.alloc_node(node, chunk, blocks[i], t);
                 self.nodes[node].children.insert(chunk.to_vec(), id);
                 node = id;
                 created.push(i);
             }
         }
         created
+    }
+
+    /// New (or recycled tombstone) node for `block` under `parent`/`chunk`.
+    fn alloc_node(&mut self, parent: usize, chunk: &[u32], block: i32, t: u64) -> usize {
+        let node = RadixNode {
+            children: std::collections::HashMap::new(),
+            parent,
+            key: chunk.to_vec(),
+            phys_block: block,
+            last_used: t,
+        };
+        if let Some(id) = self.free_nodes.pop() {
+            self.nodes[id] = node;
+            id
+        } else {
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        }
+    }
+
+    /// Evict the least-recently-used *leaf* whose block is held only by the tree
+    /// (`refcount == 1` — no live request is borrowing it), unlink it from its
+    /// parent, and return the freed physical block for the caller to decref. Only
+    /// leaves are evictable: pruning from the tips keeps every cached path rooted,
+    /// so `lookup` always returns a valid (possibly shorter) prefix. Returns None
+    /// when nothing is reclaimable (every leaf is pinned by an in-flight request).
+    fn evict_leaf(&mut self, refcount: &[u32]) -> Option<i32> {
+        let victim = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| {
+                *i != 0 && n.phys_block >= 0 && n.children.is_empty()
+                    && refcount[n.phys_block as usize] == 1
+            })
+            .min_by_key(|(_, n)| n.last_used)
+            .map(|(i, _)| i)?;
+        let blk = self.nodes[victim].phys_block;
+        let parent = self.nodes[victim].parent;
+        let key = std::mem::take(&mut self.nodes[victim].key);
+        self.nodes[parent].children.remove(&key);
+        self.nodes[victim].phys_block = -1; // tombstone, recycled by alloc_node
+        self.free_nodes.push(victim);
+        Some(blk)
     }
 }
 
@@ -316,6 +373,8 @@ struct Paging {
     refcount: Vec<u32>,
     // Some in prefix-cache mode (5b); None in single-sequence mode (5a).
     cache: Option<RadixCache>,
+    // count of blocks reclaimed from the cache by eviction (observability).
+    evictions: u64,
 }
 
 impl Paging {
@@ -340,6 +399,7 @@ impl Paging {
             free,
             refcount: vec![1; n_blocks], // every block belongs to the one sequence
             cache: None,
+            evictions: 0,
         }
     }
 
@@ -359,22 +419,86 @@ impl Paging {
             free: (0..n_blocks as i32).collect(),
             refcount: vec![0; n_blocks],
             cache: Some(RadixCache::new(block_size)),
+            evictions: 0,
         }
     }
 
-    /// Claim a free physical block (refcount 1). Returns None when the pool is
-    /// exhausted (5b leaves eviction to a future step; the gate sizes the pool to
-    /// fit, so this never fires there).
+    /// Claim a free physical block (refcount 1). When the free list is empty,
+    /// evict the LRU cached block first (5b prefix cache); returns None only if
+    /// the pool is full *and* nothing is reclaimable — every block is pinned by a
+    /// live request, i.e. the working set genuinely exceeds the pool.
     fn alloc(&mut self) -> Option<i32> {
+        if self.free.is_empty() {
+            self.evict();
+        }
         let b = self.free.pop()?;
         self.refcount[b as usize] = 1;
         Some(b)
     }
 
-    // Paired with decref for when a reused block is referenced by both the tree
-    // and a live sequence; 5b borrows reused blocks transiently (no eviction
-    // mid-request), so the increment only matters once eviction lands.
-    #[allow(dead_code)]
+    /// Reclaim one block from the prefix cache (LRU leaf, tree-only). True if a
+    /// block was freed. No-op (false) outside prefix-cache mode or when every
+    /// cached leaf is currently borrowed by an in-flight request.
+    fn evict(&mut self) -> bool {
+        let blk = match self.cache.as_mut() {
+            Some(cache) => cache.evict_leaf(&self.refcount),
+            None => return false,
+        };
+        match blk {
+            Some(b) => {
+                self.decref(b); // tree's last ref drops -> block returns to `free`
+                self.evictions += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Structural invariant check for the prefix-cache pool: no physical block is
+    /// owned by two tree nodes, every tree block is referenced (refcount >= 1),
+    /// and the free list is a duplicate-free set of refcount-0 blocks disjoint
+    /// from the tree. Catches the dangerous bug — a block freed/reused while a
+    /// tree node still points at it — as a "free and tree-owned" error.
+    fn audit(&self) -> Result<(), String> {
+        let cache = match &self.cache {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let n = self.refcount.len();
+        let mut owner = vec![usize::MAX; n];
+        for (idx, node) in cache.nodes.iter().enumerate() {
+            if idx == 0 || node.phys_block < 0 {
+                continue; // root / tombstone
+            }
+            let b = node.phys_block as usize;
+            if owner[b] != usize::MAX {
+                return Err(format!("block {b} owned by tree nodes {} and {idx}", owner[b]));
+            }
+            owner[b] = idx;
+            if self.refcount[b] == 0 {
+                return Err(format!("tree block {b} (node {idx}) has refcount 0"));
+            }
+        }
+        let mut seen = vec![false; n];
+        for &b in &self.free {
+            let b = b as usize;
+            if seen[b] {
+                return Err(format!("block {b} appears twice in the free list"));
+            }
+            seen[b] = true;
+            if self.refcount[b] != 0 {
+                return Err(format!("free block {b} has refcount {}", self.refcount[b]));
+            }
+            if owner[b] != usize::MAX {
+                return Err(format!("block {b} is both free and tree-owned (node {})", owner[b]));
+            }
+        }
+        Ok(())
+    }
+
+    // A reused/tree-owned block referenced by both the tree and a live request
+    // carries one ref per holder, so eviction never reclaims a block the current
+    // request is still reading (its refcount is >= 2 while borrowed).
     fn incref(&mut self, b: i32) {
         self.refcount[b as usize] += 1;
     }
@@ -1894,8 +2018,8 @@ impl Engine {
     /// block allocator plus a token-prefix trie, so a new request reuses the KV
     /// blocks of any previously cached request it shares a prefix with. Implies
     /// paging. The pool spans the cache's n_slots positions (shared across cached
-    /// sequences); short requests reuse freely. Eviction when the pool fills is
-    /// left to a later step — the gate sizes the workload to fit.
+    /// sequences); short requests reuse freely. When the pool fills, the allocator
+    /// evicts the least-recently-used cached block (LRU leaf) to make room.
     pub fn set_prefix_cache(&mut self, on: bool) {
         self.paging = if on {
             let n_slots = self.config.n_ctx.div_ceil(KV_BLOCK) * KV_BLOCK;
@@ -1904,6 +2028,21 @@ impl Engine {
             None
         };
         self.decode_graph = None;
+    }
+
+    /// Total physical blocks in the prefix-cache pool (KV capacity / KV_BLOCK).
+    pub fn pool_capacity(&self) -> usize {
+        self.config.n_ctx.div_ceil(KV_BLOCK)
+    }
+
+    /// Blocks reclaimed from the cache by eviction since `set_prefix_cache(true)`.
+    pub fn pool_evictions(&self) -> u64 {
+        self.paging.as_ref().map_or(0, |p| p.evictions)
+    }
+
+    /// Structural integrity of the prefix-cache pool (see `Paging::audit`).
+    pub fn audit_pool(&self) -> Result<(), String> {
+        self.paging.as_ref().map_or(Ok(()), |p| p.audit())
     }
 
     /// Prefill `tokens`, reusing the KV blocks of the longest cached token prefix
@@ -1930,15 +2069,21 @@ impl Engine {
                 .expect("prefill_cached needs set_prefix_cache(true)");
             let matched = pg
                 .cache
-                .as_ref()
+                .as_mut()
                 .expect("prefix-cache mode")
                 .lookup(tokens);
             let m = matched.len().min((n - 1) / b);
+            // Borrow each reused block for this request (ref tree + live) before
+            // allocating the suffix: a fresh alloc may evict, and the extra ref
+            // keeps the prefix this request is still reading off the victim list.
             for (j, &blk) in matched.iter().take(m).enumerate() {
                 pg.table_host[j] = blk;
+                pg.incref(blk);
             }
             for j in m..n_log {
-                let blk = pg.alloc().expect("prefix-cache pool exhausted");
+                let blk = pg
+                    .alloc()
+                    .expect("prefix-cache pool exhausted: working set exceeds pool");
                 pg.table_host[j] = blk;
             }
             pg.table_dev = stream.clone_htod(&pg.table_host[..]).unwrap();
@@ -1949,9 +2094,13 @@ impl Engine {
         // prefix KV through the block table.
         let logits = self.prefill(&tokens[k..], k);
 
-        // 4. Cache the freshly computed full chunks; release every fresh block
-        // that did not become a tree node (the transient trailing partial block,
-        // and — in the rare reuse-cap case — chunks the tree already held).
+        // 4. Cache the freshly computed full chunks, then release this request's
+        // borrow of every table block. A block the tree took ownership of (a newly
+        // created node) was ref'd for the tree, so it survives at refcount 1 and
+        // stays cached; everything else (the transient trailing partial block, and
+        // — in the rare reuse-cap case — chunks the tree already held) drops to 0
+        // and returns to the pool. Uniform decref over the whole table mirrors the
+        // uniform borrow above, which is what makes the refcount eviction-safe.
         {
             let pg = self.paging.as_mut().unwrap();
             let full_blocks: Vec<i32> = (0..n_full).map(|j| pg.table_host[j]).collect();
@@ -1959,12 +2108,11 @@ impl Engine {
                 let cache = pg.cache.as_mut().unwrap();
                 cache.insert(&tokens[..n_full * b], &full_blocks)
             };
-            let created: std::collections::HashSet<usize> = created.into_iter().collect();
-            for j in m..n_log {
-                if j >= n_full || !created.contains(&j) {
-                    let blk = pg.table_host[j];
-                    pg.decref(blk);
-                }
+            for &j in &created {
+                pg.incref(full_blocks[j]); // the tree now owns this block
+            }
+            for j in 0..n_log {
+                pg.decref(pg.table_host[j]);
             }
         }
 

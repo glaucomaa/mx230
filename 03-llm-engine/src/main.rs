@@ -1014,9 +1014,104 @@ fn main() {
                 println!("| {bsz} | {:.1} |", (bsz * n_new) as f64 / dt);
             }
         }
+        // Stage 5b eviction gate: flood the prefix-cache pool past capacity and
+        // check (a) it does not panic — the allocator evicts instead, (b) the LRU
+        // policy keeps the most-recent prompt cached, and (c) a prompt whose blocks
+        // were evicted is recomputed *bit-identically* to a cold prefill (eviction
+        // frees blocks but never corrupts a result).
+        Some("evict") => {
+            const BLOCK: usize = 16; // KV_BLOCK
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let ctx = CudaContext::new(0).unwrap();
+            let mode = gpu::WeightMode::Int8; // fits all three models
+            let kv8 = args.iter().any(|a| a == "--kv8");
+
+            let cap = gpu::Engine::new(&ctx, &model, mode, kv8).pool_capacity();
+
+            // Distinct prompts: a unique marker in the first 16-token chunk gives
+            // each its own trie path (zero shared prefix). ~10 blocks each, sized
+            // so the set demands ~2.5x the pool — eviction is unavoidable.
+            let blocks_per = 10usize;
+            let n_prompts = (cap * 5 / (blocks_per * 2)).max(8);
+            // Pad each prompt to a whole number of blocks: a reused prompt then
+            // leaves a full 16-token suffix, recomputed through the same batch GEMM
+            // path as a cold prefill (so warm == cold bit-for-bit). A length of
+            // 16k+1 would instead leave a 1-token suffix, which routes through the
+            // GEMV decode kernel — a different reduction order that diverges from
+            // the GEMM reference by ~1e-1 under int8 (the GEMV-vs-GEMM near-tie the
+            // `batch` gate documents), which is a kernel-path artifact, not the KV.
+            let prompts: Vec<Vec<u32>> = (0..n_prompts)
+                .map(|i| {
+                    let mut s = format!("Topic {i:04}: ");
+                    while tok.encode(&s).len() < blocks_per * BLOCK {
+                        s.push_str("the quick brown fox jumps over the lazy dog by the river. ");
+                    }
+                    let mut ids = tok.encode(&s);
+                    ids.truncate(ids.len() / BLOCK * BLOCK); // whole blocks only
+                    ids
+                })
+                .collect();
+            let demanded: usize = prompts.iter().map(|p| p.len() / BLOCK).sum();
+            let kv = if kv8 { "/kv8" } else { "" };
+            println!(
+                "pool = {cap} blocks; {n_prompts} distinct prompts demand ~{demanded} blocks ({:.1}x pool), mode int8{kv}",
+                demanded as f64 / cap as f64,
+            );
+
+            // Cold references (fresh cache, full recompute) for the earliest prompt
+            // (will be evicted) and the most-recent one (LRU should retain it).
+            let cold = |idx: usize| {
+                let mut e = gpu::Engine::new(&ctx, &model, mode, kv8);
+                e.set_prefix_cache(true);
+                let (lg, st) = e.prefill_cached(&prompts[idx]);
+                assert_eq!(st.reused_blocks, 0, "cold reference must not reuse");
+                lg
+            };
+            let cold0 = cold(0);
+            let cold_last = cold(n_prompts - 1);
+            let max_abs = |a: &[f32], b: &[f32]| {
+                a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+            };
+
+            // Flood one engine in order, past capacity. Must not panic — the
+            // allocator evicts instead — and the pool stays structurally sound.
+            let mut eng = gpu::Engine::new(&ctx, &model, mode, kv8);
+            eng.set_prefix_cache(true);
+            for p in &prompts {
+                let _ = eng.prefill_cached(p);
+            }
+            let ev = eng.pool_evictions();
+            assert!(ev > 0, "flooding {demanded} blocks through a {cap}-block pool must evict");
+            eng.audit_pool().expect("pool integrity after flood");
+
+            // Most-recent prompt: LRU kept it warm, so it still reuses, and the
+            // reused prefill matches its cold logits.
+            let (last_lg, last_st) = eng.prefill_cached(&prompts[n_prompts - 1]);
+            let d_last = max_abs(&last_lg, &cold_last);
+            assert!(last_st.reused_blocks > 0, "LRU should retain the most-recent prompt");
+            assert!(d_last < 1e-3, "recent reused logits differ from cold (max={d_last:.3e})");
+
+            // Earliest prompt: evicted long ago, so it is a full recompute — and it
+            // must be bit-identical to the cold reference (eviction is lossless).
+            let (p0_lg, p0_st) = eng.prefill_cached(&prompts[0]);
+            let d0 = max_abs(&p0_lg, &cold0);
+            assert_eq!(p0_st.reused_blocks, 0, "earliest prompt should have been evicted");
+            assert_eq!(d0, 0.0, "evicted-then-recomputed logits must be bit-identical to cold (max={d0:.3e})");
+
+            println!("evictions: {ev} blocks reclaimed; pool integrity OK");
+            println!(
+                "recent prompt (LRU-kept): reused {}/{} blocks, max|Δlogit| vs cold {d_last:.1e}",
+                last_st.reused_blocks,
+                last_st.total_tokens / BLOCK,
+            );
+            println!("evicted prompt (recomputed): reused 0, max|Δlogit| vs cold {d0:.1e} (bit-identical)");
+            println!("eviction: no panic past pool, LRU retains recent, evicted recompute lossless  OK");
+        }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix|batch> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix|batch|evict> [args]"
             );
             std::process::exit(1);
         }

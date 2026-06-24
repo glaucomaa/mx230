@@ -18,6 +18,7 @@ cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec] [--paged]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a] [--paged]  # --prefill-dp4a: opt-in dp4a prefill scores (~6-8%)
 cargo run -rp llm-engine -- prefix [--model qwen]     # radix prefix cache: cached prefill == cold prefill (bit-identical) + TTFT saved
 cargo run -rp llm-engine -- batch [--model qwen] [-n 32]  # continuous batching: batched decode == single-seq (bit-identical) + tok/s vs batch size
+cargo run -rp llm-engine -- evict [--model qwen] [--kv8]  # flood the prefix-cache pool past capacity: LRU eviction, lossless recompute
 cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
@@ -594,9 +595,19 @@ Two prompts sharing a 208-token prefix, second request (the `prefix` gate):
 | int8/kv8 | 208/215 (13 blk) |  80.7 ms | 11.2 ms | 7.2x | bit-identical |
 
 Only the 7-token suffix is recomputed; `max|Δlogit| = 0` versus a cold prefill,
-on GPT-2 (fp32/int8/kv8) and Qwen2.5-0.5B (fp16/int8/kv8). Eviction when the pool
-fills is the one remaining step — the ref-counted allocator and the block table
-are already shaped for it.
+on GPT-2 (fp32/int8/kv8) and Qwen2.5-0.5B (fp16/int8/kv8).
+
+**Eviction** (`evict`). When the pool fills, the allocator reclaims the
+least-recently-used cached block instead of failing. Only **leaves** of the trie
+are evictable, so pruning from the tips keeps every cached path rooted and a
+`lookup` always returns a valid (possibly shorter) prefix; an in-flight request's
+blocks carry an extra reference and are never reclaimed out from under it.
+Eviction is lossless: a prompt whose blocks were evicted is simply recomputed.
+The `evict` gate floods a 64-block pool with 2.5× its capacity of distinct
+prompts — 96 evictions, no failure, pool integrity intact — and checks that the
+recomputed-after-eviction logits are **bit-identical** to a cold prefill
+(`max|Δlogit| = 0`) while the most-recently-used prompt stays cached, on all three
+models (int8 and int8/kv8).
 
 **Continuous batching** (`batch`). Decode `B` independent sequences in one
 forward: grid `(n_head, n_seq)`, each sequence carrying its own position and
@@ -666,8 +677,9 @@ restores bit-identity.
   prefill, prompt-lookup speculative decode (device-side verify, only
   token ids cross the bus) and a CUDA-graph benchmark path.
 - `src/gpu.rs` (Engine v2) — `Paging` (block table + host mirror + ref-counted
-  LIFO block allocator) and `RadixCache` (block-level prefix trie);
-  `set_paged` / `set_prefix_cache` / `prefill_cached`. In `kernels/llm.cu`, a
+  LIFO block allocator with LRU eviction) and `RadixCache` (block-level prefix
+  trie with LRU-leaf eviction); `set_paged` / `set_prefix_cache` / `prefill_cached`.
+  In `kernels/llm.cu`, a
   `kv_row<PAGED>` helper threads the block-table gather through every KV
   write/read (decode fp32/int8 + graph `_dyn`, prefill fp32/int8/dp4a) as
   `_paged` entry points; `PAGED=false` collapses to the contiguous addressing,
