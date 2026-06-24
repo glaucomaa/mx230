@@ -349,6 +349,25 @@ pub struct PrefixStats {
     pub reused_blocks: usize,
 }
 
+/// One served request for the continuous-batching scheduler (Stage 5c): a prompt
+/// and how many greedy tokens to generate.
+#[derive(Clone)]
+pub struct Request {
+    pub prompt: Vec<u32>,
+    pub max_new: usize,
+}
+
+/// Per-step occupancy of the continuous-batching scheduler: how many sequence
+/// decodes ran in total and over how many batched steps (mean batch = decodes /
+/// steps). The win over static batching is that this stays near `max_batch`
+/// instead of collapsing as a chunk's short sequences finish.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ServeStats {
+    pub decode_steps: usize,   // number of batched decode launches
+    pub seq_decodes: usize,    // sum of the active-batch size over those launches
+    pub admitted: usize,       // requests admitted (== requests served)
+}
+
 /// PagedAttention state (Stage 5a/5b). The KV cache (the `KvCache` buffers
 /// above) is a pool of fixed-size blocks; the block table indirects every cache
 /// access — `block_table[t / B]` gives the physical block holding logical
@@ -3510,6 +3529,119 @@ impl Engine {
         let mut logits = Vec::new();
         let _ = self.forward_batched(&cur, &bd_pos, &bd_tables, n_log, Some(&mut logits));
         (0..nseq).map(|s| logits[s * nv..(s + 1) * nv].to_vec()).collect()
+    }
+
+    /// Continuous-batching scheduler (Stage 5c): serve a queue of `requests` with
+    /// heterogeneous prompt and output lengths, keeping up to `max_batch`
+    /// sequences decoding together. Each step runs one batched decode over the
+    /// *currently active* set; a sequence that has produced its `max_new` tokens
+    /// retires and frees its KV blocks, and a waiting request is admitted into the
+    /// freed slot — so the batch stays full instead of stalling on the longest
+    /// sequence (the weakness of static batching, where a whole chunk waits for
+    /// its slowest member). Returns each request's `max_new` greedy tokens (in
+    /// request order) plus occupancy stats. Output is bit-identical to decoding
+    /// each request alone: every sequence keeps its own positions and KV blocks,
+    /// and the batched forward is batch-invariant.
+    ///
+    /// Memory: a sequence reserves blocks for its whole lifetime at admit time
+    /// (`prompt + max_new`), so no running sequence can ever fail to allocate and
+    /// no preemption is needed; on-demand paging with preemption/recompute is the
+    /// production (vLLM) refinement. The pool is the prefix-cache pool; the
+    /// scheduler uses only its ref-counted allocator (no prefix trie).
+    pub fn run_continuous(
+        &mut self,
+        requests: &[Request],
+        max_batch: usize,
+    ) -> (Vec<Vec<u32>>, ServeStats) {
+        assert!((1..=MAX_SPEC_TOKENS).contains(&max_batch));
+        let b = KV_BLOCK;
+        let n_ctx = self.config.n_ctx;
+        let n_log = n_ctx.div_ceil(b);
+        let stream = self.stream.clone();
+        self.set_prefix_cache(true); // pool allocator (the scheduler skips the trie)
+
+        struct Slot {
+            req: usize,
+            table: Vec<i32>, // logical -> physical, padded to n_log with -1
+            need: usize,     // blocks reserved for the whole lifetime
+            pos: usize,      // position of `cur` (its KV is written on the next step)
+            cur: u32,        // current input token
+            target: usize,   // total tokens to generate (== max_new)
+        }
+
+        let mut results: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
+        let mut stats = ServeStats::default();
+        let mut next_req = 0usize;
+        let mut active: Vec<Slot> = Vec::new();
+
+        let free_decref = |eng: &mut Self, table: &[i32], need: usize| {
+            let pg = eng.paging.as_mut().unwrap();
+            for &blk in &table[..need] {
+                pg.decref(blk);
+            }
+        };
+
+        loop {
+            // ADMIT: fill free slots while the pool has room for a request's life.
+            while active.len() < max_batch && next_req < requests.len() {
+                let r = next_req;
+                let (plen, target) = (requests[r].prompt.len(), requests[r].max_new);
+                assert!(plen >= 1 && target >= 1);
+                assert!(plen + target <= n_ctx, "request {r} (prompt+max_new) exceeds n_ctx");
+                let need = (plen + target).div_ceil(b);
+                if self.paging.as_ref().unwrap().free.len() < need {
+                    break; // not enough blocks right now — wait for a retire
+                }
+                let mut table = vec![-1i32; n_log];
+                for slot in table.iter_mut().take(need) {
+                    *slot = self.paging.as_mut().unwrap().alloc().unwrap();
+                }
+                // Prefill the prompt into this sequence's reserved blocks; its
+                // last-token argmax is the first generated token.
+                {
+                    let pg = self.paging.as_mut().unwrap();
+                    pg.table_host.copy_from_slice(&table);
+                    pg.table_dev = stream.clone_htod(&pg.table_host).unwrap();
+                }
+                let first = argmax(&self.prefill(&requests[r].prompt, 0)) as u32;
+                results[r].push(first);
+                stats.admitted += 1;
+                next_req += 1;
+                if target == 1 {
+                    free_decref(self, &table, need); // done at the prefill token
+                } else {
+                    active.push(Slot { req: r, table, need, pos: plen, cur: first, target });
+                }
+            }
+            if active.is_empty() {
+                break; // nothing running and nothing admittable -> all served
+            }
+
+            // One batched decode step over the active set.
+            let cur: Vec<u32> = active.iter().map(|s| s.cur).collect();
+            let pos_i: Vec<i32> = active.iter().map(|s| s.pos as i32).collect();
+            let packed: Vec<i32> = active.iter().flat_map(|s| s.table.iter().copied()).collect();
+            let bd_pos = stream.clone_htod(&pos_i).unwrap();
+            let bd_tables = stream.clone_htod(&packed).unwrap();
+            let next = self.forward_batched(&cur, &bd_pos, &bd_tables, n_log, None);
+            stats.decode_steps += 1;
+            stats.seq_decodes += active.len();
+
+            // Append each sequence's new token; retire the finished ones.
+            let mut keep: Vec<Slot> = Vec::with_capacity(active.len());
+            for (i, mut slot) in std::mem::take(&mut active).into_iter().enumerate() {
+                slot.cur = next[i];
+                slot.pos += 1;
+                results[slot.req].push(next[i]);
+                if results[slot.req].len() >= slot.target {
+                    free_decref(self, &slot.table, slot.need);
+                } else {
+                    keep.push(slot);
+                }
+            }
+            active = keep;
+        }
+        (results, stats)
     }
 
     /// Batched prompt prefill; returns the final row's logits on the host.

@@ -1109,9 +1109,121 @@ fn main() {
             println!("evicted prompt (recomputed): reused 0, max|Δlogit| vs cold {d0:.1e} (bit-identical)");
             println!("eviction: no panic past pool, LRU retains recent, evicted recompute lossless  OK");
         }
+        // Stage 5c scheduler gate: continuous batching over heterogeneous requests
+        // (varied prompt + output lengths). Two claims: (1) the admit/retire
+        // scheduler reproduces each request's single-sequence greedy decode
+        // bit-identically, and (2) with skewed lengths it does far less wasted
+        // decode work than static batching (which stalls a chunk on its longest).
+        Some("serve") => {
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let ctx = CudaContext::new(0).unwrap();
+            let max_batch = opt_value(&args, "--batch").and_then(|s| s.parse().ok()).unwrap_or(4);
+            let base = match choice.arch {
+                model::Arch::Gpt2 => gpu::WeightMode::Fp32,
+                model::Arch::Qwen2 => gpu::WeightMode::Fp16,
+                model::Arch::Llama => gpu::WeightMode::Int4,
+            };
+
+            // Skewed request mix: a long generation interleaved with short ones, so
+            // static batching wastes most of a chunk waiting on the long member.
+            let base_prompts = [
+                "The history of computing began",
+                "Once upon a time in a distant land",
+                "The capital of France is",
+                "In the beginning there was",
+            ];
+            let lens = [32usize, 8, 8, 8, 32, 8, 8, 8, 32, 8, 8, 8];
+            let requests: Vec<gpu::Request> = lens
+                .iter()
+                .enumerate()
+                .map(|(i, &l)| gpu::Request {
+                    prompt: tok.encode(base_prompts[i % base_prompts.len()]),
+                    max_new: l,
+                })
+                .collect();
+            let useful: usize = lens.iter().sum();
+
+            // Reference: each request decoded alone (B=1 through the same batched
+            // forward), so the scheduler output must match it bit-for-bit.
+            let reference = |eng: &mut gpu::Engine| -> Vec<Vec<u32>> {
+                requests
+                    .iter()
+                    .map(|r| eng.generate_batched(std::slice::from_ref(&r.prompt), r.max_new).remove(0))
+                    .collect()
+            };
+
+            // (1) Correctness across the KV-precision spread: float baseline and
+            // the fragile int8 weights + int8 KV. The scheduler is mode-agnostic;
+            // bit-identity holds for every mode (batched forward is batch-invariant).
+            for (mode, kv8) in [(base, false), (gpu::WeightMode::Int8, true)] {
+                let kv = if kv8 { "/kv8" } else { "" };
+                let mut ref_eng = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let refs = reference(&mut ref_eng);
+                drop(ref_eng);
+
+                let mut eng = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let (cont, _) = eng.run_continuous(&requests, max_batch);
+                drop(eng);
+                for r in 0..requests.len() {
+                    assert_eq!(
+                        cont[r], refs[r],
+                        "{mode}{kv} request {r}: continuous-batched != single-sequence decode"
+                    );
+                }
+                println!("{mode}{kv}: {} requests, continuous == single-seq decode (bit-identical)  OK", requests.len());
+            }
+
+            // (2) Throughput: continuous vs static batching ({base} weights).
+            let mut eng = gpu::Engine::new(&ctx, &model, base, false);
+            let _ = eng.run_continuous(&requests, max_batch); // warmup
+            let t0 = Instant::now();
+            let (cont, st) = eng.run_continuous(&requests, max_batch);
+            let cont_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            // Static baseline: fixed chunks of `max_batch`, each decoded in lockstep
+            // to the chunk's longest request; shorter ones keep computing (wasted).
+            let t0 = Instant::now();
+            let mut static_out: Vec<Vec<u32>> = Vec::new();
+            let mut static_seq_decodes = 0usize;
+            for chunk in requests.chunks(max_batch) {
+                let cmax = chunk.iter().map(|r| r.max_new).max().unwrap();
+                let cprompts: Vec<Vec<u32>> = chunk.iter().map(|r| r.prompt.clone()).collect();
+                let outs = eng.generate_batched(&cprompts, cmax);
+                static_seq_decodes += chunk.len() * (cmax - 1);
+                for (i, r) in chunk.iter().enumerate() {
+                    static_out.push(outs[i][..r.max_new].to_vec());
+                }
+            }
+            let static_ms = t0.elapsed().as_secs_f64() * 1e3;
+            for r in 0..requests.len() {
+                assert_eq!(static_out[r], cont[r], "static vs continuous output mismatch at {r}");
+            }
+
+            let mean_batch = st.seq_decodes as f64 / st.decode_steps as f64;
+            println!("\n{} requests, max_batch {max_batch}, lengths {lens:?} ({useful} tokens)", requests.len());
+            println!("| scheduler | decode seq-steps | mean batch | wall ms | tok/s |");
+            println!("|-----------|------------------|-----------|---------|-------|");
+            println!(
+                "| static    | {static_seq_decodes} | {:.2} | {static_ms:.0} | {:.0} |",
+                max_batch as f64,
+                useful as f64 / (static_ms / 1e3),
+            );
+            println!(
+                "| continuous | {} | {mean_batch:.2} | {cont_ms:.0} | {:.0} |",
+                st.seq_decodes,
+                useful as f64 / (cont_ms / 1e3),
+            );
+            println!(
+                "continuous batching: {:.1}% less decode work, {:.2}x throughput  OK",
+                100.0 * (1.0 - st.seq_decodes as f64 / static_seq_decodes as f64),
+                static_ms / cont_ms,
+            );
+        }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix|batch|evict> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix|batch|evict|serve> [args]"
             );
             std::process::exit(1);
         }

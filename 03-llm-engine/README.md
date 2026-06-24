@@ -19,6 +19,7 @@ cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a] [--pag
 cargo run -rp llm-engine -- prefix [--model qwen]     # radix prefix cache: cached prefill == cold prefill (bit-identical) + TTFT saved
 cargo run -rp llm-engine -- batch [--model qwen] [-n 32]  # continuous batching: batched decode == single-seq (bit-identical) + tok/s vs batch size
 cargo run -rp llm-engine -- evict [--model qwen] [--kv8]  # flood the prefix-cache pool past capacity: LRU eviction, lossless recompute
+cargo run -rp llm-engine -- serve [--model qwen] [--batch 4]  # continuous-batching scheduler (admit/retire) vs static batching, bit-identical
 cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
@@ -603,13 +604,22 @@ are evictable, so pruning from the tips keeps every cached path rooted and a
 `lookup` always returns a valid (possibly shorter) prefix; an in-flight request's
 blocks carry an extra reference and are never reclaimed out from under it.
 Eviction is lossless: a prompt whose blocks were evicted is simply recomputed.
-The `evict` gate floods a 64-block pool with 2.5× its capacity of distinct
-prompts — 96 evictions, no failure, pool integrity intact — and checks that the
-recomputed-after-eviction logits are **bit-identical** to a cold prefill
-(`max|Δlogit| = 0`) while the most-recently-used prompt stays cached, on all three
-models (int8 and int8/kv8).
 
-**Continuous batching** (`batch`). Decode `B` independent sequences in one
+The `evict` gate floods the pool with 2.5× its capacity of distinct prompts and
+checks that a prompt whose blocks were evicted is recomputed **bit-identically**
+to a cold prefill (`max|Δlogit| = 0`) while the most-recently-used prompt stays
+cached, with the pool structurally intact (no block ever both free and tree-owned):
+
+| model | pool | prompts (demand) | evictions | evicted→recompute | LRU-retained |
+|-------|------|------------------|-----------|-------------------|--------------|
+| GPT-2          |  64 blk | 16 (160 blk, 2.5×) |  96 | `max\|Δ\|=0` | reused 9/10 |
+| Qwen2.5-0.5B   |  64 blk | 16 (160 blk, 2.5×) |  96 | `max\|Δ\|=0` | reused 9/10 |
+| TinyLlama-1.1B | 128 blk | 32 (320 blk, 2.5×) | 192 | `max\|Δ\|=0` | reused 9/10 |
+
+Lossless on all three models, int8 and int8/kv8 (the recompute path uses the same
+GEMM kernels as a cold prefill, so it is bit-exact, not just argmax-equal).
+
+**Batched decode** (`batch`). Decode `B` independent sequences in one
 forward: grid `(n_head, n_seq)`, each sequence carrying its own position and
 block table, attending only to its own KV. Decode is memory-bound and dominated
 by the per-layer **weight read**, so streaming those weights once for the whole
@@ -640,6 +650,31 @@ The culprit was a learned-position fixup that added `wpe[row]` then corrected wi
 row-dependent floating-point path, and kv8's coarse KV quant amplified the 7e-5
 into an argmax flip. Adding `wpe[pos]` exactly once to a token-only embedding
 restores bit-identity.
+
+**Continuous batching** (`serve`). Real serving has requests of different
+lengths arriving over time. `run_continuous` is the scheduler on top of the
+batched decode: it keeps up to `max_batch` sequences decoding together, and the
+moment one finishes it **retires** (frees its KV blocks) and a waiting request is
+**admitted** into the slot — so the batch stays full instead of stalling on the
+longest member. (Blocks are reserved for a sequence's whole lifetime at admit, so
+no running sequence can fail to allocate; on-demand paging with preemption is the
+vLLM refinement.) Each request's output is bit-identical to decoding it alone.
+
+Against **static batching** — fixed chunks of `max_batch`, each run in lockstep
+until its *longest* member finishes, the shorter ones wasting compute — on a
+skewed mix of 12 requests (lengths `[32,8,8,8]×3`, `max_batch=4`, 168 useful
+tokens). Continuous does **58% less decode work** (156 vs 372 sequence-steps) and
+keeps a mean batch of 3.47 vs the chunked schedule's wasteful 4.00:
+
+| model | static tok/s | continuous tok/s | speedup |
+|-------|--------------|------------------|---------|
+| GPT-2 fp32       | 88 | 166 | 1.87× |
+| Qwen2.5-0.5B fp16 | 25 | 46 | 1.86× |
+| TinyLlama-1.1B int4 | 24 | 43 | 1.78× |
+
+Verified bit-identical to single-sequence decode on all three models for the
+float baseline and int8 weights + int8 KV (the scheduler is mode-agnostic; the
+batched forward is batch-invariant).
 
 ## Pieces
 
@@ -684,9 +719,11 @@ restores bit-identity.
   write/read (decode fp32/int8 + graph `_dyn`, prefill fp32/int8/dp4a) as
   `_paged` entry points; `PAGED=false` collapses to the contiguous addressing,
   so the default path is unchanged. `generate_batched` / `forward_batched` add
-  continuous batching on top: `*_seqpos` / `*_batched` kernels (`grid.y = seq`)
-  carry per-sequence positions and block tables so one forward decodes `B`
-  sequences with a single shared weight read.
+  batched decode on top: `*_seqpos` / `*_batched` kernels (`grid.y = seq`) carry
+  per-sequence positions and block tables so one forward decodes `B` sequences
+  with a single shared weight read. `run_continuous` is the continuous-batching
+  scheduler over that primitive — admit/retire of variable-length requests with
+  per-sequence block reservation.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked
