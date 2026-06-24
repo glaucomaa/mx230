@@ -801,6 +801,13 @@ struct Kernels {
     attn_prefill_paged: CudaFunction,
     attn_prefill_q8_paged: CudaFunction,
     attn_prefill_dp4a_paged: CudaFunction,
+    // continuous-batch decode (Stage 5c)
+    attn_decode_batched: CudaFunction,
+    attn_decode_q8_batched: CudaFunction,
+    copy_kv_seqpos: CudaFunction,
+    quantize_kv_seqpos: CudaFunction,
+    rope_seqpos: CudaFunction,
+    add_wpe_seqpos: CudaFunction,
     layernorm_batch: CudaFunction,
     rmsnorm_batch: CudaFunction,
     add_inplace: CudaFunction,
@@ -901,6 +908,12 @@ fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
         attn_prefill_paged: f("attn_prefill_paged"),
         attn_prefill_q8_paged: f("attn_prefill_q8_paged"),
         attn_prefill_dp4a_paged: f("attn_prefill_dp4a_paged"),
+        attn_decode_batched: f("attn_decode_batched"),
+        attn_decode_q8_batched: f("attn_decode_q8_batched"),
+        copy_kv_seqpos: f("copy_kv_seqpos"),
+        quantize_kv_seqpos: f("quantize_kv_seqpos"),
+        rope_seqpos: f("rope_seqpos"),
+        add_wpe_seqpos: f("add_wpe_seqpos"),
         layernorm_batch: f("layernorm_batch"),
         rmsnorm_batch: f("rmsnorm_batch"),
         add_inplace: f("add_inplace"),
@@ -2623,7 +2636,7 @@ impl Engine {
         self.stream.clone_dtoh(&self.logits).unwrap()
     }
 
-    fn launch_embed_batch(&mut self, tokens: &[u32], pos0: usize) {
+    fn launch_embed_batch(&mut self, tokens: &[u32], pos0: usize, zero_wpe: bool) {
         let c = self.config;
         let n = tokens.len();
         let host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -2631,12 +2644,16 @@ impl Engine {
             .memcpy_htod(&host, &mut self.batch_tok.slice_mut(0..n))
             .unwrap();
         let (pos_i, n_i, e_i, v_i) = (pos0 as i32, n as i32, c.n_embd as i32, c.n_vocab as i32);
+        // Continuous-batch decode adds the learned position separately (per
+        // sequence, via add_wpe_seqpos), so it embeds token-only by pointing the
+        // wpe arg at the always-zero bias buffer (size n_vocab >= n*n_embd).
+        let wpe = if zero_wpe { &self.zero_bias } else { &self.wpe };
         match &self.wte_t {
             Weights::F32(w) => {
                 let mut lb = self.stream.launch_builder(&self.k.embed_batch);
                 lb.arg(&mut self.batch_x)
                     .arg(w)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2648,7 +2665,7 @@ impl Engine {
                 let mut lb = self.stream.launch_builder(&self.k.embed_half_batch);
                 lb.arg(&mut self.batch_x)
                     .arg(w)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2661,7 +2678,7 @@ impl Engine {
                 lb.arg(&mut self.batch_x)
                     .arg(q)
                     .arg(scales)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2674,7 +2691,7 @@ impl Engine {
                 lb.arg(&mut self.batch_x)
                     .arg(q)
                     .arg(scales)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2688,7 +2705,7 @@ impl Engine {
                     .arg(q)
                     .arg(sub)
                     .arg(dm)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2702,7 +2719,7 @@ impl Engine {
                     .arg(q)
                     .arg(sub)
                     .arg(dm)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2716,7 +2733,7 @@ impl Engine {
                     .arg(q)
                     .arg(sub)
                     .arg(dm)
-                    .arg(&self.wpe)
+                    .arg(wpe)
                     .arg(&self.batch_tok)
                     .arg(&pos_i)
                     .arg(&n_i)
@@ -2744,7 +2761,7 @@ impl Engine {
         let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let eps = c.norm_eps;
-        self.launch_embed_batch(tokens, pos0);
+        self.launch_embed_batch(tokens, pos0, false);
 
         for l in 0..c.n_layer {
             let layer = &self.layers[l];
@@ -3016,6 +3033,335 @@ impl Engine {
             e,
             eps,
         );
+    }
+
+    /// One continuous-batch decode step (Stage 5c): advance `toks.len()`
+    /// sequences by one token each in a single forward, then return each
+    /// sequence's greedy next token. `toks[s]` is sequence s's current input,
+    /// `bd_pos[s]` its position, and row s of `bd_tables` (n_log entries) its
+    /// block table. The per-layer weight read is shared across the whole batch —
+    /// the throughput lever on a memory-bound card. Mirrors `batch_body`, but the
+    /// rows are independent sequences (own positions, own KV) rather than tokens
+    /// of one prompt, so RoPE, the KV write and attention go per-sequence.
+    fn forward_batched(
+        &mut self,
+        toks: &[u32],
+        bd_pos: &CudaSlice<i32>,
+        bd_tables: &CudaSlice<i32>,
+        n_log: usize,
+        logits_out: Option<&mut Vec<f32>>,
+    ) -> Vec<u32> {
+        let c = self.config;
+        let n = toks.len();
+        let e = c.n_embd;
+        let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let eps = c.norm_eps;
+        let bs_i = KV_BLOCK as i32;
+        let n_log_i = n_log as i32;
+        let (qkvd_i, qd_i, kvd_i) = (qkvd as i32, qd as i32, kvd as i32);
+        let (nh_i, nkv_i, hd_i, n_i) = (nh as i32, nkv as i32, hd as i32, n as i32);
+
+        // Embed token-only (zero wpe), then add each sequence's learned position
+        // wpe[pos[s]] in a single add. Token embedding is row-independent, so a
+        // sequence's embedding is bit-identical batched (row s) or alone (row 0);
+        // see add_wpe_seqpos for why the one-shot add (not an add-then-subtract
+        // fixup) is what keeps it bit-identical. RoPE models zero wpe → skip.
+        self.launch_embed_batch(toks, 0, true);
+        if c.arch == Arch::Gpt2 {
+            let e_i = e as i32;
+            let mut lb = self.stream.launch_builder(&self.k.add_wpe_seqpos);
+            lb.arg(&mut self.batch_x)
+                .arg(&self.wpe)
+                .arg(bd_pos)
+                .arg(&n_i)
+                .arg(&e_i);
+            unsafe { lb.launch(cfg1d(n * e)) }.unwrap();
+        }
+
+        for l in 0..c.n_layer {
+            let layer = &self.layers[l];
+            norm_batch(
+                &self.stream, &self.k, &mut self.batch_xb, &self.batch_x,
+                &layer.ln1_g, layer.ln1_b.as_ref(), n, e, eps,
+            );
+            gemm(
+                &self.stream, &self.k, &mut self.batch_qkv, &self.batch_xb,
+                &layer.qkv_w, &layer.qkv_b, n, qkvd, e, &mut self.act,
+            );
+
+            if c.arch != Arch::Gpt2 {
+                let mut lb = self.stream.launch_builder(&self.k.rope_seqpos);
+                lb.arg(&mut self.batch_qkv)
+                    .arg(bd_pos)
+                    .arg(&n_i)
+                    .arg(&nh_i)
+                    .arg(&nkv_i)
+                    .arg(&hd_i)
+                    .arg(&qkvd_i)
+                    .arg(&c.rope_theta);
+                unsafe { lb.launch(cfg1d(n * (nh + nkv) * hd / 2)) }.unwrap();
+            }
+
+            let attn_cfg = LaunchConfig {
+                grid_dim: (nh as u32, n as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            match &mut self.kv {
+                KvCache::F32 { k, v } => {
+                    let kv_cfg = LaunchConfig {
+                        grid_dim: (kvd.div_ceil(256) as u32, n as u32, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut lb = self.stream.launch_builder(&self.k.copy_kv_seqpos);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&self.batch_qkv)
+                        .arg(bd_pos)
+                        .arg(&qd_i)
+                        .arg(&kvd_i)
+                        .arg(&qkvd_i)
+                        .arg(bd_tables)
+                        .arg(&bs_i)
+                        .arg(&n_log_i);
+                    unsafe { lb.launch(kv_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_batched);
+                    lb.arg(&mut self.batch_attn)
+                        .arg(&self.batch_qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(bd_pos)
+                        .arg(&nh_i)
+                        .arg(&nkv_i)
+                        .arg(&hd_i)
+                        .arg(bd_tables)
+                        .arg(&bs_i)
+                        .arg(&n_log_i)
+                        .arg(&qkvd_i)
+                        .arg(&qd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+                KvCache::Q8 { k, v, ks, vs, kb, vb } => {
+                    let q_cfg = LaunchConfig {
+                        grid_dim: (nkv as u32, n as u32, 1),
+                        block_dim: (hd as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut lb = self.stream.launch_builder(&self.k.quantize_kv_seqpos);
+                    lb.arg(&mut k[l])
+                        .arg(&mut v[l])
+                        .arg(&mut ks[l])
+                        .arg(&mut vs[l])
+                        .arg(&mut kb[l])
+                        .arg(&mut vb[l])
+                        .arg(&self.batch_qkv)
+                        .arg(bd_pos)
+                        .arg(&qd_i)
+                        .arg(&nkv_i)
+                        .arg(&hd_i)
+                        .arg(&qkvd_i)
+                        .arg(bd_tables)
+                        .arg(&bs_i)
+                        .arg(&n_log_i);
+                    unsafe { lb.launch(q_cfg) }.unwrap();
+
+                    let mut lb = self.stream.launch_builder(&self.k.attn_decode_q8_batched);
+                    lb.arg(&mut self.batch_attn)
+                        .arg(&self.batch_qkv)
+                        .arg(&k[l])
+                        .arg(&v[l])
+                        .arg(&ks[l])
+                        .arg(&vs[l])
+                        .arg(&kb[l])
+                        .arg(&vb[l])
+                        .arg(bd_pos)
+                        .arg(&nh_i)
+                        .arg(&nkv_i)
+                        .arg(&hd_i)
+                        .arg(bd_tables)
+                        .arg(&bs_i)
+                        .arg(&n_log_i)
+                        .arg(&qkvd_i)
+                        .arg(&qd_i);
+                    unsafe { lb.launch(attn_cfg) }.unwrap();
+                }
+            }
+
+            gemm(
+                &self.stream, &self.k, &mut self.batch_xb, &self.batch_attn,
+                &layer.proj_w, &layer.proj_b, n, e, qd, &mut self.act,
+            );
+            add(&self.stream, &self.k.add_inplace, &mut self.batch_x, &self.batch_xb, n * e);
+
+            norm_batch(
+                &self.stream, &self.k, &mut self.batch_xb, &self.batch_x,
+                &layer.ln2_g, layer.ln2_b.as_ref(), n, e, eps,
+            );
+            gemm(
+                &self.stream, &self.k, &mut self.batch_h, &self.batch_xb,
+                &layer.fc_w, layer.fc_b.as_ref().unwrap_or(&self.zero_bias), n, inter, e,
+                &mut self.act,
+            );
+            let total_i = (n * inter) as i32;
+            match &layer.up_w {
+                None => {
+                    let mut lb = self.stream.launch_builder(&self.k.gelu_inplace);
+                    lb.arg(&mut self.batch_h).arg(&total_i);
+                    unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
+                }
+                Some(up_w) => {
+                    gemm(
+                        &self.stream, &self.k, &mut self.batch_h2, &self.batch_xb,
+                        up_w, &self.zero_bias, n, inter, e, &mut self.act,
+                    );
+                    let mut lb = self.stream.launch_builder(&self.k.silu_mul);
+                    lb.arg(&mut self.batch_h).arg(&self.batch_h2).arg(&total_i);
+                    unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
+                }
+            }
+            gemm(
+                &self.stream, &self.k, &mut self.batch_xb, &self.batch_h,
+                &layer.fc2_w, layer.fc2_b.as_ref().unwrap_or(&self.zero_bias), n, e, inter,
+                &mut self.act,
+            );
+            add(&self.stream, &self.k.add_inplace, &mut self.batch_x, &self.batch_xb, n * e);
+        }
+
+        norm_batch(
+            &self.stream, &self.k, &mut self.batch_xb, &self.batch_x,
+            &self.lnf_g, self.lnf_b.as_ref(), n, e, eps,
+        );
+        gemm(
+            &self.stream, &self.k, &mut self.batch_logits, &self.batch_xb,
+            self.lm_head_t.as_ref().unwrap_or(&self.wte_t), &self.zero_bias, n, c.n_vocab, e,
+            &mut self.act,
+        );
+        let v_i = c.n_vocab as i32;
+        let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
+        lb.arg(&mut self.batch_argmax).arg(&self.batch_logits).arg(&v_i);
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.unwrap();
+        // Gate diagnostic only: pull the full logits to host so the `batch` gate
+        // can prove F32-KV batched == single-sequence bit-for-bit and quantify
+        // the kv8 near-tie. The fast decode/throughput path passes None.
+        if let Some(buf) = logits_out {
+            *buf = self.stream.clone_dtoh(&self.batch_logits.slice(0..n * c.n_vocab)).unwrap();
+        }
+        self.stream
+            .clone_dtoh(&self.batch_argmax.slice(0..n))
+            .unwrap()
+            .into_iter()
+            .map(|x| x as u32)
+            .collect()
+    }
+
+    /// Continuous-batch greedy decode (Stage 5c): prefill each prompt into its
+    /// own paged KV blocks, then advance all sequences together one token per
+    /// step. Returns `n_new` greedy tokens per prompt — identical to decoding
+    /// each prompt alone, since each sequence still attends only to its own KV.
+    /// Sets up a fresh paged block pool. RoPE models (Qwen/TinyLlama) and GPT-2
+    /// are all supported (GPT-2's learned positions via `add_wpe_seqpos`).
+    pub fn generate_batched(&mut self, prompts: &[Vec<u32>], n_new: usize) -> Vec<Vec<u32>> {
+        let nseq = prompts.len();
+        assert!(
+            (1..=MAX_SPEC_TOKENS).contains(&nseq),
+            "batch size must be 1..={MAX_SPEC_TOKENS}"
+        );
+        assert!(n_new >= 1);
+        let b = KV_BLOCK;
+        let n_log = self.config.n_ctx.div_ceil(b);
+        let stream = self.stream.clone();
+        self.set_prefix_cache(true); // fresh pool + ref-counted block allocator
+
+        let mut tables = vec![vec![-1i32; n_log]; nseq];
+        let mut pos = vec![0usize; nseq];
+        let mut cur = vec![0u32; nseq];
+        let mut out: Vec<Vec<u32>> = vec![Vec::with_capacity(n_new); nseq];
+
+        // Prefill each sequence into its own blocks (sequential), recording its
+        // first greedy token and final position.
+        for s in 0..nseq {
+            let plen = prompts[s].len();
+            assert!(plen + n_new <= self.config.n_ctx, "context overflow");
+            for j in 0..plen.div_ceil(b) {
+                tables[s][j] = self.paging.as_mut().unwrap().alloc().expect("pool exhausted");
+            }
+            {
+                let pg = self.paging.as_mut().unwrap();
+                pg.table_host.copy_from_slice(&tables[s]);
+                pg.table_dev = stream.clone_htod(&pg.table_host).unwrap();
+            }
+            let logits = self.prefill(&prompts[s], 0);
+            cur[s] = argmax(&logits) as u32;
+            out[s].push(cur[s]);
+            pos[s] = plen;
+        }
+
+        // Batched decode: feed cur[s] at pos[s], producing the next token. A
+        // sequence crossing a block boundary claims a fresh block first.
+        for _ in 1..n_new {
+            for s in 0..nseq {
+                let lb = pos[s] / b;
+                if tables[s][lb] == -1 {
+                    tables[s][lb] = self.paging.as_mut().unwrap().alloc().expect("pool exhausted");
+                }
+            }
+            let packed: Vec<i32> = tables.iter().flatten().copied().collect();
+            let bd_tables = stream.clone_htod(&packed).unwrap();
+            let pos_i: Vec<i32> = pos.iter().map(|&p| p as i32).collect();
+            let bd_pos = stream.clone_htod(&pos_i).unwrap();
+            let next = self.forward_batched(&cur, &bd_pos, &bd_tables, n_log, None);
+            for s in 0..nseq {
+                cur[s] = next[s];
+                out[s].push(next[s]);
+                pos[s] += 1;
+            }
+        }
+        out
+    }
+
+    /// Gate diagnostic (Stage 5c `batch`): prefill `prompts`, run ONE batched
+    /// decode step, and return each sequence's full logits. Lets the gate compare
+    /// a sequence's first-step logits batched (B=n) vs alone (B=1): the F32-KV
+    /// forward is bit-identical (max|Δ|=0), so any kv8 token divergence is a
+    /// near-tie on identical-to-noise logits, not cross-sequence contamination.
+    pub fn batched_first_logits(&mut self, prompts: &[Vec<u32>]) -> Vec<Vec<f32>> {
+        let nseq = prompts.len();
+        let b = KV_BLOCK;
+        let n_log = self.config.n_ctx.div_ceil(b);
+        let nv = self.config.n_vocab;
+        let stream = self.stream.clone();
+        self.set_prefix_cache(true);
+
+        let mut tables = vec![vec![-1i32; n_log]; nseq];
+        let mut cur = vec![0u32; nseq];
+        let mut pos = vec![0i32; nseq];
+        for s in 0..nseq {
+            let plen = prompts[s].len();
+            for j in 0..plen.div_ceil(b) {
+                tables[s][j] = self.paging.as_mut().unwrap().alloc().expect("pool exhausted");
+            }
+            {
+                let pg = self.paging.as_mut().unwrap();
+                pg.table_host.copy_from_slice(&tables[s]);
+                pg.table_dev = stream.clone_htod(&pg.table_host).unwrap();
+            }
+            cur[s] = argmax(&self.prefill(&prompts[s], 0)) as u32;
+            pos[s] = plen as i32;
+        }
+        let packed: Vec<i32> = tables.iter().flatten().copied().collect();
+        let bd_tables = stream.clone_htod(&packed).unwrap();
+        let bd_pos = stream.clone_htod(&pos).unwrap();
+        let mut logits = Vec::new();
+        let _ = self.forward_batched(&cur, &bd_pos, &bd_tables, n_log, Some(&mut logits));
+        (0..nseq).map(|s| logits[s * nv..(s + 1) * nv].to_vec()).collect()
     }
 
     /// Batched prompt prefill; returns the final row's logits on the host.

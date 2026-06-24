@@ -1457,6 +1457,93 @@ extern "C" __global__ void attn_decode_q8_paged_dyn(float *out, const float *qkv
                               head_dim, bt, bs);
 }
 
+// ---- continuous-batch decode (Stage 5c) ------------------------------------
+// One token for each of n_seq sequences in one forward. The weight read is
+// shared across the whole batch (the point on a memory-bound card); each
+// sequence keeps its own position pos[s] and its own block table (row s of
+// `tables`, n_log entries each), attending only to its own cached KV. The
+// per-(head, sequence) attention and KV write reuse the single-sequence paged
+// device bodies with per-sequence base pointers — grid.y selects the sequence.
+
+extern "C" __global__ void attn_decode_batched(
+        float *out, const float *qkv, const float *kcache, const float *vcache,
+        const int *pos, int n_head, int n_kv_head, int head_dim,
+        const int *tables, int block_size, int n_log, int qkv_stride, int out_stride) {
+    int s = blockIdx.y;
+    attn_decode_impl<true>(out + (size_t)s * out_stride, qkv + (size_t)s * qkv_stride,
+                           kcache, vcache, pos[s], n_head, n_kv_head, head_dim,
+                           tables + (size_t)s * n_log, block_size);
+}
+
+extern "C" __global__ void attn_decode_q8_batched(
+        float *out, const float *qkv, const signed char *kq, const signed char *vq,
+        const float *ks, const float *vs, const float *kb, const float *vb,
+        const int *pos, int n_head, int n_kv_head, int head_dim,
+        const int *tables, int block_size, int n_log, int qkv_stride, int out_stride) {
+    int s = blockIdx.y;
+    attn_decode_q8_impl<true>(out + (size_t)s * out_stride, qkv + (size_t)s * qkv_stride,
+                              kq, vq, ks, vs, kb, vb, pos[s], n_head, n_kv_head, head_dim,
+                              tables + (size_t)s * n_log, block_size);
+}
+
+// Per-sequence fp32 KV write: sequence s (grid.y) writes its new token's K/V to
+// the physical block that holds its position pos[s].
+extern "C" __global__ void copy_kv_seqpos(
+        float *kcache, float *vcache, const float *qkv, const int *pos,
+        int q_dim, int kv_dim, int qkv_stride, const int *tables, int block_size, int n_log) {
+    int s = blockIdx.y;
+    size_t row = kv_row<true>(tables + (size_t)s * n_log, block_size, pos[s]) * kv_dim;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kv_dim) {
+        kcache[row + i] = qkv[(size_t)s * qkv_stride + q_dim + i];
+        vcache[row + i] = qkv[(size_t)s * qkv_stride + q_dim + kv_dim + i];
+    }
+}
+
+extern "C" __global__ void quantize_kv_seqpos(
+        signed char *kq, signed char *vq, float *ks, float *vs, float *kb, float *vb,
+        const float *qkv, const int *pos, int q_dim, int n_kv_head, int head_dim,
+        int qkv_stride, const int *tables, int block_size, int n_log) {
+    int s = blockIdx.y;
+    quantize_kv_impl<true>(kq, vq, ks, vs, kb, vb, qkv + (size_t)s * qkv_stride, pos[s],
+                           q_dim, n_kv_head, head_dim, tables + (size_t)s * n_log, block_size);
+}
+
+// RoPE with a per-sequence position (vs rope_batch's pos0 + row).
+extern "C" __global__ void rope_seqpos(float *qkv, const int *pos, int n_seq, int n_head,
+                                       int n_kv_head, int head_dim, int stride, float theta) {
+    int half = head_dim / 2;
+    int per_row = (n_head + n_kv_head) * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_seq * per_row) return;
+    int s = idx / per_row;
+    int i = idx - s * per_row;
+    int h = i / half;
+    int d = i % half;
+    float *base = qkv + (size_t)s * stride + h * head_dim;
+    float freq = __powf(theta, -2.0f * d / head_dim);
+    float c, sn;
+    __sincosf(pos[s] * freq, &sn, &c);
+    float x1 = base[d], x2 = base[d + half];
+    base[d] = x1 * c - x2 * sn;
+    base[d + half] = x1 * sn + x2 * c;
+}
+
+// GPT-2 learned positions for continuous-batch decode: the batched embed runs
+// with a zero wpe (token-only), so each row s holds wte[tok_s] alone — a
+// row-independent value. Add wpe[pos[s]] exactly once here. This single add
+// makes a sequence's embedding bit-identical whether it is row 0 (alone) or row
+// s of a batch; an earlier add-then-subtract fixup was non-bit-identical because
+// the cancelled wpe[row] term took a row-dependent floating-point path, which a
+// kv8 near-tie could amplify into a token flip. (RoPE models zero wpe → skip.)
+extern "C" __global__ void add_wpe_seqpos(float *x, const float *wpe, const int *pos,
+                                          int n_seq, int n_embd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_seq * n_embd) return;
+    int s = idx / n_embd, i = idx % n_embd;
+    x[idx] += wpe[(size_t)pos[s] * n_embd + i];
+}
+
 // ---- batched prefill / speculative-verify path ----------------------------
 // Decode is one token at a time (GEMV, memory-bound); prefill and draft
 // verification process T tokens at once, so the matmuls become GEMMs that

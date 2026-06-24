@@ -17,6 +17,7 @@ cargo run -rp llm-engine -- generate "Alan Turing was" -n 40 [--fp16|--int8|--in
 cargo run -rp llm-engine -- bench -n 128 [--graphs] [--kv8] [--spec] [--paged]
 cargo run -rp llm-engine -- prefill-bench -n 512 [--kv8] [--prefill-dp4a] [--paged]  # --prefill-dp4a: opt-in dp4a prefill scores (~6-8%)
 cargo run -rp llm-engine -- prefix [--model qwen]     # radix prefix cache: cached prefill == cold prefill (bit-identical) + TTFT saved
+cargo run -rp llm-engine -- batch [--model qwen] [-n 32]  # continuous batching: batched decode == single-seq (bit-identical) + tok/s vs batch size
 cargo run -rp llm-engine -- kbench [--model qwen] [--int8|--int4] [--emit-llama]  # isolated matmul kernels vs llama.cpp MMVQ/MMQ
 cargo run -rp llm-engine -- ppl-data                  # download WikiText-2 raw test
 cargo run -rp llm-engine -- ppl -n 2048 [--model qwen]
@@ -594,8 +595,40 @@ Two prompts sharing a 208-token prefix, second request (the `prefix` gate):
 
 Only the 7-token suffix is recomputed; `max|Δlogit| = 0` versus a cold prefill,
 on GPT-2 (fp32/int8/kv8) and Qwen2.5-0.5B (fp16/int8/kv8). Eviction when the pool
-fills and cross-sequence batching (continuous batching) are the next steps — the
-ref-counted allocator and the block table are already shaped for them.
+fills is the one remaining step — the ref-counted allocator and the block table
+are already shaped for it.
+
+**Continuous batching** (`batch`). Decode `B` independent sequences in one
+forward: grid `(n_head, n_seq)`, each sequence carrying its own position and
+block table, attending only to its own KV. Decode is memory-bound and dominated
+by the per-layer **weight read**, so streaming those weights once for the whole
+batch — instead of once per sequence — is the throughput lever. `generate_batched`
+prefills each prompt into its own pool blocks (the prefix-cache allocator), then
+advances all sequences together; the matmuls become small GEMMs (`gemm_rows`,
+B≤8) that share the weight stream. Per-sequence kernels (`grid.y = seq`) handle
+the parts that aren't shared: RoPE, the KV write/quantize, paged attention, and
+GPT-2's learned-position add.
+
+A sequence's logits are **bit-identical** whether it is row `s` of a batch or run
+alone — `max|Δlogit| = 0` (B=1 vs B=8), every mode incl. kv8, on all three
+models; the paging reshuffles physical blocks but no per-row math depends on the
+batch-mates. Throughput scales ~6× from B=1 to B=8 as the weight read amortizes:
+
+| batch | GPT-2 fp32 | Qwen fp16 | TinyLlama int4 |
+|-------|-----------|-----------|----------------|
+| 1 | 57 tok/s | 15.9 | 16.6 |
+| 2 | 110 | 30.5 | 31.8 |
+| 4 | 202 | 56.5 | 58.4 |
+| 8 | 345 | 98.5 | 101 |
+
+One bug worth keeping: the first version diverged on kv8 (one sequence flipped at
+token 22). The `max|Δlogit|` diagnostic pinned it — row 0 was exact, rows 1–3 off
+by an identical `6.866e-5`, i.e. a function of the *row index*, not the content.
+The culprit was a learned-position fixup that added `wpe[row]` then corrected with
+`+ wpe[pos] − wpe[row]`: arithmetically `wpe[pos]`, but the cancellation took a
+row-dependent floating-point path, and kv8's coarse KV quant amplified the 7e-5
+into an argmax flip. Adding `wpe[pos]` exactly once to a token-only embedding
+restores bit-identity.
 
 ## Pieces
 
@@ -638,7 +671,10 @@ ref-counted allocator and the block table are already shaped for them.
   `kv_row<PAGED>` helper threads the block-table gather through every KV
   write/read (decode fp32/int8 + graph `_dyn`, prefill fp32/int8/dp4a) as
   `_paged` entry points; `PAGED=false` collapses to the contiguous addressing,
-  so the default path is unchanged.
+  so the default path is unchanged. `generate_batched` / `forward_batched` add
+  continuous batching on top: `*_seqpos` / `*_batched` kernels (`grid.y = seq`)
+  carry per-sequence positions and block tables so one forward decodes `B`
+  sequences with a single shared weight read.
 
 Verification: fp32 GPU logits match the CPU reference to `8e-5` (allclose);
 fp16, int8 and both int8-KV variants report allclose error and are checked

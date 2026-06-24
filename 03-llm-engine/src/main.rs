@@ -895,9 +895,128 @@ fn main() {
             }
             println!("prefix cache: cached == cold on all modes (bit-identical)  OK");
         }
+        // Stage 5c gate: continuous-batch decode must reproduce per-sequence
+        // single decode, and tokens/sec should rise with batch size (the per-layer
+        // weight read is shared across the batch on a memory-bound card).
+        Some("batch") => {
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let ctx = CudaContext::new(0).unwrap();
+            let n_new = opt_n(&args, 32);
+            // Pick the lightest weight mode that fits 2 GB as the throughput base
+            // and the check-(3) reference: GPT-2 fp32 (498 MB), Qwen fp16 (988 MB),
+            // TinyLlama Int4 (619 MB — its fp16 is 2.2 GB and OOMs).
+            let base = match choice.arch {
+                model::Arch::Gpt2 => gpu::WeightMode::Fp32,
+                model::Arch::Qwen2 => gpu::WeightMode::Fp16,
+                model::Arch::Llama => gpu::WeightMode::Int4,
+            };
+            let prompts: Vec<Vec<u32>> = [
+                "The history of computing began",
+                "Once upon a time in a distant land",
+                "The capital of France is",
+                "In the beginning there was",
+            ]
+            .iter()
+            .map(|s| tok.encode(s))
+            .collect();
+
+            // Correctness, strongest first. (1) Batch-invariance at the logit
+            // level: a sequence's first-step logits are *bit-identical* whether it
+            // is row s of a batch or run alone (max|Δlogit| = 0) — every per-row
+            // op (GEMV-tier GEMM, per-(head,seq) paged attention, per-seq KV
+            // write, per-seq position add) is independent of the batch-mates, so
+            // paging-driven physical-block reshuffling never perturbs the math.
+            // This holds for every mode incl. kv8 — see add_wpe_seqpos for the one
+            // fixup that had to change to keep it bit-exact. (2) The whole greedy
+            // token stream matches single-sequence too. (3) vs the canonical GEMV
+            // decode (`generate`): same up to the GEMV-vs-GEMM reduction-order
+            // near-tie that `verify` already relaxes for kv8/int4.
+            println!("| mode | max|Δlogit| B=1 vs B={} | batch-invariant | vs single-seq decode |", prompts.len());
+            println!("|------|----------------------|-----------------|----------------------|");
+            for (mode, kv8) in [
+                (base, false),
+                (gpu::WeightMode::Int8, false),
+                (gpu::WeightMode::Int8, true),
+            ] {
+                let kv = if kv8 { "/kv8" } else { "" };
+                let mut single = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let want: Vec<Vec<u32>> = prompts
+                    .iter()
+                    .map(|p| single.generate(p, n_new, &mut sample::Sampler::greedy(), |_| {}))
+                    .collect();
+                drop(single);
+
+                let mut eng = gpu::Engine::new(&ctx, &model, mode, kv8);
+                let solo: Vec<Vec<u32>> = (0..prompts.len())
+                    .map(|s| eng.generate_batched(&prompts[s..=s], n_new).remove(0))
+                    .collect();
+                let batched = eng.generate_batched(&prompts, n_new);
+                // (1) first-step logits, each seq batched (B=n) vs alone (B=1).
+                let blog = eng.batched_first_logits(&prompts);
+                let slog: Vec<Vec<f32>> = (0..prompts.len())
+                    .map(|s| eng.batched_first_logits(&prompts[s..=s]).remove(0))
+                    .collect();
+                drop(eng);
+                let max_d = (0..prompts.len())
+                    .flat_map(|s| blog[s].iter().zip(&slog[s]).map(|(a, b)| (a - b).abs()))
+                    .fold(0.0f32, f32::max);
+
+                // (2) hard, all modes: batched greedy stream == single-sequence.
+                for s in 0..prompts.len() {
+                    assert_eq!(
+                        batched[s], solo[s],
+                        "{mode}{kv} seq {s}: batched (B={}) != alone (B=1) — not batch-invariant",
+                        prompts.len()
+                    );
+                }
+                // (3) vs canonical GEMV decode (`generate`): batched runs the
+                // gemm_rows tier, `generate` the decode GEMV — different kernels,
+                // different reduction orders. Exact for the float baseline; a
+                // greedy near-tie can flip under any quant (int8 weights or kv8),
+                // the same fragility `verify` already relaxes. Not a batch effect
+                // (checks 1-2 above are bit-exact), so this is only a note here.
+                let quant = !matches!(mode, gpu::WeightMode::Fp32 | gpu::WeightMode::Fp16);
+                let div: Vec<String> = (0..prompts.len())
+                    .filter(|&s| batched[s] != want[s])
+                    .map(|s| {
+                        let ml = batched[s].iter().zip(&want[s]).take_while(|(a, b)| a == b).count();
+                        format!("seq{s}@{ml}/{n_new}")
+                    })
+                    .collect();
+                let vs_single = if div.is_empty() {
+                    format!("== ({n_new} tok)")
+                } else {
+                    assert!(quant || kv8, "{mode}{kv}: batched diverges from GEMV decode on a non-fragile mode: {div:?}");
+                    format!("near-tie {}", div.join(","))
+                };
+                println!(
+                    "| {mode}{kv} | {max_d:.1e} {} | {} seqs x {n_new} | {vs_single} |",
+                    if max_d == 0.0 { "(==)" } else { "" },
+                    prompts.len(),
+                );
+                assert_eq!(max_d, 0.0, "{mode}{kv}: batched logits not bit-identical to single-seq (max={max_d:.3e})");
+            }
+
+            // throughput: decode tok/s vs batch size. One prompt replicated B
+            // times; the per-step weight read is shared, so tok/s should climb.
+            println!("\nthroughput ({base} weights, one prompt x B, {n_new} tokens each):");
+            println!("| batch | tokens/sec |");
+            println!("|-------|------------|");
+            let mut eng = gpu::Engine::new(&ctx, &model, base, false);
+            for &bsz in &[1usize, 2, 4, 8] {
+                let batch_prompts: Vec<Vec<u32>> = (0..bsz).map(|_| prompts[0].clone()).collect();
+                let _ = eng.generate_batched(&batch_prompts, n_new); // warmup
+                let t0 = Instant::now();
+                let _ = eng.generate_batched(&batch_prompts, n_new);
+                let dt = t0.elapsed().as_secs_f64();
+                println!("| {bsz} | {:.1} |", (bsz * n_new) as f64 / dt);
+            }
+        }
         _ => {
             eprintln!(
-                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix> [args]"
+                "usage: llm-engine <export|ppl-data|calib-data|gptq|generate|verify|bench|prefill-bench|ppl|prefix|batch> [args]"
             );
             std::process::exit(1);
         }
