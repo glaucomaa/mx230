@@ -374,6 +374,83 @@ Decode is one GEMV per weight matrix per token — pure memory streaming:
   The spec margins shrank as dp4a made plain decode faster — speculation
   pays in proportion to how expensive a forward pass is; on text with no
   repeats it falls back to one token per forward and costs nothing.
+- **Self-speculative early-exit decoding (`--self-spec`) — a documented
+  negative.** Prompt-lookup only fires on repetitive text. The open-generation
+  analogue is to draft with the *same* model's first `K` layers, then verify
+  with all `L` — zero extra VRAM (decisive at 2 GB), and lossless because the
+  full model still argmaxes every token. The raw early-exit logits are badly
+  calibrated (these models aren't LayerSkip-trained), so `calibrate-spec` fits a
+  closed-form linear **exit adapter** `A_K : h_K → ĥ_L` by ridge regression
+  (Gram/cross accumulated over the calibration corpus, solved with a hand-rolled
+  Cholesky), and the verify path **reuses the draft's layers-`0..K` KV** and runs
+  only layers `K..L`. The adapter is real — held-out top-1 agreement (the
+  per-position acceptance ceiling) climbs cleanly with depth:
+
+  | exit K / L | GPT-2 (L=12) | TinyLlama (L=22) |
+  |------------|--------------|------------------|
+  | K=2  | 25% | — |
+  | K=4  | 32% | 18% |
+  | K=6  | 37% | 22% |
+  | K=8  | 43% | — |
+  | K=10 | 64% | — |
+
+  But it does not pay off on this hardware, at any `K` — measured in the
+  quantized modes people actually run (`bench --self-spec`, 128 tokens):
+
+  | model | mode | greedy | self-spec (best) | result |
+  |------|------|--------|------------------|--------|
+  | GPT-2 | int8 | 267 tok/s | 102 tok/s (K=2, γ=2) | **0.38x** |
+  | TinyLlama-1.1B | int4 | 61.7 tok/s | 19.9 tok/s (K=6, γ=2) | **0.32x** |
+
+  The cause is not the draft — it is **verify**. The loop's wall-clock split
+  (GPT-2 int8, γ=2) is 3.0 ms in the drafter and **9.4 ms in verify** per round,
+  and verify is essentially *flat in γ* (9.39 ms at γ=2, 9.47 ms at γ=3): a
+  fixed ≈2.5 greedy-steps no matter how many tokens it checks. That fixed cost is
+  the engine's batched-prefill path (per-layer GEMM + activation quant +
+  prefill attention) carrying far more launch/overhead than the fused single-token
+  decode GEMV — at a batch of 2 it runs ~3x slower per layer than greedy decode.
+  So even a *free* draft would only reach `9.4 ms ÷ 1.3 accepted tokens ≈ 0.5x`,
+  and no cheaper-draft trick (smaller adapter, top-k draft head) can cross 1x.
+  Prompt-lookup wins on repetitive text precisely because ~100% acceptance
+  amortizes that same fixed verify over ~8 tokens; a linear self-draft's ~30%
+  acceptance accepts ~1.3, so the verify overhead dominates. Crossing 1x would
+  take a much higher-acceptance drafter (LayerSkip-trained, not a frozen linear
+  exit) **or** a small-batch verify path as cheap as the decode GEMV — both
+  larger than an adapter. It is lossless (`verify` asserts both KV-reuse and
+  full-recompute reproduce greedy exactly), so the cost is purely speed and the
+  default is off. (Mirrors the other honest negatives here: int2 collapse, fp16
+  math, the wide-tier int3 GEMV.)
+- **Fused small-batch verify — closing the GEMM half of the verify gap.** The
+  self-spec post-mortem above named two ways to make verify cheap; the drafter
+  is acceptance-capped, but the *other* lever — "a small-batch verify path as
+  cheap as the decode GEMV" — is reachable. The batched-prefill GEMM at M ≤ 8
+  ran **two** launches per matmul: a `quantize_act` pass writing the quantized
+  activations (+scales, +group sums) to global, then `gemm_rows` reading them
+  back. The decode GEMV never pays this — it quantizes the row *in-kernel*, in
+  shared memory, in one launch. So tier-0 (M ≤ 8) now does the same: a
+  `gemv_rows_*` kernel quantizes the M rows into shared and streams each weight
+  column once, skipping the separate pass and the activation round-trip. It is
+  templated on `MAXM ∈ {2,4,8}` so the per-row accumulator arrays don't spill at
+  the M=2–3 that verify actually uses, and it exists for every quantized weight
+  mode (int8/int4 + int4k/int3/int2 for parity). Because each kernel mirrors its
+  decode GEMV exactly, the result is **bit-identical to decode** — `verify`'s
+  batch==decode argmax assertion covers it directly, with no new tolerance.
+  Measured by A/B against the same code with the fused path off (`LLM_NO_FUSED=1`,
+  kept as a fallback lever), self-spec γ=2:
+
+  | model | mode | verify ms/round | layer-GEMM | lm_head | self-spec tok/s |
+  |-------|------|-----------------|-----------|---------|-----------------|
+  | GPT-2 | int8 | 9.28 → **6.61** (−29%) | 6.00 → 4.49 | 2.28 → 1.14 | 102 → **131** (1.28x) |
+  | GPT-2 | int4 | 9.88 → **5.56** (−44%) | 6.06 → 3.74 | 2.81 → 0.84 | 125 → **197** (1.57x) |
+  | TinyLlama-1.1B | int4 | 48.55 → **29.82** (−39%) | 42.16 → 25.18 | — | 19.8 → **28.3** (1.43x) |
+
+  The lm_head GEMM gains most (−50% to −70%): it is a single big matmul
+  (N = vocab), so eliminating its separate quant launch + round-trip is almost
+  pure win. This pulls verify from ~2.5–3 decode-steps toward ~2; it does not by
+  itself make self-spec cross 1x (that still needs the high-acceptance drafter),
+  but it is a flat win for every batched-prefill consumer — **prompt-lookup spec**
+  (high acceptance amortizes a now-cheaper verify) and **continuous batching** at
+  small B, where `forward_batched` runs the very same tier-0 GEMM.
 - **int8 weights were instruction-bound until the math went integer.** The
   story has three chapters. The first int8 GEMV issued one byte load +
   convert + FMA per weight — the same instruction count as fp32 for a

@@ -2066,6 +2066,406 @@ extern "C" __global__ void gemm_rows_int8(float *C, const int *Aq, const float *
     }
 }
 
+// Fused small-batch int8 GEMM via dp4a, modeled on gemv_int8: the M activation
+// rows are quantized in shared memory (no separate quantize_act pass, no Aq
+// round-trip), then each thread streams its weight column ONCE, accumulating all
+// M outputs — bandwidth-bound like the decode GEMV instead of the K-tiled
+// gemm_rows. Templated on MAXM so the accumulator arrays size to the actual row
+// count (size-8 arrays at M=2 spill registers and wreck occupancy). The caller
+// guarantees the shared budget (M*K + 4*M*K/AG bytes) fits.
+template <int MAXM>
+__device__ __forceinline__ void gemv_rows_int8_body(float *C, const float *A,
+                                                    const signed char *w,
+                                                    const float *scales, const float *bias,
+                                                    int M, int N, int K) {
+    extern __shared__ char smem_raw[];
+    int n_groups = K / AG;
+    int nq = K / 4;                                       // dp4a words per row
+    int *xq = (int *)smem_raw;                            // M*nq ints
+    float *xs = (float *)(smem_raw + (size_t)M * nq * 4); // M*n_groups floats
+    for (int idx = threadIdx.x; idx < M * n_groups; idx += blockDim.x) {
+        int m = idx / n_groups, g = idx % n_groups;
+        const float *xg = A + (size_t)m * K + g * AG;
+        float amax = 0.0f;
+        for (int j = 0; j < AG; ++j) amax = fmaxf(amax, fabsf(xg[j]));
+        float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (int q = 0; q < AG / 4; ++q) {
+            int packed = 0;
+            for (int j = 0; j < 4; ++j) {
+                int v = max(-127, min(127, __float2int_rn(xg[4 * q + j] * id)));
+                packed |= (v & 0xFF) << (8 * j);
+            }
+            xq[(size_t)m * nq + (AG / 4) * g + q] = packed;
+        }
+        xs[(size_t)m * n_groups + g] = amax > 0.0f ? amax / 127.0f : 1.0f;
+    }
+    __syncthreads();
+
+    const int *w32 = (const int *)w;
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < N;
+         o += gridDim.x * blockDim.x) {
+        float acc[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+        for (int g = 0; g < n_groups; ++g) {
+            int ig[MAXM];
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m) ig[m] = 0;
+            for (int q = 0; q < AG / 4; ++q) {
+                int wv = w32[(size_t)((AG / 4) * g + q) * N + o];
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m)
+                    if (m < M)
+                        ig[m] = __dp4a(xq[(size_t)m * nq + (AG / 4) * g + q], wv, ig[m]);
+            }
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m)
+                if (m < M)
+                    acc[m] += (float)ig[m] * xs[(size_t)m * n_groups + g];
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m)
+            if (m < M) {
+                float r = acc[m] * scales[o] + (bias ? bias[o] : 0.0f);
+                C[(size_t)m * N + o] = r;
+            }
+    }
+}
+
+extern "C" __global__ void gemv_rows_int8_m2(float *C, const float *A, const signed char *w,
+                                             const float *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int8_body<2>(C, A, w, scales, bias, M, N, K);
+}
+extern "C" __global__ void gemv_rows_int8_m4(float *C, const float *A, const signed char *w,
+                                             const float *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int8_body<4>(C, A, w, scales, bias, M, N, K);
+}
+extern "C" __global__ void gemv_rows_int8_m8(float *C, const float *A, const signed char *w,
+                                             const float *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int8_body<8>(C, A, w, scales, bias, M, N, K);
+}
+
+// Fused tier-0 int4 GEMM: the row-wise twin of gemv_int4. The M activation rows
+// are quantized in shared memory (per-4-element dp4a words + group sums for the
+// zero-point correction), then each thread streams its int4 weight column once,
+// unpacking nibbles with q4_lo8/q4_hi8. No separate quantize_act launch, no Aq
+// round-trip, and bit-identical to the decode GEMV (same reduction order).
+// Shared budget M*(3*nq + nw)*4 bytes (nq=K/4, nw=K/Q4_GROUP); caller checks it.
+template <int MAXM>
+__device__ __forceinline__ void gemv_rows_int4_body(float *C, const float *A,
+                                                    const unsigned char *w,
+                                                    const __half *scales, const float *bias,
+                                                    int M, int N, int K) {
+    extern __shared__ char smem_raw[];
+    int nq = K / 4;          // activation dp4a words per row
+    int nw = K / Q4_GROUP;   // 32-row weight groups per row
+    int *xq = (int *)smem_raw;                     // M*nq ints
+    float *xs = (float *)(xq + (size_t)M * nq);    // M*nq scales
+    int *xsum = (int *)(xs + (size_t)M * nq);      // M*nq group sums
+    float *s32 = (float *)(xsum + (size_t)M * nq); // M*nw correction sums
+    for (int idx = threadIdx.x; idx < M * nq; idx += blockDim.x) {
+        int m = idx / nq, g = idx % nq;
+        const float *xg = A + (size_t)m * K + g * 4;
+        float amax = 0.0f;
+        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(xg[j]));
+        float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int packed = 0, sum = 0;
+        for (int j = 0; j < 4; ++j) {
+            int v = max(-127, min(127, __float2int_rn(xg[j] * id)));
+            sum += v;
+            packed |= (v & 0xFF) << (8 * j);
+        }
+        xq[(size_t)m * nq + g] = packed;
+        xs[(size_t)m * nq + g] = amax > 0.0f ? amax / 127.0f : 1.0f;
+        xsum[(size_t)m * nq + g] = sum;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < M * nw; idx += blockDim.x) {
+        int m = idx / nw, wg = idx % nw;
+        float s = 0.0f;
+        for (int g = 8 * wg; g < 8 * wg + 8; ++g)
+            s += xs[(size_t)m * nq + g] * (float)xsum[(size_t)m * nq + g];
+        s32[(size_t)m * nw + wg] = s;
+    }
+    __syncthreads();
+
+    const int *w32 = (const int *)w;
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < N;
+         o += gridDim.x * blockDim.x) {
+        float acc[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+        for (int wg = 0; wg < nw; ++wg) {
+            float inner[MAXM];
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m) inner[m] = 0.0f;
+            for (int r = 0; r < 4; ++r) { // packed word = 8 rows of column o
+                int wr = wg * 4 + r;
+                int wv = w32[(size_t)wr * N + o];
+                int lo = q4_lo8(wv), hi = q4_hi8(wv);
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m)
+                    if (m < M) {
+                        const int *xqm = xq + (size_t)m * nq;
+                        const float *xsm = xs + (size_t)m * nq;
+                        inner[m] += xsm[2 * wr] * (float)__dp4a(lo, xqm[2 * wr], 0) +
+                                    xsm[2 * wr + 1] * (float)__dp4a(hi, xqm[2 * wr + 1], 0);
+                    }
+            }
+            float sc = __half2float(scales[(size_t)wg * N + o]);
+#pragma unroll
+            for (int m = 0; m < MAXM; ++m)
+                if (m < M)
+                    acc[m] += (inner[m] - 8.0f * s32[(size_t)m * nw + wg]) * sc;
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m)
+            if (m < M) {
+                float r = acc[m] + (bias ? bias[o] : 0.0f);
+                C[(size_t)m * N + o] = r;
+            }
+    }
+}
+
+extern "C" __global__ void gemv_rows_int4_m2(float *C, const float *A, const unsigned char *w,
+                                             const __half *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int4_body<2>(C, A, w, scales, bias, M, N, K);
+}
+extern "C" __global__ void gemv_rows_int4_m4(float *C, const float *A, const unsigned char *w,
+                                             const __half *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int4_body<4>(C, A, w, scales, bias, M, N, K);
+}
+extern "C" __global__ void gemv_rows_int4_m8(float *C, const float *A, const unsigned char *w,
+                                             const __half *scales, const float *bias,
+                                             int M, int N, int K) {
+    gemv_rows_int4_body<8>(C, A, w, scales, bias, M, N, K);
+}
+
+// Shared staging for the fused k-quant row GEMMs (int4k/int3/int2): quantize the
+// M activation rows into shared (per-4-element dp4a words + the 16-row sub-block
+// sums s16 that fold the two-level -m term). Identical to the decode GEMVs'
+// prologue; only the weight unpack in the output loop differs per mode.
+__device__ __forceinline__ void stage_kquant_rows(const float *A, int M, int K,
+                                                  int *xq, float *xs, int *xsum, float *s16) {
+    int nq = K / 4, ns = K / 16;
+    for (int idx = threadIdx.x; idx < M * nq; idx += blockDim.x) {
+        int m = idx / nq, g = idx % nq;
+        const float *xg = A + (size_t)m * K + g * 4;
+        float amax = 0.0f;
+        for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(xg[j]));
+        float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int packed = 0, sum = 0;
+        for (int j = 0; j < 4; ++j) {
+            int v = max(-127, min(127, __float2int_rn(xg[j] * id)));
+            sum += v;
+            packed |= (v & 0xFF) << (8 * j);
+        }
+        xq[(size_t)m * nq + g] = packed;
+        xs[(size_t)m * nq + g] = amax > 0.0f ? amax / 127.0f : 1.0f;
+        xsum[(size_t)m * nq + g] = sum;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < M * ns; idx += blockDim.x) {
+        int m = idx / ns, wr = idx % ns;
+        float s = 0.0f;
+        for (int g = 4 * wr; g < 4 * wr + 4; ++g)
+            s += xs[(size_t)m * nq + g] * (float)xsum[(size_t)m * nq + g];
+        s16[(size_t)m * ns + wr] = s;
+    }
+    __syncthreads();
+}
+
+// Fused tier-0 int4k GEMM: row-wise twin of gemv_int4k (two-level k-quant
+// scales, 16-row sub-blocks). Shared = M*(3*nq + ns)*4 (nq=K/4, ns=K/16).
+template <int MAXM>
+__device__ __forceinline__ void gemv_rows_int4k_body(float *C, const float *A,
+                                                     const unsigned char *w,
+                                                     const unsigned char *sub, const __half2 *dm,
+                                                     const float *bias, int M, int N, int K) {
+    extern __shared__ char smem_raw[];
+    int nq = K / 4, ns = K / 16;
+    int *xq = (int *)smem_raw;
+    float *xs = (float *)(xq + (size_t)M * nq);
+    int *xsum = (int *)(xs + (size_t)M * nq);
+    float *s16 = (float *)(xsum + (size_t)M * nq);
+    stage_kquant_rows(A, M, K, xq, xs, xsum, s16);
+
+    const int *w32 = (const int *)w;
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < N;
+         o += gridDim.x * blockDim.x) {
+        float acc[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+        for (int s = 0; s < K / 128; ++s) {
+            float2 dmv = __half22float2(dm[(size_t)s * N + o]);
+            for (int sb = 0; sb < 8; ++sb) {
+                int wri = 8 * s + sb;
+                float inner[MAXM];
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m) inner[m] = 0.0f;
+                for (int pw = 0; pw < 2; ++pw) { // packed word = 8 rows
+                    int wr = 2 * wri + pw;
+                    int wv = w32[(size_t)wr * N + o];
+                    int lo = q4_lo8(wv), hi = q4_hi8(wv);
+#pragma unroll
+                    for (int m = 0; m < MAXM; ++m)
+                        if (m < M) {
+                            const int *xqm = xq + (size_t)m * nq;
+                            const float *xsm = xs + (size_t)m * nq;
+                            inner[m] += xsm[2 * wr] * (float)__dp4a(lo, xqm[2 * wr], 0) +
+                                        xsm[2 * wr + 1] * (float)__dp4a(hi, xqm[2 * wr + 1], 0);
+                        }
+                }
+                unsigned char sbq = sub[(size_t)wri * N + o];
+                float sd = (float)(sbq & 15), sm = (float)(sbq >> 4);
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m)
+                    if (m < M)
+                        acc[m] += dmv.x * sd * inner[m] - dmv.y * sm * s16[(size_t)m * ns + wri];
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m)
+            if (m < M) C[(size_t)m * N + o] = acc[m] + (bias ? bias[o] : 0.0f);
+    }
+}
+
+// Fused tier-0 int2 GEMM: row-wise twin of gemv_int2 (16 rows per packed word,
+// 4 bit-plane dp4a words each).
+template <int MAXM>
+__device__ __forceinline__ void gemv_rows_int2_body(float *C, const float *A,
+                                                    const unsigned char *w,
+                                                    const unsigned char *sub, const __half2 *dm,
+                                                    const float *bias, int M, int N, int K) {
+    extern __shared__ char smem_raw[];
+    int nq = K / 4, ns = K / 16;
+    int *xq = (int *)smem_raw;
+    float *xs = (float *)(xq + (size_t)M * nq);
+    int *xsum = (int *)(xs + (size_t)M * nq);
+    float *s16 = (float *)(xsum + (size_t)M * nq);
+    stage_kquant_rows(A, M, K, xq, xs, xsum, s16);
+
+    const int *w32 = (const int *)w;
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < N;
+         o += gridDim.x * blockDim.x) {
+        float acc[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+        for (int s = 0; s < K / 128; ++s) {
+            float2 dmv = __half22float2(dm[(size_t)s * N + o]);
+            for (int r = 0; r < 8; ++r) { // packed word = 16 rows
+                int wr = 8 * s + r;
+                int wv = w32[(size_t)wr * N + o];
+                float inner[MAXM];
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m) inner[m] = 0.0f;
+                for (int p = 0; p < 4; ++p) {
+                    int plane = q2_plane(wv, p);
+#pragma unroll
+                    for (int m = 0; m < MAXM; ++m)
+                        if (m < M)
+                            inner[m] += xs[(size_t)m * nq + 4 * wr + p] *
+                                        (float)__dp4a(plane, xq[(size_t)m * nq + 4 * wr + p], 0);
+                }
+                unsigned char sbq = sub[(size_t)wr * N + o];
+                float sd = (float)(sbq & 15), sm = (float)(sbq >> 4);
+#pragma unroll
+                for (int m = 0; m < MAXM; ++m)
+                    if (m < M)
+                        acc[m] += dmv.x * sd * inner[m] - dmv.y * sm * s16[(size_t)m * ns + wr];
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m)
+            if (m < M) C[(size_t)m * N + o] = acc[m] + (bias ? bias[o] : 0.0f);
+    }
+}
+
+// Fused tier-0 int3 GEMM: row-wise twin of gemv_int3 (32-row group = 3 words;
+// q3_plane splices the two lo words with the hi bit word).
+template <int MAXM>
+__device__ __forceinline__ void gemv_rows_int3_body(float *C, const float *A,
+                                                    const unsigned char *w,
+                                                    const unsigned char *sub, const __half2 *dm,
+                                                    const float *bias, int M, int N, int K) {
+    extern __shared__ char smem_raw[];
+    int nq = K / 4, ns = K / 16;
+    int *xq = (int *)smem_raw;
+    float *xs = (float *)(xq + (size_t)M * nq);
+    int *xsum = (int *)(xs + (size_t)M * nq);
+    float *s16 = (float *)(xsum + (size_t)M * nq);
+    stage_kquant_rows(A, M, K, xq, xs, xsum, s16);
+
+    const int *w32 = (const int *)w;
+    for (int o = blockIdx.x * blockDim.x + threadIdx.x; o < N;
+         o += gridDim.x * blockDim.x) {
+        float acc[MAXM];
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) acc[m] = 0.0f;
+        for (int s = 0; s < K / 128; ++s) {
+            float2 dmv = __half22float2(dm[(size_t)s * N + o]);
+            for (int g = 0; g < 4; ++g) {
+                int wg = 4 * s + g;
+                int lo[2] = {w32[(size_t)(wg * 3 + 0) * N + o],
+                             w32[(size_t)(wg * 3 + 1) * N + o]};
+                int hi = w32[(size_t)(wg * 3 + 2) * N + o];
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    float inner[MAXM];
+#pragma unroll
+                    for (int m = 0; m < MAXM; ++m) inner[m] = 0.0f;
+                    for (int p = 0; p < 4; ++p) {
+                        int gq = 8 * wg + 4 * r + p;
+                        int plane = q3_plane(lo[r], hi, r, p);
+#pragma unroll
+                        for (int m = 0; m < MAXM; ++m)
+                            if (m < M)
+                                inner[m] += xs[(size_t)m * nq + gq] *
+                                            (float)__dp4a(plane, xq[(size_t)m * nq + gq], 0);
+                    }
+                    int wr = 2 * wg + r;
+                    unsigned char sbq = sub[(size_t)wr * N + o];
+                    float sd = (float)(sbq & 15), sm = (float)(sbq >> 4);
+#pragma unroll
+                    for (int m = 0; m < MAXM; ++m)
+                        if (m < M)
+                            acc[m] +=
+                                dmv.x * sd * inner[m] - dmv.y * sm * s16[(size_t)m * ns + wr];
+                }
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m)
+            if (m < M) C[(size_t)m * N + o] = acc[m] + (bias ? bias[o] : 0.0f);
+    }
+}
+
+#define KQUANT_ROWS_WRAPPERS(NAME)                                                             \
+    extern "C" __global__ void gemv_rows_##NAME##_m2(                                           \
+        float *C, const float *A, const unsigned char *w, const unsigned char *sub,            \
+        const __half2 *dm, const float *bias, int M, int N, int K) {                           \
+        gemv_rows_##NAME##_body<2>(C, A, w, sub, dm, bias, M, N, K);                            \
+    }                                                                                          \
+    extern "C" __global__ void gemv_rows_##NAME##_m4(                                           \
+        float *C, const float *A, const unsigned char *w, const unsigned char *sub,            \
+        const __half2 *dm, const float *bias, int M, int N, int K) {                           \
+        gemv_rows_##NAME##_body<4>(C, A, w, sub, dm, bias, M, N, K);                            \
+    }                                                                                          \
+    extern "C" __global__ void gemv_rows_##NAME##_m8(                                           \
+        float *C, const float *A, const unsigned char *w, const unsigned char *sub,            \
+        const __half2 *dm, const float *bias, int M, int N, int K) {                           \
+        gemv_rows_##NAME##_body<8>(C, A, w, sub, dm, bias, M, N, K);                            \
+    }
+KQUANT_ROWS_WRAPPERS(int4k)
+KQUANT_ROWS_WRAPPERS(int2)
+KQUANT_ROWS_WRAPPERS(int3)
+#undef KQUANT_ROWS_WRAPPERS
+
 // int4 GEMM via dp4a: same shape as gemm_i8_body (A pre-quantized by
 // quantize_act), but the B tile unpacks packed nibble words into unsigned
 // dp4a planes during the shared-tile fill (q4_lo8/q4_hi8 — no bias subtract).

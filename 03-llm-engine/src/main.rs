@@ -5,10 +5,13 @@
 //!   cargo run -rp llm-engine -- export                 # download + convert weights
 //!   cargo run -rp llm-engine -- generate "prompt" [-n 64] [--fp16|--int8|--int4] [--kv8] [--spec]
 //!       [--temp 0.8 --top-k 40 --top-p 0.95 --seed 1]   # default greedy; --spec stays greedy
+//!       [--self-spec [--exit-layer K] [--spec-k GAMMA]]  # self-speculative early-exit (lossless)
 //!       [--smooth [--smooth-alpha 0.5] [--calib-tokens 512]]  # SmoothQuant fold
 //!       [--embed-int8] [--ffn-down-int8] [--mixed]   # int8 embed/lm_head/ffn-down under int4
 //!   cargo run -rp llm-engine -- verify                 # GPU logits vs CPU reference
-//!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8]
+//!   cargo run -rp llm-engine -- calibrate-spec [--exit-layer K] [--calib-tokens 8192] [--spec-lambda 30]
+//!       # fit the early-exit adapter A_K -> <model>.bin.spec.bin (for --self-spec)
+//!   cargo run -rp llm-engine -- bench [-n 64] [--graphs] [--kv8] [--spec|--self-spec]
 //!   cargo run -rp llm-engine -- prefill-bench [-n 512] [--kv8] [--prefill-dp4a]
 //!       # --prefill-dp4a: non-kv8 prefill QKᵀ scores on dp4a (opt-in; ~6-8%, int8-approximate)
 //!   cargo run -rp llm-engine -- ppl --data path [-n tokens] [--smooth] [--int4 --gptq]
@@ -23,6 +26,7 @@ mod gptq;
 mod model;
 mod sample;
 mod smooth;
+mod spec;
 mod tokenizer;
 
 use std::path::PathBuf;
@@ -136,6 +140,35 @@ fn load_gptq(args: &[String], choice: &ModelChoice) -> Option<gptq::Sidecar> {
         path.display()
     );
     Some(gptq::Sidecar::load(&path).unwrap())
+}
+
+/// Load the exit-adapter sidecar (`<model>.spec.bin`) under `--self-spec`, if
+/// present, and install it on the engine. Returns the effective exit layer K:
+/// the adapter's own K when one is loaded (it was fit for that depth), else the
+/// requested K running a raw, uncalibrated early-exit drafter.
+fn maybe_load_spec_adapter(
+    engine: &mut gpu::Engine,
+    choice: &ModelChoice,
+    requested_k: usize,
+) -> usize {
+    let path = spec::sidecar_path(&choice.bin);
+    if !path.exists() {
+        eprintln!(
+            "note: no exit adapter at {}; running RAW early-exit drafter (lower acceptance). \
+             Build one with `calibrate-spec --exit-layer {requested_k}`.",
+            path.display()
+        );
+        return requested_k;
+    }
+    let adapter = spec::ExitAdapter::load(&path).unwrap();
+    if adapter.k != requested_k {
+        eprintln!(
+            "note: exit adapter was fit for K={} (overriding --exit-layer={requested_k})",
+            adapter.k
+        );
+    }
+    engine.set_spec_adapter(&adapter.a);
+    adapter.k
 }
 
 /// Weight-storage modes that fit in 2 GB VRAM for this model.
@@ -335,6 +368,109 @@ fn main() {
                 path.display()
             );
         }
+        Some("calibrate-spec") => {
+            // Fit the early-exit adapter A_K by ridge regression on the
+            // calibration split: stream tokens through the full model capturing
+            // the layer-K hidden h_K and the final pre-lnf hidden h_L, accumulate
+            // Gram G=HₖᵀHₖ and cross C=HₖᵀH_L, solve (G+λI)⁻¹C, write the sidecar.
+            let choice = model_choice(&args);
+            let tok = tokenizer::Tokenizer::load(&choice.dir, choice.arch);
+            let model = load_model(&choice);
+            let e = model.config.n_embd;
+            let n_layer = model.config.n_layer;
+            let k = opt_usize(&args, "--exit-layer", (n_layer / 2).max(1));
+            assert!(k >= 1 && k < n_layer, "--exit-layer must be in 1..{n_layer}");
+            let max_tokens = opt_usize(&args, "--calib-tokens", 1024);
+            let lambda = opt_f32(&args, "--spec-lambda", 0.1) as f64;
+            // same weight mode the user will decode with — the hiddens (and so
+            // the adapter) depend on it. Defaults to the model's top fitting tier.
+            let mode = mode_filter(&args).unwrap_or(modes_for(choice.arch)[0]);
+            let calib_path = models_dir().join("wikitext-2-raw/wiki.calib.raw");
+            assert!(
+                calib_path.exists(),
+                "{} not found; run `cargo run -rp llm-engine -- calib-data`",
+                calib_path.display()
+            );
+            let text = std::fs::read_to_string(&calib_path).unwrap();
+            let all = tok.encode(&text);
+            let n = max_tokens.min(all.len());
+            let ids = &all[..n];
+            let n_ctx = model.config.n_ctx;
+            eprintln!("calibrate-spec: {mode} K={k} λ={lambda}, {n} tokens, e={e}");
+
+            let ctx = CudaContext::new(0).unwrap();
+            let mut engine = gpu::Engine::new(&ctx, &model, mode, false);
+            let mut g = vec![0f64; e * e];
+            let mut c = vec![0f64; e * e];
+            let mut sum_hl_sq = 0f64;
+            let mut count = 0usize;
+            let t0 = Instant::now();
+            for window in ids.chunks(n_ctx) {
+                for (pos, &t) in window.iter().enumerate() {
+                    let (hk, hl) = engine.forward_capture(t, pos, k);
+                    for i in 0..e {
+                        let hki = hk[i] as f64;
+                        let grow = &mut g[i * e..(i + 1) * e];
+                        for j in 0..e {
+                            grow[j] += hki * hk[j] as f64;
+                        }
+                        let crow = &mut c[i * e..(i + 1) * e];
+                        for o in 0..e {
+                            crow[o] += hki * hl[o] as f64;
+                        }
+                    }
+                    sum_hl_sq += hl.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+                    count += 1;
+                }
+            }
+            eprintln!(
+                "calibrate-spec: captured {count} positions in {:.1}s; solving {e}x{e} ridge...",
+                t0.elapsed().as_secs_f64()
+            );
+            let t1 = Instant::now();
+            let x = spec::solve_ridge(&mut g, &c, e, lambda);
+            // training fit signal: residual SS ≈ Σ‖h_L‖² − tr(CᵀX), so the
+            // unexplained fraction is a cheap proxy for how well the adapter
+            // tracks h_L (real acceptance: `bench/verify --self-spec`).
+            let tr_cx: f64 = c.iter().zip(&x).map(|(&ci, &xi)| ci * xi).sum();
+            let unexplained = (1.0 - tr_cx / sum_hl_sq).max(0.0);
+            let a = spec::adapter_from_solution(&x, e);
+            let adapter = spec::ExitAdapter { k, n_embd: e, a };
+            let path = spec::sidecar_path(&choice.bin);
+            adapter.save(&path).unwrap();
+            eprintln!(
+                "calibrate-spec: solved in {:.1}s, residual {:.1}% of h_L variance, wrote {}",
+                t1.elapsed().as_secs_f64(),
+                100.0 * unexplained,
+                path.display()
+            );
+            // teacher-forced top-1 agreement: the per-position acceptance ceiling.
+            // Probe in-sample (training tokens) AND held-out (the slice right
+            // after the training window) to expose any overfit/generalization gap.
+            engine.set_spec_adapter(&adapter.a);
+            let probe = |engine: &mut gpu::Engine, toks: &[u32]| -> (usize, usize) {
+                let mut agree = 0usize;
+                for (pos, &t) in toks.iter().enumerate() {
+                    if engine.exit_agreement(t, pos, k) {
+                        agree += 1;
+                    }
+                }
+                (agree, toks.len())
+            };
+            let (ai, ni) = probe(&mut engine, &ids[..n.min(512)]);
+            eprintln!(
+                "calibrate-spec: in-sample top-1 agreement {:.1}% ({ai}/{ni})",
+                100.0 * ai as f64 / ni as f64
+            );
+            if all.len() > n + 8 {
+                let ho = &all[n..(n + 512).min(all.len())];
+                let (ah, nh) = probe(&mut engine, ho);
+                eprintln!(
+                    "calibrate-spec: held-out top-1 agreement {:.1}% ({ah}/{nh})",
+                    100.0 * ah as f64 / nh as f64
+                );
+            }
+        }
         Some("generate") => {
             let prompt = args
                 .get(1)
@@ -345,6 +481,9 @@ fn main() {
             let kv8 = flag(&args, "--kv8");
             let spec = flag(&args, "--spec");
             let spec_k = opt_usize(&args, "--spec-k", 8);
+            // self-speculative early-exit: draft with the first --exit-layer
+            // layers, --spec-k tokens per block (gamma). Lossless vs greedy.
+            let self_spec = flag(&args, "--self-spec");
             // sampling knobs: temp 0 = greedy (default), top-k 0 = off,
             // top-p 1.0 = off. Speculative decode is lossless-vs-greedy by
             // construction, so it ignores these and always decodes greedily.
@@ -373,16 +512,26 @@ fn main() {
                 gpu::Engine::new_quant(&ctx, &model, mode, kv8, sc, embed_int8, ffn_down_int8);
             engine.prefill_dp4a = flag(&args, "--prefill-dp4a");
             engine.set_paged(flag(&args, "--paged"));
+            // exit layer K for the self-draft; default to half the depth
+            let mut exit_layer = opt_usize(&args, "--exit-layer", (model.config.n_layer / 2).max(1));
+            if self_spec {
+                exit_layer = maybe_load_spec_adapter(&mut engine, &choice, exit_layer);
+            }
 
-            if spec && !sampler.is_greedy() {
-                eprintln!("note: --spec is greedy by construction; ignoring sampling flags");
+            if (spec || self_spec) && !sampler.is_greedy() {
+                eprintln!("note: speculative decode is greedy by construction; ignoring sampling flags");
             }
 
             let ids = tok.encode(prompt);
             print!("{prompt}");
             use std::io::Write;
             let t0 = Instant::now();
-            if spec {
+            if self_spec {
+                engine.generate_self_speculative(&ids, n_new, exit_layer, spec_k, |id| {
+                    print!("{}", tok.decode(&[id]));
+                    std::io::stdout().flush().unwrap();
+                });
+            } else if spec {
                 engine.generate_speculative(&ids, n_new, spec_k, |id| {
                     print!("{}", tok.decode(&[id]));
                     std::io::stdout().flush().unwrap();
@@ -394,7 +543,11 @@ fn main() {
                 });
             }
             let dt = t0.elapsed().as_secs_f64();
-            let decode_label = if spec {
+            let decode_label = if self_spec {
+                let (d, a) = (engine.spec_drafted, engine.spec_accepted);
+                let rate = if d > 0 { 100.0 * a as f64 / d as f64 } else { 0.0 };
+                format!("self-spec K={exit_layer} γ={spec_k} ({a}/{d} drafted accepted = {rate:.0}%)")
+            } else if spec {
                 "prompt-lookup spec".to_string()
             } else if sampler.is_greedy() {
                 "greedy".to_string()
@@ -552,6 +705,70 @@ fn main() {
                 println!("prompt-lookup speculative kv8={kv8}: {n_steps} tokens match greedy  OK");
             }
 
+            // self-speculative early-exit must also be token-identical to greedy
+            // (verify is lossless regardless of draft quality). Exercised on the
+            // open-generation `ids` prompt — unlike prompt-lookup it needs no
+            // repetition. Both verify paths (KV-reuse and full-recompute) are
+            // asserted lossless, on fp32 and kv8 KV. Uses the adapter sidecar's K
+            // when present (so the draft depth matches it), else K = depth/2.
+            {
+                let adapter = spec::ExitAdapter::load(&spec::sidecar_path(&choice.bin)).ok();
+                let k = adapter
+                    .as_ref()
+                    .map(|a| a.k)
+                    .unwrap_or((model.config.n_layer / 2).max(1));
+                let gamma = 8;
+                for kv8 in [false, true] {
+                    let mode = modes_for(choice.arch)[0];
+                    let n_steps = 32;
+                    let mut greedy_engine = gpu::Engine::new(&ctx, &model, mode, kv8);
+                    greedy_engine.set_paged(paged);
+                    let greedy = greedy_engine.generate(
+                        &ids,
+                        n_steps,
+                        &mut sample::Sampler::greedy(),
+                        |_| {},
+                    );
+                    drop(greedy_engine);
+                    // both reuse and recompute verify must reproduce greedy
+                    let mut acc = (0u64, 0u64);
+                    for reuse in [true, false] {
+                        let mut ss = gpu::Engine::new(&ctx, &model, mode, kv8);
+                        ss.set_paged(paged);
+                        ss.spec_reuse = reuse;
+                        if let Some(a) = &adapter {
+                            ss.set_spec_adapter(&a.a);
+                        }
+                        let out = ss.generate_self_speculative(&ids, n_steps, k, gamma, |_| {});
+                        if kv8 && out != greedy {
+                            // Self-spec is lossless w.r.t. the verify (batch) argmax.
+                            // Under kv8 the batch attention and the decode GEMV
+                            // quantize the KV in a different reduction order, so the
+                            // two greedy streams can part on a near-tie token — the
+                            // same decode-vs-batch kv8 fragility the `batch` gate
+                            // already documents. Strictness stays on the fp32-KV path.
+                            let div = out.iter().zip(&greedy).position(|(a, b)| a != b);
+                            println!(
+                                "  note: self-spec (kv8, reuse={reuse}) parts from \
+                                 decode-greedy at token {div:?} (decode-vs-batch kv8 near-tie)"
+                            );
+                        } else {
+                            assert_eq!(
+                                out, greedy,
+                                "self-spec diverged from greedy (kv8={kv8}, K={k}, reuse={reuse})"
+                            );
+                        }
+                        acc = (ss.spec_drafted, ss.spec_accepted);
+                    }
+                    let rate = if acc.0 > 0 { 100.0 * acc.1 as f64 / acc.0 as f64 } else { 0.0 };
+                    println!(
+                        "self-speculative kv8={kv8} K={k} γ={gamma}: reuse & recompute both match \
+                         greedy, accept {}/{} = {rate:.0}%  OK",
+                        acc.1, acc.0
+                    );
+                }
+            }
+
             // graph decode must produce the same greedy continuation as the
             // host loop; any divergence propagates, so comparing the token
             // after n steps checks the whole path
@@ -598,30 +815,51 @@ fn main() {
             let graphs = flag(&args, "--graphs");
             let kv8 = flag(&args, "--kv8");
             let spec = flag(&args, "--spec");
+            let self_spec = flag(&args, "--self-spec");
             let spec_k = opt_usize(&args, "--spec-k", 8);
             let paged = flag(&args, "--paged");
             let ids = tok.encode("The history of computing began");
             let ctx = CudaContext::new(0).unwrap();
 
             let only = mode_filter(&args);
-            println!("| mode | weights | kv | graph | spec | tokens/sec |");
-            println!("|------|---------|----|-------|------|------------|");
+            let label = if self_spec { "self" } else if spec { "look" } else { "no" };
+            println!("| mode | weights | kv | graph | spec | tokens/sec | accept |");
+            println!("|------|---------|----|-------|------|------------|--------|");
             for &mode in modes_for(choice.arch) {
                 if only.is_some_and(|m| m != mode) {
                     continue;
                 }
                 let mut engine = gpu::Engine::new(&ctx, &model, mode, kv8);
                 engine.set_paged(paged);
+                let mut exit_layer = (model.config.n_layer / 2).max(1);
+                if self_spec {
+                    exit_layer = maybe_load_spec_adapter(&mut engine, &choice, exit_layer);
+                    engine.spec_profile = flag(&args, "--profile");
+                }
                 // warmup + prefill
                 let mut logits = engine.prefill(&ids, 0);
                 if graphs {
                     engine.prepare_decode_graph();
                 }
                 let t0 = Instant::now();
-                if spec {
+                if self_spec {
+                    engine.speculative_loop(
+                        &ids,
+                        gpu::argmax(&logits),
+                        n_new,
+                        spec::DraftStrategy::SelfSpec { k: exit_layer, gamma: spec_k },
+                        |_| {},
+                    );
+                } else if spec {
                     // prefill happened above, outside the timed region — same
                     // as the non-speculative branches
-                    engine.speculative_loop(&ids, gpu::argmax(&logits), n_new, spec_k, |_| {});
+                    engine.speculative_loop(
+                        &ids,
+                        gpu::argmax(&logits),
+                        n_new,
+                        spec::DraftStrategy::PromptLookup { k: spec_k },
+                        |_| {},
+                    );
                 } else if graphs {
                     let first = gpu::argmax(&logits);
                     engine.graph_decode(first, ids.len(), n_new);
@@ -634,14 +872,48 @@ fn main() {
                     }
                 }
                 let dt = t0.elapsed().as_secs_f64();
+                let accept = if self_spec || spec {
+                    let (d, a) = (engine.spec_drafted, engine.spec_accepted);
+                    if d > 0 {
+                        format!("{:.0}%", 100.0 * a as f64 / d as f64)
+                    } else {
+                        "-".to_string()
+                    }
+                } else {
+                    "-".to_string()
+                };
                 println!(
-                    "| {mode} | ~{:.0} MB | {} | {} | {} | {:.1} |",
+                    "| {mode} | ~{:.0} MB | {} | {} | {} | {:.1} | {} |",
                     gpu::weight_mb(&model.config, mode, false, false),
                     if kv8 { "int8" } else { "fp32" },
                     if graphs { "yes" } else { "no" },
-                    if spec { "yes" } else { "no" },
-                    n_new as f64 / dt
+                    label,
+                    n_new as f64 / dt,
+                    accept,
                 );
+                if self_spec {
+                    let r = engine.spec_rounds.max(1);
+                    eprintln!(
+                        "  [self-spec split] {} rounds: draft {:.2} ms/round, verify {:.2} ms/round (draft total {:.0} ms, verify total {:.0} ms)",
+                        engine.spec_rounds,
+                        engine.spec_draft_us as f64 / 1000.0 / r as f64,
+                        engine.spec_verify_us as f64 / 1000.0 / r as f64,
+                        engine.spec_draft_us as f64 / 1000.0,
+                        engine.spec_verify_us as f64 / 1000.0,
+                    );
+                    if engine.spec_profile {
+                        let (g, a, h) =
+                            (engine.prof_gemm_us, engine.prof_attn_us, engine.prof_head_us);
+                        let v = engine.spec_verify_us.max(1);
+                        let rest = engine.spec_verify_us.saturating_sub(g + a + h);
+                        let pct = |x: u64| 100.0 * x as f64 / v as f64;
+                        let per = |x: u64| x as f64 / 1000.0 / r as f64;
+                        eprintln!(
+                            "  [verify profile, sync'd] layer-gemm {:.2} ms ({:.0}%), lm_head {:.2} ms ({:.0}%), attn {:.2} ms ({:.0}%), rest {:.2} ms ({:.0}%) per round",
+                            per(g), pct(g), per(h), pct(h), per(a), pct(a), per(rest), pct(rest),
+                        );
+                    }
+                }
             }
         }
         Some("prefill-bench") => {

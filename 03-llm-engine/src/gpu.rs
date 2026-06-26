@@ -14,6 +14,7 @@ use half::f16;
 
 use crate::gptq;
 use crate::model::{Arch, Config, Model};
+use crate::spec::DraftStrategy;
 
 const LLM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm.ptx"));
 const LLM_AG8_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/llm_ag8.ptx"));
@@ -903,13 +904,25 @@ struct Kernels {
     gemm_rows_f32: CudaFunction,
     gemm_rows_half: CudaFunction,
     gemm_rows_int8: CudaFunction,
+    gemv_rows_int8_m2: CudaFunction,
+    gemv_rows_int8_m4: CudaFunction,
+    gemv_rows_int8_m8: CudaFunction,
     gemm_rows_int4: CudaFunction,
+    gemv_rows_int4_m2: CudaFunction,
+    gemv_rows_int4_m4: CudaFunction,
+    gemv_rows_int4_m8: CudaFunction,
     gemm_int2: CudaFunction,
     gemm_int2_skinny: CudaFunction,
     gemm_rows_int2: CudaFunction,
+    gemv_rows_int2_m2: CudaFunction,
+    gemv_rows_int2_m4: CudaFunction,
+    gemv_rows_int2_m8: CudaFunction,
     gemm_int3: CudaFunction,
     gemm_int3_skinny: CudaFunction,
     gemm_rows_int3: CudaFunction,
+    gemv_rows_int3_m2: CudaFunction,
+    gemv_rows_int3_m4: CudaFunction,
+    gemv_rows_int3_m8: CudaFunction,
     // int4k (Q4_K-style two-level scales) — parallel set to the int4 path
     embed_int4k: CudaFunction,
     embed_int4k_dyn: CudaFunction,
@@ -919,6 +932,9 @@ struct Kernels {
     gemm_int4k: CudaFunction,
     gemm_int4k_skinny: CudaFunction,
     gemm_rows_int4k: CudaFunction,
+    gemv_rows_int4k_m2: CudaFunction,
+    gemv_rows_int4k_m4: CudaFunction,
+    gemv_rows_int4k_m8: CudaFunction,
     quantize_act: CudaFunction,
     copy_kv_dyn: CudaFunction,
     copy_kv_batch: CudaFunction,
@@ -1010,15 +1026,27 @@ fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
         gemm_int8_skinny: f("gemm_int8_skinny"),
         gemm_int4_skinny: f("gemm_int4_skinny"),
         gemm_rows_f32: f("gemm_rows_f32"),
+        gemv_rows_int8_m2: f("gemv_rows_int8_m2"),
+        gemv_rows_int8_m4: f("gemv_rows_int8_m4"),
+        gemv_rows_int8_m8: f("gemv_rows_int8_m8"),
         gemm_rows_half: f("gemm_rows_half"),
         gemm_rows_int8: f("gemm_rows_int8"),
         gemm_rows_int4: f("gemm_rows_int4"),
+        gemv_rows_int4_m2: f("gemv_rows_int4_m2"),
+        gemv_rows_int4_m4: f("gemv_rows_int4_m4"),
+        gemv_rows_int4_m8: f("gemv_rows_int4_m8"),
         gemm_int2: f("gemm_int2"),
         gemm_int2_skinny: f("gemm_int2_skinny"),
         gemm_rows_int2: f("gemm_rows_int2"),
+        gemv_rows_int2_m2: f("gemv_rows_int2_m2"),
+        gemv_rows_int2_m4: f("gemv_rows_int2_m4"),
+        gemv_rows_int2_m8: f("gemv_rows_int2_m8"),
         gemm_int3: f("gemm_int3"),
         gemm_int3_skinny: f("gemm_int3_skinny"),
         gemm_rows_int3: f("gemm_rows_int3"),
+        gemv_rows_int3_m2: f("gemv_rows_int3_m2"),
+        gemv_rows_int3_m4: f("gemv_rows_int3_m4"),
+        gemv_rows_int3_m8: f("gemv_rows_int3_m8"),
         embed_int4k: f("embed_int4k"),
         embed_int4k_dyn: f("embed_int4k_dyn"),
         embed_int4k_batch: f("embed_int4k_batch"),
@@ -1027,6 +1055,9 @@ fn load_kernels(module: &Arc<CudaModule>, ag: usize) -> Kernels {
         gemm_int4k: f("gemm_int4k"),
         gemm_int4k_skinny: f("gemm_int4k_skinny"),
         gemm_rows_int4k: f("gemm_rows_int4k"),
+        gemv_rows_int4k_m2: f("gemv_rows_int4k_m2"),
+        gemv_rows_int4k_m4: f("gemv_rows_int4k_m4"),
+        gemv_rows_int4k_m8: f("gemv_rows_int4k_m8"),
         quantize_act: f("quantize_act"),
         copy_kv_dyn: f("copy_kv_dyn"),
         copy_kv_batch: f("copy_kv_batch"),
@@ -1248,6 +1279,14 @@ pub struct ActQuant {
     sum: CudaSlice<i32>,
 }
 
+// Fallback lever: `LLM_NO_FUSED=1` routes tier-0 int8 GEMMs back through the
+// two-launch quantize_act + gemm_rows path. Lets us A/B the fused kernel and
+// gives an escape hatch should its float-reduction order ever flip a gate.
+fn no_fused() -> bool {
+    static NO_FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_FUSED.get_or_init(|| std::env::var_os("LLM_NO_FUSED").is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     stream: &Arc<CudaStream>,
@@ -1326,6 +1365,38 @@ fn gemm(
         }
         Weights::Int8 { q, scales } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            // Fused small-batch path (tier 0): quantize the M activation rows in
+            // shared memory and stream weights once (gemv-style), skipping the
+            // separate quantize_act pass + Aq round-trip. Only when the M rows
+            // fit the 48 KB shared budget; otherwise the tiled gemm_rows path.
+            let fused_smem = m * kk + 4 * m * kk / k.ag;
+            if !no_fused() && tier == 0 && fused_smem <= 49152 {
+                let cfg0 = LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: fused_smem as u32,
+                };
+                // Pick the kernel whose compile-time MAXM is the smallest that
+                // covers M, so the accumulator arrays don't spill at small M.
+                let kf = if m <= 2 {
+                    &k.gemv_rows_int8_m2
+                } else if m <= 4 {
+                    &k.gemv_rows_int8_m4
+                } else {
+                    &k.gemv_rows_int8_m8
+                };
+                let mut lb = stream.launch_builder(kf);
+                lb.arg(c)
+                    .arg(a)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(bias)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i);
+                unsafe { lb.launch(cfg0) }.unwrap();
+                return;
+            }
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
@@ -1355,6 +1426,35 @@ fn gemm(
         }
         Weights::Int4 { q, scales, .. } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            // Fused tier-0 path (gemv_rows_int4): quantize the M rows in shared,
+            // stream weights once — bit-identical to the decode GEMV, skipping the
+            // separate quantize_act pass + Aq round-trip. Shared = M*(3*nq+nw)*4.
+            let fused_smem = m * (3 * (kk / 4) + kk / 32) * 4;
+            if !no_fused() && tier == 0 && fused_smem <= 49152 {
+                let cfg0 = LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: fused_smem as u32,
+                };
+                let kf = if m <= 2 {
+                    &k.gemv_rows_int4_m2
+                } else if m <= 4 {
+                    &k.gemv_rows_int4_m4
+                } else {
+                    &k.gemv_rows_int4_m8
+                };
+                let mut lb = stream.launch_builder(kf);
+                lb.arg(c)
+                    .arg(a)
+                    .arg(q)
+                    .arg(scales)
+                    .arg(bias)
+                    .arg(&m_i)
+                    .arg(&n_i)
+                    .arg(&k_i);
+                unsafe { lb.launch(cfg0) }.unwrap();
+                return;
+            }
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
@@ -1394,6 +1494,27 @@ fn gemm(
         }
         Weights::Int4K { q, sub, dm } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            // Fused tier-0 path (gemv_rows_int4k): mirrors the decode GEMV.
+            // Shared = M*(3*nq + ns)*4 (nq=K/4, ns=K/16).
+            let fused_smem = m * (3 * (kk / 4) + kk / 16) * 4;
+            if !no_fused() && tier == 0 && fused_smem <= 49152 {
+                let cfg0 = LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: fused_smem as u32,
+                };
+                let kf = if m <= 2 {
+                    &k.gemv_rows_int4k_m2
+                } else if m <= 4 {
+                    &k.gemv_rows_int4k_m4
+                } else {
+                    &k.gemv_rows_int4k_m8
+                };
+                let mut lb = stream.launch_builder(kf);
+                lb.arg(c).arg(a).arg(q).arg(sub).arg(dm).arg(bias).arg(&m_i).arg(&n_i).arg(&k_i);
+                unsafe { lb.launch(cfg0) }.unwrap();
+                return;
+            }
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
@@ -1434,6 +1555,25 @@ fn gemm(
         }
         Weights::Int3 { q, sub, dm } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            let fused_smem = m * (3 * (kk / 4) + kk / 16) * 4;
+            if !no_fused() && tier == 0 && fused_smem <= 49152 {
+                let cfg0 = LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: fused_smem as u32,
+                };
+                let kf = if m <= 2 {
+                    &k.gemv_rows_int3_m2
+                } else if m <= 4 {
+                    &k.gemv_rows_int3_m4
+                } else {
+                    &k.gemv_rows_int3_m8
+                };
+                let mut lb = stream.launch_builder(kf);
+                lb.arg(c).arg(a).arg(q).arg(sub).arg(dm).arg(bias).arg(&m_i).arg(&n_i).arg(&k_i);
+                unsafe { lb.launch(cfg0) }.unwrap();
+                return;
+            }
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
@@ -1465,6 +1605,25 @@ fn gemm(
         }
         Weights::Int2 { q, sub, dm } => {
             debug_assert!(kk.is_multiple_of(32), "dp4a gemm assumes K % 32 == 0");
+            let fused_smem = m * (3 * (kk / 4) + kk / 16) * 4;
+            if !no_fused() && tier == 0 && fused_smem <= 49152 {
+                let cfg0 = LaunchConfig {
+                    grid_dim: (n.div_ceil(256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: fused_smem as u32,
+                };
+                let kf = if m <= 2 {
+                    &k.gemv_rows_int2_m2
+                } else if m <= 4 {
+                    &k.gemv_rows_int2_m4
+                } else {
+                    &k.gemv_rows_int2_m8
+                };
+                let mut lb = stream.launch_builder(kf);
+                lb.arg(c).arg(a).arg(q).arg(sub).arg(dm).arg(bias).arg(&m_i).arg(&n_i).arg(&k_i);
+                unsafe { lb.launch(cfg0) }.unwrap();
+                return;
+            }
             let groups = (m * kk / k.ag) as i32;
             let mut lb = stream.launch_builder(&k.quantize_act);
             lb.arg(&mut act.q)
@@ -1738,6 +1897,35 @@ pub struct Engine {
     batch_h2: CudaSlice<f32>,
     batch_logits: CudaSlice<f32>,
     batch_argmax: CudaSlice<i32>,
+    // Self-speculative early-exit scratch. `spec_hk` stashes the layer-K hidden
+    // state of each drafted token (the residual stream entering layer K), which
+    // doubles as the seed for the verify KV-reuse path and the input to the exit
+    // adapter. `spec_adapter` is the offline-fit linear adapter A_K (n_embd x
+    // n_embd) mapping h_K -> ĥ_L; None unless `--self-spec` loaded a sidecar.
+    spec_hk: CudaSlice<f32>,
+    spec_xk: CudaSlice<f32>,
+    spec_adapter: Option<Weights>,
+    // Self-spec acceptance counters, reset at the start of each
+    // `speculative_loop`: speculated tokens proposed, of those accepted, and the
+    // number of verify rounds. (draft[0] is the already-known greedy token, so
+    // it is excluded from both `drafted` and `accepted`.)
+    pub spec_drafted: u64,
+    pub spec_accepted: u64,
+    pub spec_rounds: u64,
+    // wall-clock split (microseconds) of the last speculative_loop: time in the
+    // drafter vs in verify. Both arms end on a host sync, so Instant is honest.
+    pub spec_draft_us: u64,
+    pub spec_verify_us: u64,
+    // Self-spec verify reuses the drafter's layers-0..k KV by default; set false
+    // to force the full-recompute verify (the safe fallback / equivalence check).
+    pub spec_reuse: bool,
+    // Phase-A profiling: when set, batch_body_from / batch_head_argmax sync after
+    // each GEMM and the attention block and attribute the time, to localize the
+    // small-batch verify cost. Adds syncs (inflates totals) — diagnostic only.
+    pub spec_profile: bool,
+    pub prof_gemm_us: u64,
+    pub prof_attn_us: u64,
+    pub prof_head_us: u64,
     act: ActQuant,
     graph_tok: CudaSlice<i32>,
     graph_pos: CudaSlice<i32>,
@@ -2001,6 +2189,19 @@ impl Engine {
             batch_h2: stream.alloc_zeros(c.n_ctx * inter).unwrap(),
             batch_logits: stream.alloc_zeros(MAX_SPEC_TOKENS * v).unwrap(),
             batch_argmax: stream.alloc_zeros(MAX_SPEC_TOKENS).unwrap(),
+            spec_hk: stream.alloc_zeros(MAX_SPEC_TOKENS * e).unwrap(),
+            spec_xk: stream.alloc_zeros(e).unwrap(),
+            spec_adapter: None,
+            spec_drafted: 0,
+            spec_accepted: 0,
+            spec_rounds: 0,
+            spec_draft_us: 0,
+            spec_verify_us: 0,
+            spec_reuse: true,
+            spec_profile: false,
+            prof_gemm_us: 0,
+            prof_attn_us: 0,
+            prof_head_us: 0,
             // activation-quant scratch sized for the widest K (n_inter),
             // one scale/sum per AG-value group of the loaded module
             act: ActQuant {
@@ -2328,12 +2529,20 @@ impl Engine {
     }
 
     fn forward_body(&mut self, pos: usize) {
+        self.forward_layers(pos, 0, self.config.n_layer);
+        self.forward_head();
+    }
+
+    /// Run transformer layers `start..end` for a single token at `pos`,
+    /// accumulating into the residual stream `self.x`. No final norm / lm_head,
+    /// so the early-exit drafter can truncate at layer K and apply its own head.
+    fn forward_layers(&mut self, pos: usize, start: usize, end: usize) {
         let c = self.config;
         let e = c.n_embd;
         let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let eps = c.norm_eps;
-        for l in 0..c.n_layer {
+        for l in start..end {
             let layer = &self.layers[l];
 
             norm(
@@ -2534,6 +2743,14 @@ impl Engine {
             );
         }
 
+    }
+
+    /// Final norm + lm_head over the single-token residual stream `self.x`,
+    /// writing the vocabulary logits to `self.logits`.
+    fn forward_head(&mut self) {
+        let c = self.config;
+        let e = c.n_embd;
+        let eps = c.norm_eps;
         norm(
             &self.stream,
             &self.k,
@@ -2915,6 +3132,17 @@ impl Engine {
     /// embed -> layers -> final norm. Leaves the normalized hidden states for
     /// all rows in `batch_xb`.
     fn batch_body(&mut self, tokens: &[u32], pos0: usize) {
+        self.batch_body_from(tokens, pos0, 0, false);
+    }
+
+    /// Batched causal trunk, generalized for self-spec KV reuse. With
+    /// `start_layer = 0` and `seeded = false` this is the full prefill/verify
+    /// pass (embed -> all layers -> final norm). With `start_layer = k` and
+    /// `seeded = true` it skips the embedding and layers `0..k`: the residual
+    /// stream is seeded from the drafter's stashed layer-`k` hiddens (`spec_hk`),
+    /// and layers `0..k` are reused from the KV the drafter already wrote at
+    /// these positions. Either way the normalized hiddens land in `batch_xb`.
+    fn batch_body_from(&mut self, tokens: &[u32], pos0: usize, start_layer: usize, seeded: bool) {
         assert!(!tokens.is_empty());
         assert!(pos0 + tokens.len() <= self.config.n_ctx, "context overflow");
         assert!(
@@ -2928,9 +3156,21 @@ impl Engine {
         let (qd, kvd, qkvd, inter) = (c.q_dim(), c.kv_dim(), c.qkv_dim(), c.n_inter);
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
         let eps = c.norm_eps;
-        self.launch_embed_batch(tokens, pos0, false);
+        if seeded {
+            // verify KV reuse: the residual stream entering layer `start_layer`
+            // is the drafter's stashed h_K for these n positions; layers below
+            // are reused from the KV the drafter already wrote.
+            self.stream
+                .memcpy_dtod(
+                    &self.spec_hk.slice(0..n * e),
+                    &mut self.batch_x.slice_mut(0..n * e),
+                )
+                .unwrap();
+        } else {
+            self.launch_embed_batch(tokens, pos0, false);
+        }
 
-        for l in 0..c.n_layer {
+        for l in start_layer..c.n_layer {
             let layer = &self.layers[l];
             norm_batch(
                 &self.stream,
@@ -2943,6 +3183,7 @@ impl Engine {
                 e,
                 eps,
             );
+            let _tg = std::time::Instant::now();
             gemm(
                 &self.stream,
                 &self.k,
@@ -2955,7 +3196,12 @@ impl Engine {
                 e,
                 &mut self.act,
             );
+            if self.spec_profile {
+                self.stream.synchronize().unwrap();
+                self.prof_gemm_us += _tg.elapsed().as_micros() as u64;
+            }
 
+            let _ta = std::time::Instant::now();
             if c.arch != Arch::Gpt2 {
                 let (pos_i, n_i, nh_i, nkv_i, hd_i, stride_i) = (
                     pos0 as i32,
@@ -3099,7 +3345,12 @@ impl Engine {
                     unsafe { lb.launch(attn_cfg) }.unwrap();
                 }
             }
+            if self.spec_profile {
+                self.stream.synchronize().unwrap();
+                self.prof_attn_us += _ta.elapsed().as_micros() as u64;
+            }
 
+            let _tg = std::time::Instant::now();
             gemm(
                 &self.stream,
                 &self.k,
@@ -3112,6 +3363,10 @@ impl Engine {
                 qd,
                 &mut self.act,
             );
+            if self.spec_profile {
+                self.stream.synchronize().unwrap();
+                self.prof_gemm_us += _tg.elapsed().as_micros() as u64;
+            }
             add(
                 &self.stream,
                 &self.k.add_inplace,
@@ -3131,6 +3386,7 @@ impl Engine {
                 e,
                 eps,
             );
+            let _tg = std::time::Instant::now();
             gemm(
                 &self.stream,
                 &self.k,
@@ -3143,6 +3399,10 @@ impl Engine {
                 e,
                 &mut self.act,
             );
+            if self.spec_profile {
+                self.stream.synchronize().unwrap();
+                self.prof_gemm_us += _tg.elapsed().as_micros() as u64;
+            }
             let total_i = (n * inter) as i32;
             match &layer.up_w {
                 None => {
@@ -3151,6 +3411,7 @@ impl Engine {
                     unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
                 }
                 Some(up_w) => {
+                    let _tg = std::time::Instant::now();
                     gemm(
                         &self.stream,
                         &self.k,
@@ -3163,11 +3424,16 @@ impl Engine {
                         e,
                         &mut self.act,
                     );
+                    if self.spec_profile {
+                        self.stream.synchronize().unwrap();
+                        self.prof_gemm_us += _tg.elapsed().as_micros() as u64;
+                    }
                     let mut lb = self.stream.launch_builder(&self.k.silu_mul);
                     lb.arg(&mut self.batch_h).arg(&self.batch_h2).arg(&total_i);
                     unsafe { lb.launch(cfg1d(n * inter)) }.unwrap();
                 }
             }
+            let _tg = std::time::Instant::now();
             gemm(
                 &self.stream,
                 &self.k,
@@ -3180,6 +3446,10 @@ impl Engine {
                 inter,
                 &mut self.act,
             );
+            if self.spec_profile {
+                self.stream.synchronize().unwrap();
+                self.prof_gemm_us += _tg.elapsed().as_micros() as u64;
+            }
             add(
                 &self.stream,
                 &self.k.add_inplace,
@@ -3694,9 +3964,28 @@ impl Engine {
             "speculative verify supports at most {MAX_SPEC_TOKENS} tokens"
         );
         self.batch_body(tokens, pos0);
-        let c = self.config;
-        let n = tokens.len();
+        self.batch_head_argmax(tokens.len())
+    }
 
+    /// Self-spec KV-reuse verification: the drafter already wrote layers `0..k`
+    /// KV for these positions (exact — same per-token forward the full model
+    /// would run) and stashed their layer-`k` hiddens, so verify seeds from the
+    /// stash and runs only layers `k..L`. Argmax-equivalent to `verify_argmax`
+    /// (asserted in the self-test); the win is skipping the first `k` layers.
+    pub fn verify_argmax_reuse(&mut self, tokens: &[u32], pos0: usize, k: usize) -> Vec<u32> {
+        assert!(
+            tokens.len() <= MAX_SPEC_TOKENS,
+            "speculative verify supports at most {MAX_SPEC_TOKENS} tokens"
+        );
+        self.batch_body_from(tokens, pos0, k, true);
+        self.batch_head_argmax(tokens.len())
+    }
+
+    /// lm_head over the `n` normalized rows in `batch_xb`, then per-row device
+    /// argmax -> host token ids. Shared tail of both verify paths.
+    fn batch_head_argmax(&mut self, n: usize) -> Vec<u32> {
+        let c = self.config;
+        let _tg = std::time::Instant::now();
         gemm(
             &self.stream,
             &self.k,
@@ -3709,6 +3998,10 @@ impl Engine {
             c.n_embd,
             &mut self.act,
         );
+        if self.spec_profile {
+            self.stream.synchronize().unwrap();
+            self.prof_head_us += _tg.elapsed().as_micros() as u64;
+        }
         let v_i = c.n_vocab as i32;
         let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
         lb.arg(&mut self.batch_argmax)
@@ -3819,33 +4112,207 @@ impl Engine {
     ) -> Vec<u32> {
         assert!(!prompt.is_empty());
         let logits = self.prefill(prompt, 0);
-        self.speculative_loop(prompt, argmax(&logits), n_new, spec_k, on_token)
+        self.speculative_loop(
+            prompt,
+            argmax(&logits),
+            n_new,
+            DraftStrategy::PromptLookup { k: spec_k },
+            on_token,
+        )
+    }
+
+    /// Lossless self-speculative (early-exit) decoding: draft `gamma` tokens with
+    /// the first `k` layers of this same model, verify with all layers. The
+    /// output is bit-identical to greedy regardless of draft quality — only the
+    /// acceptance rate (and therefore the speed) depends on the drafter.
+    pub fn generate_self_speculative(
+        &mut self,
+        prompt: &[u32],
+        n_new: usize,
+        k: usize,
+        gamma: usize,
+        on_token: impl FnMut(u32),
+    ) -> Vec<u32> {
+        assert!(!prompt.is_empty());
+        let logits = self.prefill(prompt, 0);
+        self.speculative_loop(
+            prompt,
+            argmax(&logits),
+            n_new,
+            DraftStrategy::SelfSpec { k, gamma },
+            on_token,
+        )
+    }
+
+    /// Install the offline-fit exit adapter `A_K` (row-major `[n_embd, n_embd]`
+    /// in the GEMV weight layout). Enables the calibrated early-exit drafter;
+    /// without it the self-draft is a raw, uncalibrated early exit.
+    pub fn set_spec_adapter(&mut self, a: &[f32]) {
+        let e = self.config.n_embd;
+        assert_eq!(a.len(), e * e, "exit adapter must be n_embd x n_embd");
+        self.spec_adapter = Some(Weights::F32(self.stream.clone_htod(a).unwrap()));
+    }
+
+    /// Offline calibration probe: run one token through the full model at `pos`,
+    /// returning the residual stream entering layer `k` (h_K) and the final
+    /// pre-`lnf` residual (h_L). Advances the KV cache exactly like `forward`.
+    pub fn forward_capture(&mut self, tok: u32, pos: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
+        self.launch_embed(tok as i32, pos as i32);
+        self.forward_layers(pos, 0, k);
+        let h_k = self.stream.clone_dtoh(&self.x).unwrap();
+        self.forward_layers(pos, k, self.config.n_layer);
+        let h_l = self.stream.clone_dtoh(&self.x).unwrap();
+        (h_k, h_l)
+    }
+
+    /// Offline probe: teacher-forced early-exit top-1 agreement at `pos`. Runs
+    /// the early-exit head (layers `0..k` + adapter + lnf + lm_head) and the full
+    /// model at the same real position, returning whether their greedy tokens
+    /// match. This is the per-position acceptance ceiling (no draft compounding),
+    /// the signal that says whether the adapter is worth the draft cost.
+    pub fn exit_agreement(&mut self, tok: u32, pos: usize, k: usize) -> bool {
+        let e = self.config.n_embd;
+        self.launch_embed(tok as i32, pos as i32);
+        self.forward_layers(pos, 0, k);
+        // stash h_K so we can both adapter-predict AND continue to h_L
+        self.stream
+            .memcpy_dtod(&self.x.slice(0..e), &mut self.spec_hk.slice_mut(0..e))
+            .unwrap();
+        self.apply_exit_adapter();
+        self.forward_head();
+        let draft = self.device_argmax_logits();
+        // restore h_K, finish the full forward for the true greedy token
+        self.stream
+            .memcpy_dtod(&self.spec_hk.slice(0..e), &mut self.x.slice_mut(0..e))
+            .unwrap();
+        self.forward_layers(pos, k, self.config.n_layer);
+        self.forward_head();
+        let full = self.device_argmax_logits();
+        draft == full
+    }
+
+    /// Device-side argmax over the single-token `self.logits`, returning the id
+    /// without copying the whole vocab row to the host (one int crosses the bus —
+    /// the drafter runs `gamma` of these per block, so the round-trip matters).
+    fn device_argmax_logits(&mut self) -> u32 {
+        let v_i = self.config.n_vocab as i32;
+        let mut lb = self.stream.launch_builder(&self.k.argmax_rows);
+        lb.arg(&mut self.batch_argmax).arg(&self.logits).arg(&v_i);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { lb.launch(cfg) }.unwrap();
+        self.stream
+            .clone_dtoh(&self.batch_argmax.slice(0..1))
+            .unwrap()[0] as u32
+    }
+
+    /// Apply the calibration exit adapter in place: `self.x = A_K · self.x`,
+    /// mapping the layer-`k` hidden h_K to the predicted final hidden ĥ_L. A
+    /// no-op when no adapter is loaded — that is the raw early-exit drafter.
+    fn apply_exit_adapter(&mut self) {
+        if self.spec_adapter.is_none() {
+            return;
+        }
+        let e = self.config.n_embd;
+        let w = self.spec_adapter.as_ref().unwrap();
+        gemv(
+            &self.stream,
+            &self.k,
+            &mut self.spec_xk,
+            &self.x,
+            w,
+            &self.zero_bias,
+            e,
+            e,
+            false,
+        );
+        self.stream
+            .memcpy_dtod(&self.spec_xk.slice(0..e), &mut self.x.slice_mut(0..e))
+            .unwrap();
+    }
+
+    /// Early-exit self-draft: run the first `k` layers `gamma` times to propose a
+    /// candidate block. `draft[0]` is the already-known greedy token; the drafter
+    /// fills `draft[1..gamma]`. Each step writes the real layers-`0..k` KV at its
+    /// position (tentative — verify or the next round overwrites it) and stashes
+    /// the layer-`k` hidden in `spec_hk` to seed the verify KV-reuse path. The
+    /// final step exists only to stash the last candidate's hidden; its predicted
+    /// token falls past the window and is dropped.
+    fn self_draft(&mut self, greedy: u32, k: usize, gamma: usize, pos: usize) -> Vec<u32> {
+        let e = self.config.n_embd;
+        let mut draft = Vec::with_capacity(gamma);
+        draft.push(greedy);
+        let mut tok = greedy;
+        for j in 0..gamma {
+            let p = pos + j;
+            self.launch_embed(tok as i32, p as i32);
+            self.forward_layers(p, 0, k);
+            self.stream
+                .memcpy_dtod(
+                    &self.x.slice(0..e),
+                    &mut self.spec_hk.slice_mut(j * e..(j + 1) * e),
+                )
+                .unwrap();
+            self.apply_exit_adapter();
+            self.forward_head();
+            tok = self.device_argmax_logits();
+            if draft.len() < gamma {
+                draft.push(tok);
+            }
+        }
+        draft
     }
 
     /// Decode part of speculative generation, for callers that have already
     /// prefilled `prompt` into the KV cache: `first` is the greedy token the
-    /// prefill predicted. Logits stay on the GPU throughout — the host only
-    /// ever sees argmax token ids (one per verified row).
+    /// prefill predicted. `strategy` selects how each candidate block is drafted;
+    /// verification (and therefore the output) is identical either way. Logits
+    /// stay on the GPU throughout — the host only ever sees argmax token ids (one
+    /// per verified row). Updates the `spec_*` acceptance counters.
     pub fn speculative_loop(
         &mut self,
         prompt: &[u32],
         first: u32,
         n_new: usize,
-        spec_k: usize,
+        strategy: DraftStrategy,
         mut on_token: impl FnMut(u32),
     ) -> Vec<u32> {
-        assert!(spec_k > 0);
+        match strategy {
+            DraftStrategy::PromptLookup { k } => assert!(k > 0),
+            DraftStrategy::SelfSpec { k, gamma } => {
+                assert!(k > 0 && k <= self.config.n_layer && gamma > 0)
+            }
+        }
         assert!(
             prompt.len() + n_new <= self.config.n_ctx,
             "context overflow"
         );
+        self.spec_drafted = 0;
+        self.spec_accepted = 0;
+        self.spec_rounds = 0;
+        self.spec_draft_us = 0;
+        self.spec_verify_us = 0;
+        self.prof_gemm_us = 0;
+        self.prof_attn_us = 0;
+        self.prof_head_us = 0;
+        let reuse_kv = self.spec_reuse;
         let mut history = prompt.to_vec();
         let mut out = Vec::with_capacity(n_new);
         let mut pos = prompt.len();
         let mut greedy = first;
         while out.len() < n_new {
             let room = (n_new - out.len()).min(MAX_SPEC_TOKENS);
-            let draft = prompt_lookup(&history, spec_k.min(room));
+            let t_draft = std::time::Instant::now();
+            let draft = match strategy {
+                DraftStrategy::PromptLookup { k } => prompt_lookup(&history, k.min(room)),
+                DraftStrategy::SelfSpec { k, gamma } => {
+                    self.self_draft(greedy, k, gamma.min(room), pos)
+                }
+            };
+            self.spec_draft_us += t_draft.elapsed().as_micros() as u64;
             if draft.first().copied() != Some(greedy) {
                 out.push(greedy);
                 history.push(greedy);
@@ -3855,11 +4322,21 @@ impl Engine {
                 greedy = argmax(&logits);
                 continue;
             }
-            let row_argmax = self.verify_argmax(&draft, pos);
+            let t_verify = std::time::Instant::now();
+            let row_argmax = match strategy {
+                DraftStrategy::SelfSpec { k, .. } if reuse_kv => {
+                    self.verify_argmax_reuse(&draft, pos, k)
+                }
+                _ => self.verify_argmax(&draft, pos),
+            };
+            self.spec_verify_us += t_verify.elapsed().as_micros() as u64;
             let mut accepted = 1usize;
             while accepted < draft.len() && row_argmax[accepted - 1] == draft[accepted] {
                 accepted += 1;
             }
+            self.spec_rounds += 1;
+            self.spec_drafted += (draft.len() - 1) as u64;
+            self.spec_accepted += (accepted - 1) as u64;
             for &tok in &draft[..accepted] {
                 out.push(tok);
                 history.push(tok);
